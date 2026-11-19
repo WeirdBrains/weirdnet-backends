@@ -9,13 +9,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use weirdnet_agent::pool::{NetDialer, Pool, PoolOptions, encode_cert};
-use weirdnet_agent::remote::infer::v2::Request;
+use weirdnet_agent::remote::infer::v2::{Finish, InferBackend, Output, Request};
+use weirdnet_agent::remote::infer::{Admission, InferHost};
 use weirdnet_agent::remote::pool::NoEvents;
-use weirdnet_agent::remote::{Authorize, RemoteError};
+use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
 use weirdnet_agent::serve::RosterAuth;
-use weirdnet_agent::{CancelToken, Message};
-use weirdnet_backends::node::{Capability, GroupPlan, GroupWorkers, NodeClient, NodeServer, NodeService, Subscription, Update, Verifier};
-use weirdnet_backends::{EngineKind, ModelHost, ModelState};
+use weirdnet_agent::serve::{Server, Serving};
+use weirdnet_agent::{CancelToken, Message, ModelBackend};
+use weirdnet_backends::node::{
+    Capability, GroupPlan, GroupWorkers, NodeClient, NodeServer, NodeServerOptions, NodeService, Subscription, Update, Verifier,
+};
+use weirdnet_backends::{EngineKind, ModelHost, ModelState, RawInferDialer};
 use weirdnet_net::node::{Handler, Node, NodeConfig};
 use weirdnet_net::user::NodeCert;
 use weirdnet_net::{Keypair, Multiaddr, PeerId, WEIRDNET};
@@ -182,6 +186,80 @@ fn node1_round_trip() {
     });
 }
 
+/// The inference role's own answer (standing in for an inference node's routing).
+struct Router;
+
+#[async_trait]
+impl InferBackend for Router {
+    fn name(&self) -> String {
+        "router".into()
+    }
+    async fn infer(&self, _request: &Request, out: &Output, _cancel: &CancelToken) -> Result<Finish, RemoteError> {
+        out.text("from the inference role");
+        Ok(Finish::new("stop"))
+    }
+}
+
+struct RouterHost(Arc<dyn Authorize>);
+
+impl InferHost for RouterHost {
+    fn authorize(&self, caller: &Caller) -> Result<(), RemoteError> {
+        self.0.authorize(caller)
+    }
+    fn open(&self, _caller: &Caller, _model: Option<&str>) -> Result<Arc<dyn ModelBackend>, RemoteError> {
+        Err(RemoteError::Unsupported { message: "infer/2 only".into() })
+    }
+    fn open_request(&self, _caller: &Caller, _request: &Request) -> Result<Arc<dyn InferBackend>, RemoteError> {
+        Ok(Arc::new(Router))
+    }
+}
+
+/// One node is both an inference node (infer/2 for apps) and a model node (raw inference on
+/// /weirdnet-backends/infer/1, legacy infer/2 off); another app's device reaches each role.
+fn one_node_is_inference_and_model_node() {
+    let user = Keypair::generate_ed25519();
+    let both_key = Keypair::generate_ed25519();
+    let (both, app) = (start(both_key.clone()), start(Keypair::generate_ed25519()));
+    let both_cert = certify(&user, &both, "studio");
+    let app_cert = certify(&user, &app, "laptop");
+    let mut roster = Roster::new();
+    roster.upsert(both_cert.clone());
+    roster.upsert(app_cert.clone());
+    let roster = Arc::new(roster);
+    let view: Arc<dyn Fn() -> Roster + Send + Sync> = Arc::new(move || (*roster).clone());
+
+    common::block_on(async {
+        let auth: Arc<dyn Authorize> = Arc::new(RosterAuth::new(&WEIRDNET, user.public(), view.clone()));
+        let sup = common::supervisor(vec![common::launch("chat", EngineKind::Llamacpp)]);
+        sup.load("chat").await.unwrap();
+        let host = Arc::new(ModelHost::new(sup.clone(), auth.clone()).with_default("chat"));
+        let service = Arc::new(NodeService::new(host, both_key, Some(both_cert), auth.clone()));
+        let _model = NodeServer::start_with(&both, service, NodeServerOptions::default().with_legacy_infer2(false)).unwrap();
+        let router: Arc<dyn InferHost> = Arc::new(RouterHost(auth));
+        let _inference = Server::start(&both, Serving { infer: Some((router, Admission::new(2))), catalog: None, announce: true }).unwrap();
+        let peer = both.peer_id().to_string();
+        let opts = PoolOptions::default().with_cert(Some(encode_cert(&app_cert)));
+        let cancel = CancelToken::new();
+
+        let dialer = Arc::new(NetDialer::new(app.clone()));
+        dialer.hint(both.peer_id(), vec![addr(&both)]);
+        // An app: plain infer/2 reaches the inference role.
+        let apps = Pool::new(dialer.clone(), vec![peer.clone()]).with_options(opts.clone());
+        let answer = apps.infer(Request::messages(vec![Message::user("hi")]), &NoEvents, &cancel).await.unwrap();
+        assert_eq!(answer.text, "from the inference role");
+        // An inference node driving model nodes: the dialer goes to /weirdnet-backends/infer/1.
+        let raw = Arc::new(RawInferDialer::new(dialer.clone()));
+        let models = Pool::new(raw.clone(), vec![peer.clone()]).with_options(opts);
+        let answer = models.infer(Request::messages(vec![Message::user("hi")]).raw(), &NoEvents, &cancel).await.unwrap();
+        assert_eq!(answer.text, "Hello from chat! You said: hi");
+        assert!(!raw.is_legacy(&peer));
+        sup.shutdown().await;
+    });
+}
+
 fn main() {
-    common::main(&[("node1_round_trip", node1_round_trip as fn())]);
+    common::main(&[
+        ("node1_round_trip", node1_round_trip as fn()),
+        ("one_node_is_inference_and_model_node", one_node_is_inference_and_model_node as fn()),
+    ]);
 }

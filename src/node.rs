@@ -3,8 +3,11 @@
 //! A model node pushes a [`Capability`] record to every subscriber: signed by the node's key,
 //! chained to the user by its [`NodeCert`], with a sequence number and a 90 second expiry,
 //! refreshed every 15 seconds and on every change. It takes [`Command`]s: `Load`, `Unload`,
-//! `Drain`, `GroupUp`/`GroupDown` and `Health`. Inference itself is raw
-//! `/weirdnet-agent/infer/2` through [`ModelHost`], served next to node/1 by [`NodeServer`].
+//! `Drain`, `GroupUp`/`GroupDown` and `Health`. Inference itself is raw infer/2 framing through
+//! [`ModelHost`], served next to node/1 by [`NodeServer`] on [`RAW_INFER_PROTOCOL`]
+//! (`/weirdnet-backends/infer/1`) and, unless [`NodeServerOptions::legacy_infer2`] is off, on
+//! `/weirdnet-agent/infer/2` as in 0.1.0. Inference nodes dial model nodes through
+//! [`RawInferDialer`](crate::RawInferDialer), which prefers the new id.
 //!
 //! Each stream carries one [`ClientMsg`] (CBOR, with the caller's certificate) and its answers
 //! ([`ServerMsg`]); a `Subscribe` stream stays open for records until either side closes it or
@@ -33,7 +36,7 @@ use weirdnet_net::user::NodeCert;
 use weirdnet_net::{AppBody, AppResponse, Keypair, PeerId, PublicKey};
 
 use crate::engine::EngineKind;
-use crate::host::{ModelHost, Speed};
+use crate::host::{ModelHost, RAW_INFER_PROTOCOL, Speed};
 use crate::supervisor::{ModelState, ModelStatus, SupervisorEvent};
 
 /// The protocol id.
@@ -622,24 +625,73 @@ impl NodeService {
     }
 }
 
-/// Serves a [`NodeService`] on a `weirdnet-net` node: node/1, raw infer/2 through the
-/// service's [`ModelHost`] (no infer/1, no catalog, no inference announcement) and the
-/// [`MODEL_NODE_APP`] announcement. Dropping it stops serving.
+/// How a [`NodeServer`] serves raw inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NodeServerOptions {
+    /// Also serve raw inference on `/weirdnet-agent/infer/2` (and infer/1), for inference nodes
+    /// on backends 0.1.0. Default on. Turn it off on a node that is also an inference node, so
+    /// its inference role can serve infer/2 to apps.
+    pub legacy_infer2: bool,
+}
+
+impl Default for NodeServerOptions {
+    fn default() -> Self {
+        Self { legacy_infer2: true }
+    }
+}
+
+impl NodeServerOptions {
+    pub fn with_legacy_infer2(mut self, on: bool) -> Self {
+        self.legacy_infer2 = on;
+        self
+    }
+}
+
+/// Serves a [`NodeService`] on a `weirdnet-net` node: node/1, raw inference through the
+/// service's [`ModelHost`] on [`RAW_INFER_PROTOCOL`] (and infer/2, see [`NodeServerOptions`];
+/// no catalog, no inference announcement) and the [`MODEL_NODE_APP`] announcement, which lists
+/// the protocols served. Dropping it stops serving.
 pub struct NodeServer {
-    _infer: Server,
+    _infer: Option<Server>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     stop_app: Box<dyn Fn() + Send + Sync>,
 }
 
 impl NodeServer {
-    /// Starts serving. Call from a Tokio runtime. The service's key must be the node's.
+    /// Starts serving with the default [`NodeServerOptions`] (raw inference on both ids). Call
+    /// from a Tokio runtime. The service's key must be the node's.
     pub fn start<Q: Message, R: Message>(node: &Arc<Node<Q, R>>, service: Arc<NodeService>) -> Result<NodeServer, RemoteError> {
+        Self::start_with(node, service, NodeServerOptions::default())
+    }
+
+    /// Starts serving with `options`.
+    pub fn start_with<Q: Message, R: Message>(
+        node: &Arc<Node<Q, R>>,
+        service: Arc<NodeService>,
+        options: NodeServerOptions,
+    ) -> Result<NodeServer, RemoteError> {
         let net = |e: weirdnet_net::NetError| RemoteError::Failed { message: e.to_string() };
         if node.peer_id().to_string() != service.peer {
             return Err(RemoteError::Failed { message: "the service's keypair is not this node's".into() });
         }
         let host: Arc<dyn InferHost> = service.host.clone();
-        let infer = Server::start(node, Serving { infer: Some((host, service.admission.clone())), catalog: None, announce: false })?;
+        let mut raw = node.accept_streams(RAW_INFER_PROTOCOL, stream_limits()).map_err(net)?;
+        let (h, a) = (host.clone(), service.admission.clone());
+        let raw_accept = tokio::spawn(async move {
+            while let Some(stream) = futures::StreamExt::next(&mut raw).await {
+                let caller = Caller::new(stream.peer().to_string());
+                let (h, a) = (h.clone(), a.clone());
+                tokio::spawn(async move {
+                    let _ = weirdnet_agent::remote::infer::v2::serve(channel(stream), caller, h.as_ref(), &a).await;
+                });
+            }
+        });
+        let infer = if options.legacy_infer2 {
+            Some(Server::start(node, Serving { infer: Some((host, service.admission.clone())), catalog: None, announce: false })?)
+        } else {
+            None
+        };
         let mut incoming = node.accept_streams(PROTOCOL, stream_limits()).map_err(net)?;
         let svc = service.clone();
         let accept = tokio::spawn(async move {
@@ -651,7 +703,11 @@ impl NodeServer {
                 });
             }
         });
-        let body = to_cbor(&vec![PROTOCOL, weirdnet_agent::remote::infer::v2::PROTOCOL])?;
+        let mut protocols = vec![PROTOCOL, RAW_INFER_PROTOCOL];
+        if options.legacy_infer2 {
+            protocols.push(weirdnet_agent::remote::infer::v2::PROTOCOL);
+        }
+        let body = to_cbor(&protocols)?;
         node.serve_app(
             MODEL_NODE_APP,
             Arc::new(move |_peer, _req| {
@@ -663,7 +719,7 @@ impl NodeServer {
         let n = node.clone();
         Ok(NodeServer {
             _infer: infer,
-            tasks: vec![accept, service.watch()],
+            tasks: vec![accept, raw_accept, service.watch()],
             stop_app: Box::new(move || {
                 n.stop_serving_app(MODEL_NODE_APP);
             }),

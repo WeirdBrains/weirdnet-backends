@@ -43,8 +43,12 @@ How inference nodes drive model nodes over [`weirdnet-net`](https://crates.io/cr
   wait for requests under way, or resume), `GroupUp`/`GroupDown`, `Health`. Cross-machine swap
   groups (a Ray worker, an `rpc-server` on a private link) are started by the application's
   `GroupWorkers`; without one a node answers `Unsupported` and advertises `group_jobs: false`.
-- `NodeServer::start` serves node/1 and raw `/weirdnet-agent/infer/2` on a `weirdnet-net` node
-  and announces `weirdnet-backends-node`; `NodeService::withdraw` ends subscriptions when the
+- `NodeServer::start` serves node/1 and raw inference on `/weirdnet-backends/infer/1`
+  (`RAW_INFER_PROTOCOL`, the infer/2 framing) and, for 0.1.0 inference nodes, on
+  `/weirdnet-agent/infer/2`; `NodeServer::start_with(.., NodeServerOptions::default().with_legacy_infer2(false))`
+  leaves infer/2 free for a node that is also an inference node. Inference nodes wrap their
+  model-node dialer in `RawInferDialer`, which tries the new id and falls back to infer/2. It
+  announces `weirdnet-backends-node` with the protocols served; `NodeService::withdraw` ends subscriptions when the
   node leaves. `NodeClient` is the inference node's side, over any `weirdnet-agent` `Dialer`.
 - Who may drive a model node is an `Authorize` hook; `weirdnet_agent::serve::RosterAuth`
   admits the user's linked devices.

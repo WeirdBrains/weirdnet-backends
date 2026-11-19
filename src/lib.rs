@@ -33,6 +33,6 @@ pub mod sse;
 pub mod supervisor;
 
 pub use engine::{EngineConfig, EngineKind, ModelLaunch, Wrap, find_in_path};
-pub use host::{EngineModel, ModelHost, Speed};
+pub use host::{EngineModel, ModelHost, RAW_INFER_PROTOCOL, RawInferDialer, Speed};
 pub use sse::{Chunk, ChunkDecoder, SseParser, ToolCalls};
 pub use supervisor::{ChunkStream, ModelState, ModelStatus, Supervisor, SupervisorEvent, SupervisorOptions};

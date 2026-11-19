@@ -8,8 +8,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use futures::StreamExt;
 use weirdnet_agent::remote::infer::InferHost;
-use weirdnet_agent::remote::infer::v2::{EmbedBackend, Finish, InferBackend, Input, Output, Request};
-use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
+use weirdnet_agent::remote::infer::v2::{self, EmbedBackend, Finish, InferBackend, Input, Output, Request};
+use weirdnet_agent::remote::{Authorize, Caller, Channel, Dialer, RemoteError};
 use weirdnet_agent::{CancelToken, ModelBackend};
 
 use crate::error::{bad_request, engine_error, unavailable};
@@ -237,6 +237,49 @@ impl EmbedBackend for EngineModel {
             r = call => r?,
         };
         Ok((vectors.pop().ok_or_else(|| engine_error("no embedding"))?, Some(tokens)))
+    }
+}
+
+/// The protocol id model nodes serve raw infer on: the `/weirdnet-agent/infer/2` framing under
+/// its own id, so one node can be an inference node (which serves infer/2 to apps) and a model
+/// node at once. [``node::NodeServer` always serves it; [`RawInferDialer`] prefers it.
+pub const RAW_INFER_PROTOCOL: &str = "/weirdnet-backends/infer/1";
+
+/// A [`Dialer`] for inference nodes talking to model nodes: opening
+/// `/weirdnet-agent/infer/2` tries [`RAW_INFER_PROTOCOL`] first and falls back to infer/2 on
+/// nodes that don't accept it (backends 0.1.0). Nodes that fell back are remembered. Other
+/// protocols pass through. Wrap the dialer given to the `Pool` of model nodes.
+pub struct RawInferDialer {
+    inner: Arc<dyn Dialer>,
+    legacy: Mutex<std::collections::HashSet<String>>,
+}
+
+impl RawInferDialer {
+    pub fn new(inner: Arc<dyn Dialer>) -> Self {
+        Self { inner, legacy: Mutex::new(Default::default()) }
+    }
+
+    /// Whether `node` answered only on infer/2.
+    pub fn is_legacy(&self, node: &str) -> bool {
+        self.legacy.lock().unwrap_or_else(|e| e.into_inner()).contains(node)
+    }
+}
+
+#[async_trait]
+impl Dialer for RawInferDialer {
+    async fn open(&self, node: &str, protocol: &str) -> Result<Channel, RemoteError> {
+        if protocol != v2::PROTOCOL {
+            return self.inner.open(node, protocol).await;
+        }
+        if !self.is_legacy(node) {
+            match self.inner.open(node, RAW_INFER_PROTOCOL).await {
+                Err(RemoteError::Unsupported { .. }) => {}
+                other => return other,
+            }
+        }
+        let ch = self.inner.open(node, v2::PROTOCOL).await?;
+        self.legacy.lock().unwrap_or_else(|e| e.into_inner()).insert(node.to_string());
+        Ok(ch)
     }
 }
 

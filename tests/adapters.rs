@@ -13,7 +13,7 @@ use weirdnet_agent::remote::infer::v2::{EmbedRequest, Prefix, Request, Sampling}
 use weirdnet_agent::remote::pool::{NoEvents, Pool};
 use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
 use weirdnet_agent::{CancelToken, Message, ToolSpec};
-use weirdnet_backends::{Chunk, EngineKind, ModelHost, ModelState, Supervisor, SupervisorEvent, Wrap};
+use weirdnet_backends::{Chunk, EngineKind, ModelHost, ModelState, RAW_INFER_PROTOCOL, RawInferDialer, Supervisor, SupervisorEvent, Wrap};
 
 use common::{launch, serve, supervisor};
 
@@ -230,6 +230,31 @@ fn raw_infer2_through_the_model_host() {
         let e = pool.embed(EmbedRequest::new(vec!["a b".into(), "c".into()]).with_model("embed"), &cancel).await.unwrap();
         assert_eq!(e.vectors, vec![vec![3.0, 2.0, 1.0, 0.0], vec![1.0, 1.0, 1.0, 0.0]]);
         assert_eq!(e.usage.map(|u| u.prompt_tokens), Some(2), "one token per input from the mock engine");
+
+        // RawInferDialer: this memory node serves only infer/2 (a 0.1.0 model node), so the
+        // dialer falls back and remembers it; a node on the new id is used directly.
+        let raw = Arc::new(RawInferDialer::new(Arc::new(serve("model-node", host.clone(), Admission::new(2)))));
+        let p = Pool::new(raw.clone(), vec!["model-node".to_string()]);
+        assert_eq!(
+            p.infer(Request::messages(vec![Message::user("hi")]).raw(), &NoEvents, &cancel).await.unwrap().text,
+            "Hello from chat! You said: hi"
+        );
+        assert!(raw.is_legacy("model-node"));
+        let new_only = weirdnet_agent::remote::MemoryDialer::new();
+        let h = host.clone();
+        new_only.route_only("new", &[RAW_INFER_PROTOCOL], move |ch, _| {
+            let h = h.clone();
+            tokio::spawn(async move {
+                let _ = weirdnet_agent::remote::infer::v2::serve(ch, Caller::new("inference-node"), h.as_ref(), &Admission::new(1)).await;
+            });
+        });
+        let raw = Arc::new(RawInferDialer::new(Arc::new(new_only)));
+        let p = Pool::new(raw.clone(), vec!["new".to_string()]);
+        assert_eq!(
+            p.infer(Request::messages(vec![Message::user("yo")]).raw(), &NoEvents, &cancel).await.unwrap().text,
+            "Hello from chat! You said: yo"
+        );
+        assert!(!raw.is_legacy("new"));
 
         host.set_draining(true);
         let err = pool.infer(Request::messages(vec![Message::user("hi")]).raw(), &NoEvents, &cancel).await.unwrap_err();
