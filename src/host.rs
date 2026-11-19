@@ -242,7 +242,7 @@ impl EmbedBackend for EngineModel {
 
 /// The protocol id model nodes serve raw infer on: the `/weirdnet-agent/infer/2` framing under
 /// its own id, so one node can be an inference node (which serves infer/2 to apps) and a model
-/// node at once. [``node::NodeServer` always serves it; [`RawInferDialer`] prefers it.
+/// node at once. `NodeServer` (`node` feature) always serves it; [`RawInferDialer`] prefers it.
 pub const RAW_INFER_PROTOCOL: &str = "/weirdnet-backends/infer/1";
 
 /// A [`Dialer`] for inference nodes talking to model nodes: opening
