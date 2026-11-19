@@ -8,7 +8,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use futures::StreamExt;
 use weirdnet_agent::remote::infer::InferHost;
-use weirdnet_agent::remote::infer::v2::{EmbedBackend, Finish, InferBackend, Output, Request};
+use weirdnet_agent::remote::infer::v2::{EmbedBackend, Finish, InferBackend, Input, Output, Request};
 use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
 use weirdnet_agent::{CancelToken, ModelBackend};
 
@@ -155,7 +155,8 @@ impl InferBackend for EngineModel {
         self.id.clone()
     }
 
-    /// Both engines continue an assistant prefix.
+    /// Both engines continue an assistant prefix (chat) or the prompt plus the prefix (a raw
+    /// prompt, through `/v1/completions`).
     fn resumes(&self) -> bool {
         true
     }
@@ -163,7 +164,16 @@ impl InferBackend for EngineModel {
     async fn infer(&self, request: &Request, out: &Output, cancel: &CancelToken) -> Result<Finish, RemoteError> {
         self.ready().await?;
         let started = Instant::now();
-        let mut stream = self.supervisor.chat(&self.id, request).await?;
+        let mut stream = match &request.input {
+            Input::Prompt(prompt) => {
+                let mut prompt = prompt.clone();
+                if let Some(p) = &request.assistant_prefix {
+                    prompt.push_str(&p.text);
+                }
+                self.supervisor.complete(&self.id, &prompt, &request.sampling, request.seed).await?
+            }
+            _ => self.supervisor.chat(&self.id, request).await?,
+        };
         let mut calls = ToolCalls::default();
         let mut first: Option<f64> = None;
         loop {
@@ -214,14 +224,19 @@ impl EmbedBackend for EngineModel {
     }
 
     async fn embed(&self, input: &str, cancel: &CancelToken) -> Result<Vec<f32>, RemoteError> {
+        Ok(self.embed_counted(input, cancel).await?.0)
+    }
+
+    /// The vector and the engine's `usage.prompt_tokens`.
+    async fn embed_counted(&self, input: &str, cancel: &CancelToken) -> Result<(Vec<f32>, Option<u64>), RemoteError> {
         self.ready().await?;
         let inputs = [input.to_string()];
         let call = self.supervisor.embed(&self.id, &inputs);
-        let (mut vectors, _) = tokio::select! {
+        let (mut vectors, tokens) = tokio::select! {
             _ = cancel.cancelled() => return Err(RemoteError::Cancelled),
             r = call => r?,
         };
-        vectors.pop().ok_or_else(|| engine_error("no embedding"))
+        Ok((vectors.pop().ok_or_else(|| engine_error("no embedding"))?, Some(tokens)))
     }
 }
 

@@ -74,7 +74,7 @@ fn streaming(obj: &mut Map<String, Value>, alias: &str) {
 /// message; vLLM gets `continue_final_message`). Reasoning in the prefix is not continued.
 pub fn chat_body(request: &Request, alias: &str, engine: EngineKind) -> Result<Value, RemoteError> {
     let Input::Messages(messages) = &request.input else {
-        return Err(bad_request("model nodes take assembled messages, not a context_ref"));
+        return Err(bad_request("chat takes assembled messages, not a context_ref or a raw prompt"));
     };
     let mut msgs: Vec<Value> = messages.iter().map(message).collect();
     let prefix = request.assistant_prefix.as_ref().filter(|p| !p.text.is_empty());

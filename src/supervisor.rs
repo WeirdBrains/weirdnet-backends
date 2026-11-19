@@ -633,7 +633,8 @@ impl Supervisor {
         Ok(stream_chunks(resp, guard))
     }
 
-    /// Streams a raw text completion of `prompt` from `id`.
+    /// Streams a raw text completion of `prompt` from `id`, which must be ready. Response
+    /// formats and tools don't apply.
     pub async fn complete(&self, id: &str, prompt: &str, sampling: &Sampling, seed: Option<u64>) -> Result<ChunkStream, RemoteError> {
         let engine = self.engine_of(id)?;
         let body = openai::completion_body(prompt, sampling, seed, id, engine);

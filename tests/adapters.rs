@@ -222,8 +222,14 @@ fn raw_infer2_through_the_model_host() {
         waiting.wait_for_model = true;
         assert_eq!(pool.infer(waiting, &NoEvents, &cancel).await.unwrap().text, "Hello from cold! You said: hi");
 
-        let e = pool.embed(EmbedRequest::new(vec!["a b".into()]).with_model("embed"), &cancel).await.unwrap();
-        assert_eq!(e.vectors, vec![vec![3.0, 2.0, 1.0, 0.0]]);
+        // A raw prompt goes to /v1/completions.
+        let answer = pool.infer(Request::prompt("Long ago").raw(), &NoEvents, &cancel).await.unwrap();
+        assert_eq!((answer.text.as_str(), answer.finish_reason.as_deref()), (" once upon a time", Some("length")));
+        assert_eq!(answer.usage.map(|u| (u.prompt_tokens, u.completion_tokens)), Some((2, 4)));
+
+        let e = pool.embed(EmbedRequest::new(vec!["a b".into(), "c".into()]).with_model("embed"), &cancel).await.unwrap();
+        assert_eq!(e.vectors, vec![vec![3.0, 2.0, 1.0, 0.0], vec![1.0, 1.0, 1.0, 0.0]]);
+        assert_eq!(e.usage.map(|u| u.prompt_tokens), Some(2), "one token per input from the mock engine");
 
         host.set_draining(true);
         let err = pool.infer(Request::messages(vec![Message::user("hi")]).raw(), &NoEvents, &cancel).await.unwrap_err();
