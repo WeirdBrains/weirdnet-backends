@@ -1,0 +1,244 @@
+//! The adapters against a fake engine (`examples/mock_engine.rs`): launch, readiness, streamed
+//! chat with reasoning, tool calls and prefixes, completions, embeddings, swap groups, idle
+//! unload, wrapping a stock server and crash restarts; and raw infer/2 through `ModelHost`.
+
+mod common;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::StreamExt;
+use weirdnet_agent::remote::infer::Admission;
+use weirdnet_agent::remote::infer::v2::{EmbedRequest, Prefix, Request, Sampling};
+use weirdnet_agent::remote::pool::{NoEvents, Pool};
+use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
+use weirdnet_agent::{CancelToken, Message, ToolSpec};
+use weirdnet_backends::{Chunk, EngineKind, ModelHost, ModelState, Supervisor, SupervisorEvent, Wrap};
+
+use common::{launch, serve, supervisor};
+
+async fn collect(sup: &Supervisor, id: &str, req: &Request) -> Vec<Chunk> {
+    let mut s = sup.chat(id, req).await.unwrap();
+    let mut out = Vec::new();
+    while let Some(c) = s.next().await {
+        out.push(c.unwrap());
+    }
+    out
+}
+
+fn text(chunks: &[Chunk]) -> String {
+    chunks.iter().filter_map(|c| if let Chunk::Text(t) = c { Some(t.as_str()) } else { None }).collect()
+}
+
+fn chat_reasoning_tools_prefix_completion_and_embeddings() {
+    common::block_on(async {
+        let mut embed = launch("embed", EngineKind::Llamacpp);
+        embed.embedding = true;
+        let sup = supervisor(vec![launch("chat", EngineKind::Llamacpp), launch("big", EngineKind::Vllm), embed]);
+        assert_eq!(sup.state("chat"), Some(ModelState::Unloaded));
+        let err = sup.chat("chat", &Request::messages(vec![Message::user("hi")])).await.err().unwrap();
+        assert!(matches!(err, RemoteError::Unavailable { .. }), "{err:?}");
+
+        sup.load("chat").await.unwrap();
+        assert_eq!(sup.state("chat"), Some(ModelState::Ready));
+
+        let chunks = collect(&sup, "chat", &Request::messages(vec![Message::user("think about it")])).await;
+        assert_eq!(chunks.first(), Some(&Chunk::Reasoning("hmm".into())));
+        assert_eq!(text(&chunks), "Hello from chat! You said: think about it");
+        match chunks.last().unwrap() {
+            Chunk::Done { finish_reason, usage } => {
+                assert_eq!(finish_reason.as_deref(), Some("stop"));
+                assert_eq!(usage.unwrap().prompt_tokens, 5);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let req = Request::messages(vec![Message::user("x")]).with_tools(vec![ToolSpec::new("lookup", "look it up")]);
+        let mut calls = weirdnet_backends::ToolCalls::default();
+        for c in collect(&sup, "chat", &req).await {
+            if let Chunk::ToolCall { index, id, name, arguments } = c {
+                calls.push(index, id, name, &arguments);
+            }
+        }
+        let calls = calls.finish();
+        assert_eq!((calls[0].id.as_str(), calls[0].name.as_str()), ("call_1", "lookup"));
+        assert_eq!(calls[0].arguments, serde_json::json!({"q": "x"}));
+
+        let req = Request::messages(vec![Message::user("hi")]).with_prefix(Prefix::new("Hello ", ""));
+        assert_eq!(text(&collect(&sup, "chat", &req).await), "world");
+
+        let mut s = sup.complete("chat", "Tell me", &Sampling::default(), None).await.unwrap();
+        let mut done = String::new();
+        while let Some(c) = s.next().await {
+            if let Chunk::Text(t) = c.unwrap() {
+                done.push_str(&t);
+            }
+        }
+        assert_eq!(done, " once upon a time");
+
+        // vLLM's flags and key variable.
+        sup.load("big").await.unwrap();
+        assert_eq!(text(&collect(&sup, "big", &Request::messages(vec![Message::user("yo")])).await), "Hello from big! You said: yo");
+
+        sup.load("embed").await.unwrap();
+        let (vectors, tokens) = sup.embed("embed", &["one two".into(), "three".into()]).await.unwrap();
+        assert_eq!((vectors, tokens), (vec![vec![7.0, 2.0, 1.0, 0.0], vec![5.0, 1.0, 1.0, 0.0]], 2));
+        sup.shutdown().await;
+        assert_eq!(sup.state("chat"), Some(ModelState::Unloaded));
+    })
+}
+
+fn swap_groups_and_idle_unload() {
+    common::block_on(async {
+        let mut a = launch("a", EngineKind::Llamacpp);
+        a.swap_group = Some("gpu".into());
+        let mut b = launch("b", EngineKind::Llamacpp);
+        b.swap_group = Some("gpu".into());
+        let mut idle = launch("idle", EngineKind::Llamacpp);
+        idle.idle_ttl = Some(Duration::from_millis(200));
+        let sup = supervisor(vec![a, b, idle]);
+        let mut events = sup.subscribe();
+        sup.load("a").await.unwrap();
+        sup.load("b").await.unwrap();
+        assert_eq!((sup.state("a"), sup.state("b")), (Some(ModelState::Unloaded), Some(ModelState::Ready)), "one model per swap group");
+
+        sup.load("idle").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(sup.reap_idle().await, vec!["idle".to_string()]);
+        assert_eq!(sup.state("idle"), Some(ModelState::Unloaded));
+        let mut seen = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            seen.push(e);
+        }
+        assert!(seen.contains(&SupervisorEvent::Unloaded { model: "idle".into(), idle: true }), "{seen:?}");
+        sup.shutdown().await;
+    })
+}
+
+fn wraps_a_loopback_server_and_refuses_others() {
+    common::block_on(async {
+        // Run the mock as a "stock server" the node does not own.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut child = tokio::process::Command::new(common::mock_engine())
+            .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--alias", "stock"])
+            .env("WEIRDNET_MOCK_LOAD_MS", "0")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stock = launch("stock", EngineKind::Llamacpp);
+        stock.wrap = Some(Wrap { url: format!("http://127.0.0.1:{port}"), api_key: None });
+        let mut remote = launch("remote", EngineKind::Llamacpp);
+        remote.wrap = Some(Wrap { url: "http://192.0.2.1:8080".into(), api_key: None });
+        let sup = supervisor(vec![stock, remote]);
+        let mut ok = false;
+        for _ in 0..50 {
+            if sup.load("stock").await.is_ok() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ok, "wrapped server never came up");
+        assert!(sup.status().iter().any(|m| m.id == "stock" && m.wrapped && m.pid.is_none()));
+        assert_eq!(text(&collect(&sup, "stock", &Request::messages(vec![Message::user("hi")])).await), "Hello from stock! You said: hi");
+        assert!(sup.load("remote").await.is_err(), "non-loopback wrap is refused");
+        sup.unload("stock").await.unwrap();
+        assert!(child.try_wait().unwrap().is_none(), "unload only detaches a wrapped server");
+        child.kill().await.unwrap();
+    })
+}
+
+#[cfg(unix)]
+fn crash_restarts_then_crash_loop() {
+    common::block_on(async {
+        let sup = supervisor(vec![launch("crashy", EngineKind::Llamacpp)]);
+        let mut events = sup.subscribe();
+        let kill = |sup: &Supervisor| {
+            let pid = sup.status()[0].pid.unwrap();
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        };
+        sup.load("crashy").await.unwrap();
+        kill(&sup);
+        // Restarted after the backoff.
+        let mut restarted = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if sup.state("crashy") == Some(ModelState::Ready) && sup.status()[0].crashes == 1 {
+                restarted = true;
+                break;
+            }
+        }
+        assert!(restarted, "{:?}", sup.status());
+        kill(&sup);
+        let mut looped = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            while let Ok(e) = events.try_recv() {
+                looped |= matches!(e, SupervisorEvent::CrashLoop { .. });
+            }
+            if looped {
+                break;
+            }
+        }
+        assert!(looped);
+        assert!(sup.load("crashy").await.is_err(), "a crash loop refuses plain loads");
+        sup.load_with("crashy", true).await.unwrap();
+        sup.shutdown().await;
+    })
+}
+
+fn raw_infer2_through_the_model_host() {
+    common::block_on(async {
+        let mut embed = launch("embed", EngineKind::Llamacpp);
+        embed.embedding = true;
+        let sup = supervisor(vec![launch("chat", EngineKind::Llamacpp), launch("cold", EngineKind::Llamacpp), embed]);
+        sup.load("chat").await.unwrap();
+        sup.load("embed").await.unwrap();
+        let auth: Arc<dyn Authorize> =
+            Arc::new(|c: &Caller| if c.peer == "inference-node" { Ok(()) } else { Err(RemoteError::refused("unknown-device")) });
+        let host = Arc::new(ModelHost::new(sup.clone(), auth).with_default("chat"));
+        let dialer = serve("model-node", host.clone(), Admission::new(2));
+        let pool = Pool::new(Arc::new(dialer), vec!["model-node".to_string()]);
+        let cancel = CancelToken::new();
+
+        let answer = pool.infer(Request::messages(vec![Message::user("think hi")]).raw(), &NoEvents, &cancel).await.unwrap();
+        assert_eq!((answer.text.as_str(), answer.reasoning.as_str()), ("Hello from chat! You said: think hi", "hmm"));
+        assert_eq!(answer.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(answer.usage.unwrap().completion_tokens, 8);
+        assert!(host.speed("chat").ttft_ms.is_some());
+
+        let tools = Request::messages(vec![Message::user("q")]).with_tools(vec![ToolSpec::new("lookup", "")]).raw();
+        let answer = pool.infer(tools, &NoEvents, &cancel).await.unwrap();
+        assert_eq!((answer.tool_calls.len(), answer.finish_reason.as_deref()), (1, Some("tool_calls")));
+
+        // Not loaded: refused, unless the request waits for the model.
+        let cold = Request::messages(vec![Message::user("hi")]).with_model("cold").raw();
+        let err = pool.infer(cold.clone(), &NoEvents, &cancel).await.unwrap_err();
+        assert!(matches!(err.error, RemoteError::Unavailable { .. }), "{:?}", err.error);
+        let mut waiting = cold;
+        waiting.wait_for_model = true;
+        assert_eq!(pool.infer(waiting, &NoEvents, &cancel).await.unwrap().text, "Hello from cold! You said: hi");
+
+        let e = pool.embed(EmbedRequest::new(vec!["a b".into()]).with_model("embed"), &cancel).await.unwrap();
+        assert_eq!(e.vectors, vec![vec![3.0, 2.0, 1.0, 0.0]]);
+
+        host.set_draining(true);
+        let err = pool.infer(Request::messages(vec![Message::user("hi")]).raw(), &NoEvents, &cancel).await.unwrap_err();
+        assert!(matches!(err.error, RemoteError::Unavailable { .. }), "{:?}", err.error);
+        sup.shutdown().await;
+    })
+}
+
+fn main() {
+    common::main(&[
+        ("chat_reasoning_tools_prefix_completion_and_embeddings", chat_reasoning_tools_prefix_completion_and_embeddings as fn()),
+        ("swap_groups_and_idle_unload", swap_groups_and_idle_unload as fn()),
+        ("wraps_a_loopback_server_and_refuses_others", wraps_a_loopback_server_and_refuses_others as fn()),
+        #[cfg(unix)]
+        ("crash_restarts_then_crash_loop", crash_restarts_then_crash_loop as fn()),
+        ("raw_infer2_through_the_model_host", raw_infer2_through_the_model_host as fn()),
+    ]);
+}
