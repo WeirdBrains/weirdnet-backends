@@ -10,7 +10,7 @@ use futures::StreamExt;
 use weirdnet_agent::remote::infer::InferHost;
 use weirdnet_agent::remote::infer::v2::{self, EmbedBackend, Finish, InferBackend, Input, Output, Request};
 use weirdnet_agent::remote::{Authorize, Caller, Channel, Dialer, RemoteError};
-use weirdnet_agent::{CancelToken, ModelBackend};
+use weirdnet_agent::{CancelToken, Modalities, ModelBackend};
 
 use crate::error::{bad_request, engine_error, unavailable};
 use crate::sse::{Chunk, ToolCalls};
@@ -50,7 +50,9 @@ impl Speed {
 }
 
 /// Serves the supervisor's models over infer/2. Requests name a model by its launch id (or get
-/// the default). A model that is not ready is refused as unavailable unless the request has
+/// the default). A request with image or audio parts is refused (`Unsupported`, so a pool tries
+/// elsewhere) unless the model takes them ([`ModelLaunch::capabilities`](crate::ModelLaunch::capabilities));
+/// remote image URLs are a `BadRequest`. A model that is not ready is refused as unavailable unless the request has
 /// `wait_for_model` or the host loads on demand. While draining, new requests are refused.
 pub struct ModelHost {
     supervisor: Supervisor,
@@ -96,11 +98,14 @@ impl ModelHost {
         self.speed.lock().unwrap_or_else(|e| e.into_inner()).get(model).copied().unwrap_or_default()
     }
 
-    fn pick(&self, model: Option<&str>, wait: bool) -> Result<(String, bool), RemoteError> {
+    fn pick(&self, model: Option<&str>, wait: bool, needed: Modalities) -> Result<(String, bool), RemoteError> {
         if self.draining() {
             return Err(unavailable("this node is draining"));
         }
         let id = model.map(str::to_string).or_else(|| self.default_model.clone()).ok_or_else(|| bad_request("no model named and no default"))?;
+        if let Some(what) = self.supervisor.capabilities(&id).and_then(|c| c.lacking(needed)) {
+            return Err(RemoteError::Unsupported { message: format!("model `{id}` does not take {what} on this node") });
+        }
         match self.supervisor.state(&id) {
             None => Err(crate::error::unknown_model(&id)),
             Some(ModelState::Ready) => Ok((id, false)),
@@ -125,12 +130,16 @@ impl InferHost for ModelHost {
     }
 
     fn open_request(&self, _caller: &Caller, request: &Request) -> Result<Arc<dyn InferBackend>, RemoteError> {
-        let (id, load) = self.pick(request.model.as_deref(), request.wait_for_model)?;
+        let needed = request.needs();
+        if let Some(Err(message)) = request.inline_messages().unwrap_or_default().iter().map(|m| m.content.check()).find(Result::is_err) {
+            return Err(bad_request(message));
+        }
+        let (id, load) = self.pick(request.model.as_deref(), request.wait_for_model, needed)?;
         Ok(Arc::new(self.backend(id, load)))
     }
 
     fn open_embed(&self, _caller: &Caller, model: Option<&str>) -> Result<Arc<dyn EmbedBackend>, RemoteError> {
-        let (id, load) = self.pick(model, false)?;
+        let (id, load) = self.pick(model, false, Modalities::TEXT)?;
         Ok(Arc::new(self.backend(id, load)))
     }
 }

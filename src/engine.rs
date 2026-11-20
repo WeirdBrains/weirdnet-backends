@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use weirdnet_agent::Modalities;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -71,6 +72,16 @@ impl Capabilities {
     pub fn with_audio(mut self, on: bool) -> Self {
         self.audio = on;
         self
+    }
+
+    /// The inputs beyond text, as `weirdnet-agent` [`Modalities`] (what catalog entries carry).
+    pub fn inputs(&self) -> Modalities {
+        Modalities::new(self.vision, self.audio)
+    }
+
+    /// What a request needing `needed` would lack here (`"images"`, `"audio"`, ...), if anything.
+    pub fn lacking(&self, needed: Modalities) -> Option<&'static str> {
+        self.inputs().lacking(needed)
     }
 
     /// What both allow.
@@ -338,6 +349,20 @@ mod tests {
         let a = args(&EngineConfig::mlx("mlx_lm.server").command(&m, 9, "k"));
         assert_eq!(a.last().map(String::as_str), Some("32768"));
         assert_eq!(serde_json::to_string(&EngineKind::Mlx).unwrap(), "\"mlx\"");
+    }
+
+    #[test]
+    fn capabilities_as_modalities() {
+        let media = Capabilities::text().with_vision(true).with_audio(true);
+        assert_eq!(media.inputs(), Modalities::new(true, true));
+        assert_eq!(Capabilities::text().lacking(Modalities::VISION), Some("images"));
+        assert_eq!(Capabilities::text().with_vision(true).lacking(Modalities::new(true, true)), Some("audio"));
+        assert_eq!(media.lacking(Modalities::AUDIO), None);
+        assert_eq!(
+            ModelLaunch::new("x", EngineKind::Mlx, "/m/x").capabilities().lacking(Modalities::VISION),
+            Some("images"),
+            "MLX never takes images"
+        );
     }
 
     #[test]

@@ -7,10 +7,13 @@
 - MLX-LM engine (`EngineKind::Mlx`, `EngineConfig::mlx`) for Apple silicon: `mlx_lm.server` behind a proxy that checks the node's API key, rewrites `model` to `default_model`, refuses image, audio and embedding requests, and reports ready only after a one-token completion. Wrapped MLX-LM servers get the same proxy.
 - `mlx` module: `install` puts a pinned `mlx-lm` (0.32.2) into a venv with `uv` or `python3`; `install_commands`, `server_in`, `supported`.
 - `Capabilities` (chat, embeddings, vision, audio): `EngineKind::capabilities`, `ModelLaunch::capabilities`, `Supervisor::capabilities` and `ModelStatus::capabilities` in capability records.
+- Image and audio content parts (`weirdnet-agent` 0.5 `Content`) reach llama.cpp unchanged; `ModelHost` refuses them for a model without those capabilities (`Unsupported`) and refuses remote image URLs (`BadRequest`).
+- `Capabilities::inputs` and `Capabilities::lacking`.
 
 ### Changed
 
 - `Supervisor::embed` refuses MLX models with a bad request.
+- Breaking: needs `weirdnet-agent` 0.5 (content parts).
 
 ## [0.1.2] - 2026-11-20
 
