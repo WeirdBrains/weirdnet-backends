@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Image and audio content parts reach llama.cpp and vLLM unchanged (`weirdnet-agent` 0.5 `Content`).
+- `ModelLaunch::inputs`, `with_inputs` and `accepts`, `EngineKind::takes_parts`, `ModelStatus::inputs` (in capability records), `Supervisor::accepts`.
+- `ModelHost` refuses images or audio for a model that doesn't take them (`Unsupported`) and remote image URLs (`BadRequest`).
+
+### Changed
+
+- Breaking: needs `weirdnet-agent` 0.5; `ModelLaunch` has a new public field.
+
 ## [0.1.2] - 2026-11-20
 
 ### Added

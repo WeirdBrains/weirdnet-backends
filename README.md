@@ -12,9 +12,17 @@ the engines and serves them to inference nodes; what to load is always the calle
   detection, `SupervisorEvent`s, per-model logs; chat, completion and embedding forwarding.
 - `ChunkDecoder` / `ToolCalls`: OpenAI server-sent events decoded into `Chunk`s (text,
   reasoning, tool-call fragments, finish reason and usage).
-- `ModelHost`: a [`weirdnet-agent`](https://crates.io/crates/weirdnet-agent) 0.4 `InferHost`
+- `ModelHost`: a [`weirdnet-agent`](https://crates.io/crates/weirdnet-agent) 0.5 `InferHost`
   serving **raw infer/2** from the supervisor's models. Cancel aborts the engine request;
   assistant prefixes continue (resume); draining refuses new requests.
+- Images and audio: `ModelLaunch::inputs` (`with_inputs(Modalities::VISION)`) declares what a
+  chat model reads beyond text; for llama.cpp, start it with its projector
+  (`extra_args: ["--mmproj", path]`). `ModelLaunch::accepts()` is what the node advertises
+  (`ModelStatus::inputs`, so capability records carry it) and enforces: llama.cpp and vLLM chat
+  models get their declared inputs, embedding models and other engines (MLX) are text-only.
+  Image (`data:` URLs only) and audio parts reach the engine unchanged in the OpenAI shape;
+  `ModelHost` refuses them for a model that doesn't take them (`Unsupported`, so a pool tries
+  another node).
 
 ```rust
 use std::sync::Arc;

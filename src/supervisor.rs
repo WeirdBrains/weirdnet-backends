@@ -108,6 +108,10 @@ pub struct ModelStatus {
     /// The configured concurrent sequences, if set.
     #[serde(default)]
     pub slots: Option<u32>,
+    /// Inputs beyond text it takes ([`ModelLaunch::accepts`](crate::ModelLaunch::accepts)).
+    /// Absent (text only) in records from nodes before 0.2.
+    #[serde(default, skip_serializing_if = "weirdnet_agent::Modalities::is_text")]
+    pub inputs: weirdnet_agent::Modalities,
 }
 
 struct Running {
@@ -223,6 +227,7 @@ impl Supervisor {
                 crashes: s.crashes.len(),
                 context: s.launch.context,
                 slots: s.launch.slots,
+                inputs: s.launch.accepts(),
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -232,6 +237,11 @@ impl Supervisor {
     /// Requests under way across all models.
     pub fn in_flight(&self) -> usize {
         self.slots().values().map(|s| s.in_flight.load(Ordering::SeqCst)).sum()
+    }
+
+    /// The inputs beyond text model `id` takes, if it is configured.
+    pub fn accepts(&self, id: &str) -> Option<weirdnet_agent::Modalities> {
+        self.slots().get(id).map(|s| s.launch.accepts())
     }
 
     pub fn state(&self, id: &str) -> Option<ModelState> {

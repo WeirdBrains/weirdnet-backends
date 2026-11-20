@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use weirdnet_agent::Modalities;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -17,6 +18,12 @@ pub enum EngineKind {
 }
 
 impl EngineKind {
+    /// The engine forwards image and audio content parts to its model (llama.cpp with a
+    /// projector, vLLM with a multimodal model). Engines not listed here are text-only.
+    pub fn takes_parts(self) -> bool {
+        matches!(self, EngineKind::Llamacpp | EngineKind::Vllm)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             EngineKind::Llamacpp => "llamacpp",
@@ -105,6 +112,11 @@ pub struct ModelLaunch {
     /// started by hand) instead of starting an engine: the node only probes, advertises and forwards.
     #[serde(default)]
     pub wrap: Option<Wrap>,
+    /// Inputs beyond text the model reads (images, audio), as configured: for llama.cpp, a
+    /// model started with its projector (`--mmproj` in `extra_args`). Default: text only.
+    /// [`accepts`](Self::accepts) is what the node advertises and enforces.
+    #[serde(default, skip_serializing_if = "Modalities::is_text")]
+    pub inputs: Modalities,
 }
 
 /// A stock OpenAI-compatible server the node forwards to but doesn't own.
@@ -170,7 +182,20 @@ impl ModelLaunch {
             extra_args: Vec::new(),
             idle_ttl: None,
             wrap: None,
+            inputs: Modalities::TEXT,
         }
+    }
+
+    /// The inputs beyond text it reads (see [`inputs`](Self::inputs)).
+    pub fn with_inputs(mut self, inputs: Modalities) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    /// What the node advertises and lets through: the configured inputs on a chat model whose
+    /// engine forwards parts; text only for embedding models and other engines (MLX).
+    pub fn accepts(&self) -> Modalities {
+        if self.embedding || !self.engine.takes_parts() { Modalities::TEXT } else { self.inputs }
     }
 }
 
@@ -212,6 +237,21 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--alias", "qwen3-8b"]));
         assert!(a.windows(2).any(|w| w == ["--parallel", "2"]));
         assert!(!a.iter().any(|x| x == "k"), "the key stays out of argv");
+    }
+
+    #[test]
+    fn only_chat_models_on_part_engines_take_images() {
+        let both = Modalities::new(true, true);
+        assert_eq!(ModelLaunch::new("g", EngineKind::Llamacpp, "/m.gguf").accepts(), Modalities::TEXT, "text only by default");
+        assert_eq!(ModelLaunch::new("g", EngineKind::Llamacpp, "/m.gguf").with_inputs(both).accepts(), both);
+        assert_eq!(ModelLaunch::new("g", EngineKind::Vllm, "org/m").with_inputs(Modalities::VISION).accepts(), Modalities::VISION);
+        let mut e = ModelLaunch::new("e", EngineKind::Llamacpp, "/e.gguf").with_inputs(both);
+        e.embedding = true;
+        assert_eq!(e.accepts(), Modalities::TEXT);
+        let json = serde_json::to_value(ModelLaunch::new("g", EngineKind::Llamacpp, "/m.gguf")).unwrap();
+        assert!(json.get("inputs").is_none(), "text-only launches serialize as before");
+        let old: ModelLaunch = serde_json::from_value(json).unwrap();
+        assert_eq!(old.inputs, Modalities::TEXT);
     }
 
     #[test]
