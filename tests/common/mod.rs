@@ -61,7 +61,7 @@ pub fn launch(id: &str, engine: EngineKind) -> ModelLaunch {
 
 pub fn supervisor(models: Vec<ModelLaunch>) -> Supervisor {
     let mock = mock_engine();
-    let engines = vec![EngineConfig::llamacpp(&mock), EngineConfig::vllm(&mock)];
+    let engines = vec![EngineConfig::llamacpp(&mock), EngineConfig::vllm(&mock), EngineConfig::mlx(&mock)];
     Supervisor::new(engines, models, opts())
 }
 

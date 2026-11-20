@@ -1,6 +1,7 @@
 //! The adapters against a fake engine (`examples/mock_engine.rs`): launch, readiness, streamed
 //! chat with reasoning, tool calls and prefixes, completions, embeddings, swap groups, idle
-//! unload, wrapping a stock server and crash restarts; and raw infer/2 through `ModelHost`.
+//! unload, wrapping a stock server, crash restarts and MLX-LM behind its proxy; and raw infer/2
+//! through `ModelHost`.
 
 mod common;
 
@@ -13,7 +14,9 @@ use weirdnet_agent::remote::infer::v2::{EmbedRequest, Prefix, Request, Sampling}
 use weirdnet_agent::remote::pool::{NoEvents, Pool};
 use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
 use weirdnet_agent::{CancelToken, Message, ToolSpec};
-use weirdnet_backends::{Chunk, EngineKind, ModelHost, ModelState, RAW_INFER_PROTOCOL, RawInferDialer, Supervisor, SupervisorEvent, Wrap};
+use weirdnet_backends::{
+    Capabilities, Chunk, EngineKind, ModelHost, ModelState, RAW_INFER_PROTOCOL, RawInferDialer, Supervisor, SupervisorEvent, Wrap,
+};
 
 use common::{launch, serve, supervisor};
 
@@ -263,8 +266,76 @@ fn raw_infer2_through_the_model_host() {
     })
 }
 
+fn mlx_behind_its_proxy() {
+    common::block_on(async {
+        let mut emb = launch("mlx-embed", EngineKind::Mlx);
+        emb.embedding = true;
+        let sup = supervisor(vec![launch("qwen", EngineKind::Mlx), emb, launch("gguf", EngineKind::Llamacpp)]);
+        // The fake MLX-LM answers /health at once but completions only after this long; the
+        // supervisor must wait for a real token.
+        let started = std::time::Instant::now();
+        sup.load("qwen").await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(200), "ready before the weights were in");
+        assert_eq!(sup.state("qwen"), Some(ModelState::Ready));
+        // The request names the pool id; the engine only knows `default_model`.
+        let chunks = collect(&sup, "qwen", &Request::messages(vec![Message::user("hi")])).await;
+        assert_eq!(text(&chunks), "Hello from default_model! You said: hi");
+        let mut s = sup.complete("qwen", "Tell me", &Sampling::default(), None).await.unwrap();
+        let mut out = String::new();
+        while let Some(c) = s.next().await {
+            if let Chunk::Text(t) = c.unwrap() {
+                out.push_str(&t);
+            }
+        }
+        assert_eq!(out, " once upon a time");
+
+        let err = sup.embed("qwen", &["x".into()]).await.unwrap_err();
+        assert!(matches!(err, RemoteError::BadRequest { .. }), "{err:?}");
+        let err = sup.load("mlx-embed").await.unwrap_err();
+        assert!(matches!(err, RemoteError::BadRequest { .. }), "{err:?}");
+        assert!(matches!(sup.state("mlx-embed"), Some(ModelState::Failed(_))));
+
+        let caps = |id: &str| sup.status().into_iter().find(|m| m.id == id).unwrap().capabilities.unwrap();
+        assert_eq!(caps("qwen"), Capabilities::text());
+        assert!(!caps("qwen").vision && !caps("qwen").audio && !caps("qwen").embeddings);
+        assert_eq!(sup.capabilities("gguf"), Some(Capabilities::text()));
+
+        sup.unload("qwen").await.unwrap();
+        assert_eq!(sup.state("qwen"), Some(ModelState::Unloaded));
+        sup.shutdown().await;
+
+        // A stock mlx_lm.server the node only wraps still goes through the proxy.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut child = tokio::process::Command::new(common::mock_engine())
+            .args(["--model", "/m/x", "--host", "127.0.0.1", "--port", &port.to_string(), "--max-tokens", "64"])
+            .env("WEIRDNET_MOCK_LOAD_MS", "0")
+            .env_remove("LLAMA_API_KEY")
+            .env_remove("VLLM_API_KEY")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stock = launch("stock-mlx", EngineKind::Mlx);
+        stock.wrap = Some(Wrap { url: format!("http://127.0.0.1:{port}"), api_key: None });
+        let sup = supervisor(vec![stock]);
+        let mut ok = false;
+        for _ in 0..50 {
+            if sup.load("stock-mlx").await.is_ok() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ok, "wrapped MLX server never came up");
+        let chunks = collect(&sup, "stock-mlx", &Request::messages(vec![Message::user("yo")])).await;
+        assert_eq!(text(&chunks), "Hello from default_model! You said: yo");
+        sup.shutdown().await;
+        child.kill().await.unwrap();
+    })
+}
+
 fn main() {
     common::main(&[
+        ("mlx_behind_its_proxy", mlx_behind_its_proxy as fn()),
         ("chat_reasoning_tools_prefix_completion_and_embeddings", chat_reasoning_tools_prefix_completion_and_embeddings as fn()),
         ("swap_groups_and_idle_unload", swap_groups_and_idle_unload as fn()),
         ("wraps_a_loopback_server_and_refuses_others", wraps_a_loopback_server_and_refuses_others as fn()),

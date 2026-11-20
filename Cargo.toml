@@ -3,7 +3,7 @@ name = "weirdnet-backends"
 version = "0.1.2"
 edition = "2024"
 rust-version = "1.99"
-description = "Weirdnet model-node wrapper: llama.cpp server and vLLM adapters, a local supervisor (swap groups, idle unload, crash backoff, drain), SSE decoding, raw infer/2 serving, and the /weirdnet-backends/node/1 protocol with signed capability records."
+description = "Weirdnet model-node wrapper: llama.cpp server, vLLM and MLX-LM adapters, a local supervisor (swap groups, idle unload, crash backoff, drain), SSE decoding, raw infer/2 serving, and the /weirdnet-backends/node/1 protocol with signed capability records."
 authors = ["Weird Brains LLC"]
 license = "BSD-3-Clause"
 repository = "https://github.com/WeirdBrains/weirdnet-backends"
@@ -21,6 +21,7 @@ node = ["dep:weirdnet-net", "dep:weirdnet-sync", "dep:weirdnet-model", "dep:serd
 
 [dependencies]
 async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
 futures = "0.3"
 getrandom = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }

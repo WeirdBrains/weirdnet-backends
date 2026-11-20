@@ -56,7 +56,7 @@ fn sampling(obj: &mut Map<String, Value>, s: &Sampling, engine: EngineKind) {
     put("max_tokens", s.max_tokens.map(Value::from));
     put("presence_penalty", s.presence_penalty.map(Value::from));
     put("frequency_penalty", s.frequency_penalty.map(Value::from));
-    let repeat = if engine == EngineKind::Vllm { "repetition_penalty" } else { "repeat_penalty" };
+    let repeat = if matches!(engine, EngineKind::Vllm | EngineKind::Mlx) { "repetition_penalty" } else { "repeat_penalty" };
     put(repeat, s.repeat_penalty.map(Value::from));
     if !s.stop.is_empty() {
         obj.insert("stop".into(), s.stop.clone().into());

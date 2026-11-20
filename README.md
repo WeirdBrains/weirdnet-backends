@@ -1,12 +1,18 @@
 # weirdnet-backends
 
-The Weirdnet model-node wrapper. A model node runs models and takes requests, like a llama.cpp
-or vLLM server (it can even be one: a stock server it only wraps). This crate starts and stops
+The Weirdnet model-node wrapper. A model node runs models and takes requests, like a llama.cpp,
+vLLM or MLX-LM server (it can even be one: a stock server it only wraps). This crate starts and stops
 the engines and serves them to inference nodes; what to load is always the caller's decision.
 
-- `EngineConfig` / `ModelLaunch`: how `llama-server` and `vllm serve` are launched (loopback
-  only, random port, per-process API key in the environment) and probed. `Wrap` attaches to a
-  stock OpenAI-compatible server on loopback without owning it.
+- `EngineConfig` / `ModelLaunch`: how `llama-server`, `vllm serve` and MLX-LM's
+  `mlx_lm.server` are launched (loopback only, random port, per-process API key in the
+  environment, or checked by a proxy for MLX-LM) and probed. `Wrap` attaches to a stock
+  OpenAI-compatible server on loopback without owning it.
+- `Capabilities`: what each model takes (chat, embeddings, images, audio), in `ModelStatus`
+  and so in capability records, so routing keeps image, audio and embedding requests off
+  models that can't serve them. `ModelLaunch::capabilities` derives it: embedding models only
+  embed; llama.cpp models with a multimodal projector (`--mmproj`) take images and audio;
+  vLLM and MLX-LM models are text only.
 - `Supervisor`: load and unload with draining, **swap groups** (loading one model of a group
   unloads the others), **idle unload**, crash restarts with exponential backoff and crash-loop
   detection, `SupervisorEvent`s, per-model logs; chat, completion and embedding forwarding.
@@ -25,6 +31,36 @@ let sup = Supervisor::new(vec![EngineConfig::llamacpp("llama-server")], vec![cha
 sup.load("qwen3-8b").await?;
 let host = Arc::new(ModelHost::new(sup.clone(), auth)); // serve with weirdnet_agent::remote::infer::v2::serve
 ```
+
+## MLX-LM (Apple silicon)
+
+`EngineKind::Mlx` runs MLX-format models with `mlx_lm.server` on macOS on Apple silicon:
+
+```rust
+use weirdnet_backends::{EngineConfig, EngineKind, ModelLaunch, mlx};
+
+let server = mlx::install(&engines_dir.join("mlx"))?; // pinned mlx-lm in a venv (uv, else python3)
+let mut qwen = ModelLaunch::new("qwen3-8b", EngineKind::Mlx, "/models/mlx/Qwen3-8B-4bit");
+qwen.context = Some(32768); // becomes --max-tokens
+let engines = vec![EngineConfig::mlx(server), EngineConfig::llamacpp("llama-server")];
+```
+
+- Launch: `mlx_lm.server --model <dir> --host 127.0.0.1 --port <p> --max-tokens <context>`
+  (32768 when no context is set; MLX-LM's own default is 512).
+- MLX-LM has no API key, so it runs on a private loopback port and the model's port is a small
+  proxy in the node that checks the per-process key as a bearer token, rewrites each request's
+  `model` to MLX-LM's `default_model`, lists the pool id in `/v1/models` and streams responses
+  through.
+- A wrapped stock `mlx_lm.server` (`ModelLaunch::wrap` with `EngineKind::Mlx`) gets the same
+  proxy.
+- Ready only after a one-token completion succeeds (MLX-LM's `/health` is 200 before the
+  weights are loaded).
+- Text only: image and audio content parts get 400, and so does `/v1/embeddings`;
+  `Supervisor::embed` refuses MLX models, and an MLX model with `embedding` set fails to load.
+  Run embedding and vision models on llama.cpp.
+- `mlx::install` puts `mlx-lm==0.32.2` (`mlx::MLX_LM_VERSION`) into a venv made by `uv`
+  (Python 3.12) when it is on `PATH`, else by `python3 -m venv`; `mlx::install_commands` gives
+  the commands for apps that run them themselves.
 
 ## The `node` feature: `/weirdnet-backends/node/1`
 
@@ -62,6 +98,7 @@ How inference nodes drive model nodes over [`weirdnet-net`](https://crates.io/cr
 |---|---|---|---|
 | llama.cpp | yes | yes | yes |
 | vLLM | yes | no (vLLM is Linux-only) | no |
+| MLX-LM | no | Apple silicon only | no |
 | Graceful stop (SIGTERM, then SIGKILL after a grace period) | yes | yes | no: killed outright |
 | Engine in its own process group (children stopped too) | yes | yes | no |
 | Engine dies with the node process | yes (`PR_SET_PDEATHSIG`) | no | no |
@@ -72,5 +109,6 @@ The Unix-only pieces are behind `cfg(unix)`; the library builds everywhere.
 ## Tests
 
 The adapter tests run against a mock engine (the test binary re-executes itself as a fake
-`llama-server`/`vllm serve`), never a real one. `tests/node.rs` runs node/1 and raw infer/2
+`llama-server`/`vllm serve`/`mlx_lm.server`), never a real one. The MLX proxy has unit tests
+against a fake MLX-LM server in `src/mlx.rs`; no test runs a real `mlx_lm.server`. `tests/node.rs` runs node/1 and raw infer/2
 between in-process `weirdnet-net` nodes on the memory transport.

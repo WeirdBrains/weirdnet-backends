@@ -1,4 +1,5 @@
-//! A stand-in for `llama-server` and `vllm serve`: the same flags and endpoints, canned answers.
+//! A stand-in for `llama-server`, `vllm serve` and `mlx_lm.server`: the same flags and endpoints,
+//! canned answers.
 //! Test binaries run themselves as the fake engine when started with `--port`.
 //!
 //! Chat answers "Hello from <alias>! You said: <last user message>" word by word. A last
@@ -7,6 +8,10 @@
 //! the first tool with `{"q": "<message>"}`, split over two chunks. `/health` says 503 for
 //! `WEIRDNET_MOCK_LOAD_MS` (default 200) after start. `/v1/completions` continues the prompt
 //! with " once upon a time"; `/v1/embeddings` returns `[chars, words, 1, 0]` per input.
+//!
+//! Started with `--max-tokens` it acts like `mlx_lm.server`: no API key, the model is called
+//! `default_model`, `/health` is 200 at once while completions fail with 500 until loaded, and
+//! there is no `/v1/embeddings`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +28,7 @@ struct Mock {
     alias: String,
     key: Option<String>,
     ready_at: Instant,
+    mlx: bool,
 }
 
 /// Runs the mock engine (the test binary re-executes itself with engine flags).
@@ -38,26 +44,34 @@ async fn serve() {
     let alias = flag("--alias").or_else(|| flag("--served-model-name")).or_else(|| flag("--model")).unwrap_or_else(|| "mock".into());
     let load_ms = std::env::var("WEIRDNET_MOCK_LOAD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
     assert_eq!(host, "127.0.0.1", "engines must bind loopback only");
-    let key = std::env::var("LLAMA_API_KEY").or_else(|_| std::env::var("VLLM_API_KEY")).ok();
-    let st = Arc::new(Mock { alias, key, ready_at: Instant::now() + Duration::from_millis(load_ms) });
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/chat/completions", post(chat))
-        .route("/v1/completions", post(completions))
-        .route("/v1/embeddings", post(embeddings))
-        .with_state(st);
+    let mlx = flag("--max-tokens").is_some();
+    let (alias, key) = if mlx {
+        assert!(std::env::var("LLAMA_API_KEY").is_err() && std::env::var("VLLM_API_KEY").is_err(), "MLX-LM gets no key");
+        ("default_model".to_string(), None)
+    } else {
+        (alias, std::env::var("LLAMA_API_KEY").or_else(|_| std::env::var("VLLM_API_KEY")).ok())
+    };
+    let st = Arc::new(Mock { alias, key, ready_at: Instant::now() + Duration::from_millis(load_ms), mlx });
+    let mut app = Router::new().route("/health", get(health)).route("/v1/chat/completions", post(chat)).route("/v1/completions", post(completions));
+    if !mlx {
+        app = app.route("/v1/embeddings", post(embeddings));
+    }
+    let app = app.with_state(st);
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
 }
 
 async fn health(State(st): State<Arc<Mock>>) -> Response {
-    if Instant::now() < st.ready_at {
+    if Instant::now() < st.ready_at && !st.mlx {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error": {"message": "Loading model", "code": 503}}))).into_response();
     }
     axum::Json(json!({"status": "ok"})).into_response()
 }
 
 fn check(st: &Mock, headers: &HeaderMap, body: &Value) -> Option<Response> {
+    if st.mlx && Instant::now() < st.ready_at {
+        return Some((StatusCode::INTERNAL_SERVER_ERROR, "weights not loaded").into_response());
+    }
     let authorized = match &st.key {
         None => true,
         Some(k) => headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(&format!("Bearer {k}")),

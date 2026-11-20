@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use weirdnet_agent::remote::RemoteError;
 use weirdnet_agent::remote::infer::v2::{Request, Sampling};
 
-use crate::engine::{EngineConfig, EngineKind, ModelLaunch};
+use crate::engine::{Capabilities, EngineConfig, EngineKind, ModelLaunch};
 
 /// An engine's answer as it streams.
 pub type ChunkStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<Chunk, RemoteError>> + Send>>;
@@ -108,6 +108,10 @@ pub struct ModelStatus {
     /// The configured concurrent sequences, if set.
     #[serde(default)]
     pub slots: Option<u32>,
+    /// What the model takes ([`ModelLaunch::capabilities`]); `None` in records from nodes before
+    /// 0.1.3, where only `embedding` is known.
+    #[serde(default)]
+    pub capabilities: Option<Capabilities>,
 }
 
 struct Running {
@@ -118,6 +122,8 @@ struct Running {
     exited: watch::Receiver<Option<String>>,
     /// Keeps a wrapped server's never-firing exit channel open.
     _exit_tx: Option<watch::Sender<Option<String>>>,
+    /// The key-checking proxy in front of an MLX-LM server; stops when the engine record goes.
+    _proxy: Option<crate::mlx::ProxyHandle>,
 }
 
 struct Slot {
@@ -223,6 +229,7 @@ impl Supervisor {
                 crashes: s.crashes.len(),
                 context: s.launch.context,
                 slots: s.launch.slots,
+                capabilities: Some(s.launch.capabilities()),
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -236,6 +243,11 @@ impl Supervisor {
 
     pub fn state(&self, id: &str) -> Option<ModelState> {
         self.slots().get(id).map(|s| s.state.clone())
+    }
+
+    /// What `id` takes ([`ModelLaunch::capabilities`]).
+    pub fn capabilities(&self, id: &str) -> Option<Capabilities> {
+        self.slots().get(id).map(|s| s.launch.capabilities())
     }
 
     /// Starts `id` and waits until it is ready (see [`Supervisor::load_with`]).
@@ -374,6 +386,15 @@ impl Supervisor {
         wrap.check().map_err(unavailable)?;
         let base = wrap.base();
         let ok = self.inner.http.get(format!("{base}/health")).timeout(Duration::from_secs(5)).send().await.is_ok_and(|r| r.status().is_success());
+        // A stock mlx_lm.server still needs the proxy for `default_model` and text-only checks.
+        let (base, api_key, proxy) = if ok && launch.engine == EngineKind::Mlx {
+            let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| unavailable(format!("mlx proxy: {e}")))?;
+            let url = format!("http://{}", l.local_addr().map_err(|e| unavailable(format!("mlx proxy: {e}")))?);
+            let key = random_hex(24);
+            (url, Some(key.clone()), Some(crate::mlx::spawn_proxy(l, base, launch.id.clone(), key)))
+        } else {
+            (base, wrap.api_key.clone(), None)
+        };
         let (tx, rx) = watch::channel(None);
         let mut slots = self.slots();
         let slot = slots.get_mut(&launch.id).expect("checked by load");
@@ -383,7 +404,7 @@ impl Supervisor {
             return Err(unavailable(format!("{}: wrapped server {base} is not answering /health", launch.id)));
         }
         slot.state = ModelState::Ready;
-        slot.running = Some(Running { base, api_key: wrap.api_key.clone(), pid: None, stop: None, exited: rx, _exit_tx: Some(tx) });
+        slot.running = Some(Running { base, api_key, pid: None, stop: None, exited: rx, _exit_tx: Some(tx), _proxy: proxy });
         Ok(())
     }
 
@@ -394,9 +415,27 @@ impl Supervisor {
             .get(&launch.engine)
             .ok_or_else(|| unavailable(format!("engine {} is not configured on this node", launch.engine.name())))?
             .clone();
-        let port = free_port().map_err(|e| unavailable(format!("no free loopback port: {e}")))?;
+        let mlx = launch.engine == EngineKind::Mlx;
+        if mlx && launch.embedding {
+            let why = "MLX-LM serves no embeddings; run embedding models on llama.cpp or vLLM".to_string();
+            if let Some(s) = self.slots().get_mut(&launch.id) {
+                s.state = ModelState::Failed(why.clone());
+            }
+            return Err(bad_request(format!("{}: {why}", launch.id)));
+        }
+        let no_port = |e: std::io::Error| unavailable(format!("no free loopback port: {e}"));
+        // MLX-LM has no API key: it gets a private port, and the advertised one is the proxy's,
+        // bound now so nothing else can take it.
+        let (port, proxy_listener) = if mlx {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(no_port)?;
+            l.set_nonblocking(true).map_err(no_port)?;
+            (l.local_addr().map_err(no_port)?.port(), Some(l))
+        } else {
+            (free_port().map_err(no_port)?, None)
+        };
+        let engine_port = if mlx { free_port().map_err(no_port)? } else { port };
         let api_key = random_hex(24);
-        let mut cmd = engine.command(launch, port, &api_key);
+        let mut cmd = engine.command(launch, engine_port, &api_key);
         cmd.stdin(Stdio::null());
         match self.log_file(&launch.id) {
             Some((out, err)) => {
@@ -420,6 +459,14 @@ impl Supervisor {
         }
         let mut child = cmd.spawn().map_err(|e| unavailable(format!("could not start {}: {e}", engine.program.display())))?;
         let pid = child.id();
+        let proxy = match proxy_listener.map(tokio::net::TcpListener::from_std) {
+            Some(Ok(l)) => Some(crate::mlx::spawn_proxy(l, format!("http://127.0.0.1:{engine_port}"), launch.id.clone(), api_key.clone())),
+            Some(Err(e)) => {
+                let _ = terminate(&mut child, pid, self.inner.opts.stop_grace).await;
+                return Err(unavailable(format!("mlx proxy: {e}")));
+            }
+            None => None,
+        };
         let (exit_tx, exit_rx) = watch::channel(None);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let generation = {
@@ -434,6 +481,7 @@ impl Supervisor {
                 stop: Some(stop_tx),
                 exited: exit_rx.clone(),
                 _exit_tx: None,
+                _proxy: proxy,
             });
             slot.generation
         };
@@ -650,6 +698,9 @@ impl Supervisor {
     /// Embeds `input` with `id` (an embedding model). Returns the vectors in input order and the
     /// prompt tokens used.
     pub async fn embed(&self, id: &str, input: &[String]) -> Result<(Vec<Vec<f32>>, u64), RemoteError> {
+        if self.engine_of(id)? == EngineKind::Mlx {
+            return Err(bad_request(format!("{id} runs on MLX-LM, which serves no embeddings")));
+        }
         let (base, key, _guard) = self.target(id)?;
         let resp =
             self.post(format!("{base}/v1/embeddings"), key.as_deref(), &json!({"model": id, "input": input, "encoding_format": "float"})).await?;

@@ -14,6 +14,9 @@ pub enum EngineKind {
     Llamacpp,
     /// `vllm serve` (Linux, NVIDIA sm_80+ or supported ROCm).
     Vllm,
+    /// MLX-LM's `mlx_lm.server` (macOS on Apple silicon). Text only, no embeddings; the
+    /// supervisor puts a key-checking proxy in front of it (see [`crate::mlx`]).
+    Mlx,
 }
 
 impl EngineKind {
@@ -21,6 +24,62 @@ impl EngineKind {
         match self {
             EngineKind::Llamacpp => "llamacpp",
             EngineKind::Vllm => "vllm",
+            EngineKind::Mlx => "mlx",
+        }
+    }
+
+    /// The most this engine can serve. A model may serve less (see [`ModelLaunch::capabilities`]).
+    pub fn capabilities(self) -> Capabilities {
+        match self {
+            EngineKind::Llamacpp | EngineKind::Vllm => Capabilities { chat: true, embeddings: true, vision: true, audio: true },
+            EngineKind::Mlx => Capabilities::text(),
+        }
+    }
+}
+
+/// What a model takes, so routing can keep requests off models that can't serve them: images
+/// or audio off text-only models, embeddings off chat-only engines such as MLX-LM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Capabilities {
+    /// Chat and raw text completions.
+    pub chat: bool,
+    /// `/v1/embeddings`.
+    pub embeddings: bool,
+    /// Image content parts.
+    pub vision: bool,
+    /// Audio content parts.
+    pub audio: bool,
+}
+
+impl Capabilities {
+    /// Text chat and completions only.
+    pub fn text() -> Self {
+        Self { chat: true, ..Self::default() }
+    }
+
+    /// Embeddings only.
+    pub fn embeddings() -> Self {
+        Self { embeddings: true, ..Self::default() }
+    }
+
+    pub fn with_vision(mut self, on: bool) -> Self {
+        self.vision = on;
+        self
+    }
+
+    pub fn with_audio(mut self, on: bool) -> Self {
+        self.audio = on;
+        self
+    }
+
+    /// What both allow.
+    pub fn intersect(self, other: Self) -> Self {
+        Self {
+            chat: self.chat && other.chat,
+            embeddings: self.embeddings && other.embeddings,
+            vision: self.vision && other.vision,
+            audio: self.audio && other.audio,
         }
     }
 }
@@ -44,8 +103,17 @@ impl EngineConfig {
         Self { kind: EngineKind::Vllm, program: program.into(), extra_args: Vec::new(), ready_timeout: Duration::from_secs(1200) }
     }
 
+    /// `program` is `mlx_lm.server`, such as [`crate::mlx::server_in`] of a venv made by
+    /// [`crate::mlx::install`].
+    pub fn mlx(program: impl Into<PathBuf>) -> Self {
+        Self { kind: EngineKind::Mlx, program: program.into(), extra_args: Vec::new(), ready_timeout: Duration::from_secs(1200) }
+    }
+
     /// The command for `model` on `127.0.0.1:port`. The API key goes in the environment, not the
     /// command line, so other local users can't read it from the process list.
+    ///
+    /// MLX-LM takes no API key: the supervisor starts it on a private port and checks the key in
+    /// a proxy on the advertised one, so `api_key` is not passed to it.
     pub fn command(&self, model: &ModelLaunch, port: u16, api_key: &str) -> Command {
         let mut cmd = Command::new(&self.program);
         match self.kind {
@@ -75,6 +143,12 @@ impl EngineConfig {
                 }
                 cmd.env("VLLM_API_KEY", api_key);
             }
+            EngineKind::Mlx => {
+                // mlx_lm.server stops at 512 tokens unless told otherwise; the others run to the
+                // context window.
+                let max = model.context.unwrap_or(crate::mlx::DEFAULT_MAX_TOKENS).to_string();
+                cmd.args(["--model", &model.source, "--host", "127.0.0.1", "--port", &port.to_string(), "--max-tokens", &max]);
+            }
         }
         cmd.args(&self.extra_args).args(&model.extra_args);
         cmd
@@ -87,7 +161,8 @@ pub struct ModelLaunch {
     /// Pool id; also the engine's served model name.
     pub id: String,
     pub engine: EngineKind,
-    /// A GGUF path for llama.cpp; a path or Hub id for vLLM.
+    /// A GGUF path for llama.cpp; a path or Hub id for vLLM; an MLX-format model directory (or
+    /// Hub id) for MLX-LM.
     pub source: String,
     pub context: Option<u32>,
     /// Concurrent requests (llama.cpp slots, vLLM max sequences).
@@ -172,6 +247,24 @@ impl ModelLaunch {
             wrap: None,
         }
     }
+
+    /// What this model takes. Embedding models only embed (and can't run on MLX-LM at all). A
+    /// llama.cpp model takes images and audio when it has a multimodal projector (`--mmproj` in
+    /// `extra_args`); the projector decides which, and llama-server refuses what it lacks. vLLM
+    /// and MLX-LM models are text only here.
+    pub fn capabilities(&self) -> Capabilities {
+        let own = if self.embedding {
+            Capabilities::embeddings()
+        } else {
+            let media = self.engine == EngineKind::Llamacpp && self.has_projector();
+            Capabilities::text().with_vision(media).with_audio(media)
+        };
+        own.intersect(self.engine.capabilities())
+    }
+
+    fn has_projector(&self) -> bool {
+        self.extra_args.iter().any(|a| matches!(a.split('=').next(), Some("--mmproj" | "-mm" | "--mmproj-url" | "-mmu")))
+    }
 }
 
 /// The first executable called `name` on `PATH`.
@@ -232,5 +325,40 @@ mod tests {
         let a = args(&EngineConfig::vllm("vllm").command(&m, 9000, "k"));
         assert_eq!(&a[..2], ["serve", "Qwen/Qwen3-8B"]);
         assert!(a.windows(2).any(|w| w == ["--served-model-name", "big"]));
+    }
+
+    #[test]
+    fn mlx_args() {
+        let mut m = ModelLaunch::new("qwen3-8b", EngineKind::Mlx, "/m/mlx/Qwen3-8B-4bit");
+        m.context = Some(4096);
+        let cmd = EngineConfig::mlx("/v/bin/mlx_lm.server").command(&m, 9, "k");
+        assert_eq!(args(&cmd), ["--model", "/m/mlx/Qwen3-8B-4bit", "--host", "127.0.0.1", "--port", "9", "--max-tokens", "4096"]);
+        assert!(cmd.as_std().get_envs().all(|(_, v)| v != Some(std::ffi::OsStr::new("k"))), "MLX-LM gets no key");
+        m.context = None;
+        let a = args(&EngineConfig::mlx("mlx_lm.server").command(&m, 9, "k"));
+        assert_eq!(a.last().map(String::as_str), Some("32768"));
+        assert_eq!(serde_json::to_string(&EngineKind::Mlx).unwrap(), "\"mlx\"");
+    }
+
+    #[test]
+    fn capabilities() {
+        let mut m = ModelLaunch::new("x", EngineKind::Mlx, "/m/x");
+        assert_eq!(m.capabilities(), Capabilities::text());
+        m.extra_args = vec!["--mmproj".into(), "/p".into()];
+        assert!(!m.capabilities().vision, "MLX-LM never takes images");
+        m.embedding = true;
+        assert_eq!(m.capabilities(), Capabilities::default(), "MLX-LM serves no embeddings");
+
+        let mut l = ModelLaunch::new("g", EngineKind::Llamacpp, "/m/g.gguf");
+        assert_eq!(l.capabilities(), Capabilities::text());
+        l.extra_args = vec!["--mmproj=/p/mm.gguf".into()];
+        let c = l.capabilities();
+        assert!(c.chat && c.vision && c.audio && !c.embeddings);
+        l.embedding = true;
+        assert_eq!(l.capabilities(), Capabilities::embeddings());
+
+        let v = ModelLaunch::new("v", EngineKind::Vllm, "Qwen/Qwen3-8B");
+        assert_eq!(v.capabilities(), Capabilities::text());
+        assert!(!EngineKind::Mlx.capabilities().embeddings && EngineKind::Llamacpp.capabilities().vision);
     }
 }
