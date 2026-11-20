@@ -4291,8 +4291,9 @@ dependencies = [
 
 [[package]]
 name = "weirdnet-agent"
-version = "0.4.5"
-source = "git+https://github.com/WeirdBrains/weirdnet-agent?rev=fd7d9972c17368c49c9bc27f54fb173337d4fea8#fd7d9972c17368c49c9bc27f54fb173337d4fea8"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95f0920cbb8119f1eba0aea20e23b278f5d97a3469c1d0fce21a095b556c13aa"
 dependencies = [
  "async-trait",
  "cbor4ii",
@@ -4357,9 +4358,9 @@ dependencies = [
 
 [[package]]
 name = "weirdnet-model"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a34f22e34dd1029522eeefe3e4d152f0fcd2ff551b7153b0e75eecbfb58cc497"
+checksum = "b3ddd78061d00ee871ee93aab6239375f542c04a1f70727190b096625f130137"
 dependencies = [
  "dirs",
  "minijinja",
