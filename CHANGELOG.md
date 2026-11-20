@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Link info in capability records: `Capability::links` (`LinkInfo`, `LinkMeasure`, `AddrClass`), set with `NodeService::set_links`; `link::local_links` lists this machine's private interfaces with the NIC's nominal speed. Only loopback, link-local and private addresses are advertised. Old verifiers ignore the field.
+- `Verifier::with_roster`: also refuses records from nodes that are unknown to, or revoked in, the `weirdnet-sync` roster.
+
+### Changed
+
+- Needs weirdnet-agent 0.4.4 and accepts weirdnet-sync 0.5 up to 0.7 (`>=0.5, <0.8`), so apps on sync 0.6 or 0.7 share one roster type.
+
 ## [0.1.1] - 2026-11-19
 
 ### Added

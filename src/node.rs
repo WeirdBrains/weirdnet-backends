@@ -37,7 +37,9 @@ use weirdnet_net::{AppBody, AppResponse, Keypair, PeerId, PublicKey};
 
 use crate::engine::EngineKind;
 use crate::host::{ModelHost, RAW_INFER_PROTOCOL, Speed};
+pub use crate::link::{AddrClass, LinkInfo, LinkMeasure};
 use crate::supervisor::{ModelState, ModelStatus, SupervisorEvent};
+use weirdnet_agent::serve::RosterView;
 
 /// The protocol id.
 pub const PROTOCOL: &str = "/weirdnet-backends/node/1";
@@ -86,6 +88,10 @@ pub struct Capability {
     pub draining: bool,
     /// Takes group jobs (`GroupUp`).
     pub group_jobs: bool,
+    /// Private interfaces (never public or CGNAT addresses), for placing swap groups. Absent
+    /// in records from 0.1.1 nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkInfo>,
 }
 
 /// One model in a [`Capability`] record.
@@ -166,22 +172,32 @@ impl SignedRecord {
     }
 }
 
-/// Checks records against the user: valid signature, and a valid, unrevoked certificate from
-/// the user for the very node that signed.
+/// Checks records against the user: valid signature, and a valid, unexpired certificate from
+/// the user for the very node that signed. With [`with_roster`](Self::with_roster) the node
+/// must also be linked in the roster now, so a revoked node presenting its old certificate is
+/// refused.
 #[derive(Clone)]
 pub struct Verifier {
     profile: &'static Profile,
     user: Option<PublicKey>,
+    roster: Option<RosterView>,
 }
 
 impl Verifier {
     pub fn new(profile: &'static Profile, user: PublicKey) -> Self {
-        Self { profile, user: Some(user) }
+        Self { profile, user: Some(user), roster: None }
     }
 
     /// Signature and expiry only (tests, or when the dialer already checked the peer).
     pub fn signature_only(profile: &'static Profile) -> Self {
-        Self { profile, user: None }
+        Self { profile, user: None, roster: None }
+    }
+
+    /// Also checks the record's node against the roster (`Roster::check_caller`): unknown,
+    /// revoked and wrong-user nodes are refused. Data-key admission doesn't matter here.
+    pub fn with_roster(mut self, roster: RosterView) -> Self {
+        self.roster = Some(roster);
+        self
     }
 
     pub fn verify(&self, record: &SignedRecord, from_peer: &str, now_ms: i64) -> Result<Capability, RemoteError> {
@@ -193,6 +209,16 @@ impl Verifier {
             };
             if !ok {
                 return Err(RemoteError::refused("capability record: no valid certificate from the user"));
+            }
+            if let Some(roster) = &self.roster {
+                use weirdnet_sync::CallerCheck;
+                match roster().check_caller(self.profile, user, from_peer, record.cert.as_ref()) {
+                    CallerCheck::Linked | CallerCheck::NotAdmitted => {}
+                    other => {
+                        let reason = other.reason().unwrap_or("unknown-device");
+                        return Err(RemoteError::refused(format!("capability record: {reason}")));
+                    }
+                }
             }
         }
         Ok(cap)
@@ -358,6 +384,7 @@ pub struct NodeService {
     info: Mutex<HashMap<String, ModelInfo>>,
     warm: Mutex<Vec<String>>,
     groups: Mutex<Vec<String>>,
+    links: Mutex<Vec<LinkInfo>>,
     recent: Mutex<VecDeque<SupervisorEvent>>,
     seq: AtomicU64,
     withdrawn: AtomicBool,
@@ -392,6 +419,7 @@ impl NodeService {
             info: Mutex::default(),
             warm: Mutex::default(),
             groups: Mutex::default(),
+            links: Mutex::default(),
             recent: Mutex::default(),
             seq: AtomicU64::new(now_ms().max(0) as u64),
             withdrawn: AtomicBool::new(false),
@@ -440,6 +468,13 @@ impl NodeService {
     /// A model's revision and quantization, for the record.
     pub fn set_model_info(&self, model: &str, revision: Option<String>, quant: Option<String>) {
         self.info.lock().unwrap_or_else(|e| e.into_inner()).insert(model.into(), (revision, quant));
+        self.touch();
+    }
+
+    /// The private links for the record (for example `link::local_links()` with the operator's
+    /// declared speeds). Public and CGNAT addresses are dropped.
+    pub fn set_links(&self, links: Vec<LinkInfo>) {
+        *self.links.lock().unwrap_or_else(|e| e.into_inner()) = crate::link::advertised(links);
         self.touch();
     }
 
@@ -496,6 +531,7 @@ impl NodeService {
             groups: self.groups.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             draining: self.host.draining(),
             group_jobs: self.workers.is_some(),
+            links: self.links.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
     }
 

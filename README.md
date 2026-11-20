@@ -34,11 +34,14 @@ How inference nodes drive model nodes over [`weirdnet-net`](https://crates.io/cr
   ([`weirdnet-model`](https://crates.io/crates/weirdnet-model) `hw`), engines, every
   configured model (state, revision, quantization, context and slot limits, load-time
   estimate, measured prefill/decode speed and time to first token), load (queued, active,
-  slots, in flight), warm prefix hashes, swap groups, draining and whether the node takes
-  group jobs. Each is signed by the node key, chained to the user by its `NodeCert`, carries
+  slots, in flight), warm prefix hashes, swap groups, draining, whether the node takes
+  group jobs and its private links (`NodeService::set_links`, `link::local_links`: address,
+  class, interface, nominal and declared speed; public and CGNAT addresses are never
+  advertised). Each is signed by the node key, chained to the user by its `NodeCert`, carries
   an increasing sequence number and expires after 90 s; it is refreshed every 15 s and on
   every change. `Verifier` checks the signature, the signer, the expiry and the user's
-  certificate; `Subscription` also rejects sequence numbers that go backwards.
+  certificate, and with `Verifier::with_roster` that the node is still linked (a revoked
+  node's record is refused even with its old certificate); `Subscription` also rejects sequence numbers that go backwards.
 - **Commands**: `Load` (with `force` for a crash loop), `Unload`, `Drain` (stop admissions and
   wait for requests under way, or resume), `GroupUp`/`GroupDown`, `Health`. Cross-machine swap
   groups (a Ray worker, an `rpc-server` on a private link) are started by the application's

@@ -4291,9 +4291,9 @@ dependencies = [
 
 [[package]]
 name = "weirdnet-agent"
-version = "0.4.1"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "721259c9004e32b394356e9ef4cc4f81cfccd33f359abdf98ee3c5682b095828"
+checksum = "f7b063d58e1e98d854ed8630756f801ff8857818edc2263ac2b5f5139c51afb1"
 dependencies = [
  "async-trait",
  "cbor4ii",
@@ -4302,6 +4302,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "weirdnet-net",
  "weirdnet-sync",
 ]
@@ -4401,14 +4402,16 @@ dependencies = [
 
 [[package]]
 name = "weirdnet-sync"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb6db4cba2b3c37138746b82e15b9ee58d413bac842dc0431d9dc8f9fb8cb45b"
+checksum = "d05697dc714dd052f56f930953c09719f4cdd46cd1d49e58ececd6cd2ff39f20"
 dependencies = [
  "blake3",
  "cbor4ii",
+ "getrandom 0.3.4",
  "hex",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "weirdnet-keys",
  "weirdnet-net",

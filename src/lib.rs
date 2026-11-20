@@ -27,6 +27,8 @@ pub mod engine;
 pub mod error;
 pub mod host;
 #[cfg(feature = "node")]
+pub mod link;
+#[cfg(feature = "node")]
 pub mod node;
 pub mod openai;
 pub mod sse;

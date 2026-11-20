@@ -17,7 +17,7 @@ use weirdnet_agent::serve::RosterAuth;
 use weirdnet_agent::serve::{Server, Serving};
 use weirdnet_agent::{CancelToken, Message, ModelBackend};
 use weirdnet_backends::node::{
-    Capability, GroupPlan, GroupWorkers, NodeClient, NodeServer, NodeServerOptions, NodeService, Subscription, Update, Verifier,
+    AddrClass, Capability, GroupPlan, GroupWorkers, LinkInfo, NodeClient, NodeServer, NodeServerOptions, NodeService, Subscription, Update, Verifier,
 };
 use weirdnet_backends::{EngineKind, ModelHost, ModelState, RawInferDialer};
 use weirdnet_net::node::{Handler, Node, NodeConfig};
@@ -169,6 +169,25 @@ fn node1_round_trip() {
         let other = Verifier::new(&WEIRDNET, foreign.public());
         let honest = service.record().unwrap();
         assert!(matches!(other.verify(&honest, &peer, weirdnet_net::now_ms()), Err(RemoteError::Refused { .. })));
+
+        // Private links go into the record; public and CGNAT addresses never do.
+        let links = ["10.0.0.2", "8.8.8.8", "100.100.1.1"].map(|a| LinkInfo::new(a.parse().unwrap()).with_declared_gbps(Some(25.0)));
+        service.set_links(links.to_vec());
+        let cap = until(&mut sub, |c| !c.links.is_empty()).await;
+        assert_eq!(cap.links.iter().map(|l| l.addr.as_str()).collect::<Vec<_>>(), ["10.0.0.2"]);
+        assert_eq!((cap.links[0].class, cap.links[0].best_gbps()), (AddrClass::Private, Some(25.0)));
+
+        // With the roster, a revoked model node's record is refused although its cert is valid.
+        let linked = Verifier::new(&WEIRDNET, user.public()).with_roster(view.clone());
+        linked.verify(&honest, &peer, weirdnet_net::now_ms()).unwrap();
+        let mut after = view();
+        after.revoke(&WEIRDNET, &user, &peer, weirdnet_net::now_ms()).unwrap();
+        let revoked = Verifier::new(&WEIRDNET, user.public()).with_roster(Arc::new(move || after.clone()));
+        let err = revoked.verify(&honest, &peer, weirdnet_net::now_ms()).unwrap_err();
+        assert!(matches!(&err, RemoteError::Refused { message } if message.contains("revoked")), "{err:?}");
+        Verifier::new(&WEIRDNET, user.public()).verify(&honest, &peer, weirdnet_net::now_ms()).unwrap();
+        let empty = Verifier::new(&WEIRDNET, user.public()).with_roster(Arc::new(Roster::new));
+        assert!(empty.verify(&honest, &peer, weirdnet_net::now_ms()).is_err(), "unknown to the roster");
 
         // Withdrawal ends subscriptions.
         service.withdraw();
