@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Image and audio content parts (`weirdnet-agent` 0.5 `Content`) reach llama.cpp unchanged; `ModelHost` refuses them for a model without those capabilities (`Unsupported`) and refuses remote image URLs (`BadRequest`).
+- `Capabilities::inputs` and `Capabilities::lacking`.
+
+### Changed
+
+- Breaking: needs `weirdnet-agent` 0.5 (content parts).
+
 ## [0.1.3] - 2026-11-20
 
 ### Added
