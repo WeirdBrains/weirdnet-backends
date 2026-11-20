@@ -13,7 +13,7 @@ use weirdnet_agent::remote::infer::Admission;
 use weirdnet_agent::remote::infer::v2::{EmbedRequest, Prefix, Request, Sampling};
 use weirdnet_agent::remote::pool::{NoEvents, Pool};
 use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
-use weirdnet_agent::{CancelToken, ContentPart, Message, ToolSpec};
+use weirdnet_agent::{CancelToken, Message, ToolSpec};
 use weirdnet_backends::{
     Capabilities, Chunk, EngineKind, ModelHost, ModelState, RAW_INFER_PROTOCOL, RawInferDialer, Supervisor, SupervisorEvent, Wrap,
 };
@@ -333,63 +333,6 @@ fn mlx_behind_its_proxy() {
     })
 }
 
-const PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-
-fn ask(images: usize, audio: bool) -> Vec<Message> {
-    let mut parts = vec![ContentPart::text("describe")];
-    parts.extend((0..images).map(|_| ContentPart::image(PNG)));
-    if audio {
-        parts.push(ContentPart::audio("UklGRg==", "wav"));
-    }
-    vec![Message::user(parts)]
-}
-
-/// End to end: pool -> infer/2 -> `ModelHost` -> llama.cpp adapter -> a fake `llama-server`
-/// started with `--mmproj`, which counts the images it receives.
-fn images_and_audio_reach_llama_server_with_a_projector() {
-    common::block_on(async {
-        let mut vision = launch("vision", EngineKind::Llamacpp);
-        vision.extra_args = vec!["--mmproj".into(), "/models/mmproj-vision.gguf".into()];
-        let mut embed = launch("embed", EngineKind::Llamacpp);
-        embed.extra_args = vision.extra_args.clone();
-        embed.embedding = true;
-        let sup = supervisor(vec![vision, launch("text", EngineKind::Llamacpp), embed]);
-        sup.load("vision").await.unwrap();
-        sup.load("text").await.unwrap();
-        let status = sup.status();
-        let caps = |id: &str| status.iter().find(|m| m.id == id).unwrap().capabilities.unwrap();
-        assert_eq!(caps("vision"), Capabilities::text().with_vision(true).with_audio(true));
-        assert_eq!((caps("text"), caps("embed")), (Capabilities::text(), Capabilities::embeddings()));
-
-        let auth: Arc<dyn Authorize> = Arc::new(|_: &Caller| Ok(()));
-        let host = Arc::new(ModelHost::new(sup.clone(), auth).with_default("text"));
-        let pool = Pool::new(Arc::new(serve("model-node", host, Admission::new(2))), vec!["model-node".to_string()]);
-        let cancel = CancelToken::new();
-        for images in [1, 3] {
-            let a = pool.infer(Request::messages(ask(images, false)).with_model("vision"), &NoEvents, &cancel).await.unwrap();
-            assert_eq!(a.text, format!("Hello from vision! You said: describe [{images} image(s)]"));
-        }
-        let a = pool.infer(Request::messages(ask(1, true)).with_model("vision"), &NoEvents, &cancel).await.unwrap();
-        assert_eq!(a.text, "Hello from vision! You said: describe [1 image(s)] [1 audio]");
-
-        // Never on a text-only model, named or the default.
-        for req in [Request::messages(ask(1, false)).with_model("text"), Request::messages(ask(1, false))] {
-            let e = pool.infer(req, &NoEvents, &cancel).await.unwrap_err();
-            assert!(matches!(&e.error, RemoteError::Unsupported { message } if message.contains("`text` does not take images")), "{:?}", e.error);
-        }
-        let e =
-            pool.infer(Request::messages(vec![Message::user(vec![ContentPart::audio("UklGRg==", "wav")])]), &NoEvents, &cancel).await.unwrap_err();
-        assert!(matches!(&e.error, RemoteError::Unsupported { message } if message.contains("does not take audio")), "{:?}", e.error);
-        let remote = vec![Message::user(vec![ContentPart::image("https://example.com/cat.png")])];
-        let e = pool.infer(Request::messages(remote).with_model("vision"), &NoEvents, &cancel).await.unwrap_err();
-        assert!(matches!(&e.error, RemoteError::BadRequest { message } if message.contains("data:image")), "{:?}", e.error);
-        // Text is unchanged.
-        let a = pool.infer(Request::messages(vec![Message::user("hi")]), &NoEvents, &cancel).await.unwrap();
-        assert_eq!(a.text, "Hello from text! You said: hi");
-        sup.shutdown().await;
-    })
-}
-
 fn main() {
     common::main(&[
         ("mlx_behind_its_proxy", mlx_behind_its_proxy as fn()),
@@ -399,6 +342,5 @@ fn main() {
         #[cfg(unix)]
         ("crash_restarts_then_crash_loop", crash_restarts_then_crash_loop as fn()),
         ("raw_infer2_through_the_model_host", raw_infer2_through_the_model_host as fn()),
-        ("images_and_audio_reach_llama_server_with_a_projector", images_and_audio_reach_llama_server_with_a_projector as fn()),
     ]);
 }

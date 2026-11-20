@@ -9,7 +9,7 @@ use weirdnet_agent::{Message, Role, ToolSpec};
 use crate::engine::EngineKind;
 use crate::error::bad_request;
 
-/// An OpenAI chat message. Image and audio parts go through unchanged, in the OpenAI shape.
+/// An OpenAI chat message.
 pub fn message(m: &Message) -> Value {
     let role = match m.role {
         Role::System => "system",
@@ -175,23 +175,6 @@ mod tests {
     fn context_refs_and_empty_requests_are_refused() {
         assert!(matches!(chat_body(&Request::context(ContextRef::new("c", None)), "m", EngineKind::Llamacpp), Err(RemoteError::BadRequest { .. })));
         assert!(chat_body(&Request::messages(vec![]), "m", EngineKind::Llamacpp).is_err());
-    }
-
-    #[test]
-    fn content_parts_go_through_unchanged() {
-        use weirdnet_agent::ContentPart;
-        let png = "data:image/png;base64,iVBORw0KGgo=";
-        let r =
-            Request::messages(vec![Message::user(vec![ContentPart::text("what?"), ContentPart::image(png), ContentPart::audio("UklGRg==", "wav")])]);
-        let b = chat_body(&r, "m", EngineKind::Llamacpp).unwrap();
-        assert_eq!(
-            b["messages"][0]["content"],
-            json!([
-                {"type": "text", "text": "what?"},
-                {"type": "image_url", "image_url": {"url": png}},
-                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}
-            ])
-        );
     }
 
     #[test]

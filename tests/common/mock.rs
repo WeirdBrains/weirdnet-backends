@@ -6,9 +6,7 @@
 //! message from the assistant is a prefix: the answer continues it with "world". A user
 //! message starting with "think" first streams reasoning. With tools, the answer is a call to
 //! the first tool with `{"q": "<message>"}`, split over two chunks. `/health` says 503 for
-//! `WEIRDNET_MOCK_LOAD_MS` (default 200) after start. Image and audio parts are counted into
-//! the answer ("... [2 image(s)]") when started with `--mmproj`, and refused like
-//! `llama-server` without a projector otherwise. `/v1/completions` continues the prompt
+//! `WEIRDNET_MOCK_LOAD_MS` (default 200) after start. `/v1/completions` continues the prompt
 //! with " once upon a time"; `/v1/embeddings` returns `[chars, words, 1, 0]` per input.
 //!
 //! Started with `--max-tokens` it acts like `mlx_lm.server`: no API key, the model is called
@@ -27,8 +25,6 @@ use axum::routing::{get, post};
 use serde_json::{Value, json};
 
 struct Mock {
-    /// Started with `--mmproj`: takes image and audio parts, like `llama-server` with a projector.
-    projector: bool,
     alias: String,
     key: Option<String>,
     ready_at: Instant,
@@ -55,8 +51,7 @@ async fn serve() {
     } else {
         (alias, std::env::var("LLAMA_API_KEY").or_else(|_| std::env::var("VLLM_API_KEY")).ok())
     };
-    let projector = flag("--mmproj").is_some();
-    let st = Arc::new(Mock { projector, alias, key, ready_at: Instant::now() + Duration::from_millis(load_ms), mlx });
+    let st = Arc::new(Mock { alias, key, ready_at: Instant::now() + Duration::from_millis(load_ms), mlx });
     let mut app = Router::new().route("/health", get(health)).route("/v1/chat/completions", post(chat)).route("/v1/completions", post(completions));
     if !mlx {
         app = app.route("/v1/embeddings", post(embeddings));
@@ -139,31 +134,7 @@ async fn chat(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body):
         return r;
     }
     let messages = body["messages"].as_array().cloned().unwrap_or_default();
-    let last_user = messages.iter().rev().find(|m| m["role"] == "user");
-    let parts = last_user.and_then(|m| m["content"].as_array()).cloned().unwrap_or_default();
-    let count = |t: &str| parts.iter().filter(|p| p["type"] == t).count();
-    let (images, audio) = (count("image_url"), count("input_audio"));
-    if (images > 0 || audio > 0) && !st.projector {
-        let msg = if images > 0 {
-            "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj"
-        } else {
-            "audio input is not supported"
-        };
-        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": {"message": msg}}))).into_response();
-    }
-    if parts.iter().any(|p| p["type"] == "image_url" && !p["image_url"]["url"].as_str().is_some_and(|u| u.starts_with("data:image/"))) {
-        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": {"message": "bad image"}}))).into_response();
-    }
-    let mut said = match last_user.map(|m| &m["content"]) {
-        Some(Value::String(s)) => s.clone(),
-        _ => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
-    };
-    if images > 0 {
-        said.push_str(&format!(" [{images} image(s)]"));
-    }
-    if audio > 0 {
-        said.push_str(&format!(" [{audio} audio]"));
-    }
+    let said = messages.iter().rev().find(|m| m["role"] == "user").and_then(|m| m["content"].as_str()).unwrap_or("").to_string();
     let chunk = |delta: Value, finish: Option<&str>| json!({"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
     let mut events = vec![chunk(json!({"role": "assistant", "content": null}), None)];
     let mut n = 0u64;
