@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
 ### Added
 
 - `models` (feature `node`): `/weirdnet-backends/models/1` for the owner only (`ModelsService` takes an `Authorize`, such as `RosterAuth`): Hub search, a repo's files measured against the node's budget, pull with progress (split GGUFs too, the largest that fits by default) and serve without a restart, list and remove. `ModelsServer` and `ModelsClient`. The node's Hugging Face token stays on the node.
