@@ -2,6 +2,19 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-21: models/1 (branch ymir-models)
+
+What changed (commit 61841af on the [ymir-models](https://github.com/WeirdBrains/weirdnet-backends/tree/ymir-models) branch, not on main; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`):
+
+- `models` (feature `node`): `/weirdnet-backends/models/1`. `ModelsService` admits only what its `Authorize` admits (meant for `RosterAuth`, the owner's devices) and runs nothing for anyone else. `Search`, `Files` (fits against the node's budget, KV from the repo's GGUF header), `Pull` (progress, resume, split GGUFs, the largest that fits when no model is named; `serve`/`load` hand it to the supervisor through `add_model`), `List` and `Remove` (stops serving first). Closing a pull's stream cancels it. `ModelsServer` serves it on a `weirdnet-net` node; `ModelsClient` is the owner's side. The Hugging Face token is the node's own and is never in a message.
+- `Cargo.toml` takes `weirdnet-model` from git (`[patch.crates-io]`, weirdnet-model main) because it needs the unreleased Hub, fit, token and split-download API. This is why the work stays off main.
+
+Checks run: `cargo fmt --check`; clippy `-D warnings` default and `--all-features`; tests default, `--all-features` (28 unit, 8 adapter, 2 node) and `--no-default-features`; `cargo doc` with `-D warnings`. The models/1 tests run over a memory dialer against a local mock Hub: a stranger is refused before anything runs; the owner searches, sees fits, pulls the best fit and a two-part split model, serves without a restart, lists and removes. CI runs only on main, so this branch has local checks only. `cargo package` was skipped (the git patch).
+
+Not tested: models/1 over a real `weirdnet-net` transport with `RosterAuth` (memory dialer only); cancelling by closing the stream mid-download (cancellation through the progress callback is tested); a real gated repo or real engine load after a pull.
+
+What's left and next: once weirdnet-model 0.5.1 is published, set `weirdnet-model = "0.5.1"`, drop `[patch.crates-io]`, merge to main and release as 0.3.0 (breaking: drops weirdnet-model 0.4), after m3talsmith approves the versions.
+
 ## 2026-11-21: models at run time, weirdnet-model 0.5
 
 What changed (commit cf294da, on main, unreleased; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`):
