@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-21: release 0.3.0
+
+What changed: `release: v0.3.0` with `scripts/weirdnet_release.py` (approved by m3talsmith together with [weirdnet-model](https://crates.io/crates/weirdnet-model) 0.5.1 and [weirdnet-alerts](https://crates.io/crates/weirdnet-alerts) 0.2.0, released in that order). Tag `v0.3.0`, published to [crates.io](https://crates.io/crates/weirdnet-backends/0.3.0), docs on [docs.rs](https://docs.rs/weirdnet-backends/0.3.0). Breaking for `node` users: weirdnet-model 0.5.1 is required and 0.4 is no longer accepted.
+
+Checks run: CI green on main (6977f1f) before the release; the release script's checks from `release.toml`.
+
+Not tested: as in the entries below.
+
+What's left and next: weirdnet-site pages for backends 0.3.0; Ymir can move to weirdnet-backends 0.3 with weirdnet-model 0.5.1 and weirdnet-alerts 0.2.
+
 ## 2026-11-21: weirdnet-model 0.5.1 from crates.io, merged to main
 
 What changed (merges the [ymir-models](https://github.com/WeirdBrains/weirdnet-backends/tree/ymir-models) branch into main; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`):
