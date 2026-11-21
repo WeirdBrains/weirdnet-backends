@@ -2,6 +2,19 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-21: weirdnet-model 0.5.1 from crates.io, merged to main
+
+What changed (merges the [ymir-models](https://github.com/WeirdBrains/weirdnet-backends/tree/ymir-models) branch into main; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`):
+
+- `Cargo.toml` takes [weirdnet-model](https://crates.io/crates/weirdnet-model) `"0.5.1"` from crates.io and drops the `[patch.crates-io]` git patch; `Cargo.lock` follows. The `node` feature no longer takes weirdnet-model 0.4 (breaking, noted in the changelog).
+- `models/1` and `Supervisor::add_model` are now on main.
+
+Checks run: `cargo fmt --check`; clippy `-D warnings` default and `--all-features`; tests default, `--all-features` (28 unit, 8 adapter, 2 node) and `--no-default-features`; `cargo doc` with `-D warnings`; `cargo package`.
+
+Not tested: as in the models/1 entry below (real transport, mid-download stream close, gated repos, real engine load after a pull).
+
+What's left and next: release 0.3.0 (approved by m3talsmith together with weirdnet-model 0.5.1 and weirdnet-alerts 0.2.0).
+
 ## 2026-11-21: models/1 (branch ymir-models)
 
 What changed (commit 61841af on the [ymir-models](https://github.com/WeirdBrains/weirdnet-backends/tree/ymir-models) branch, not on main; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`):

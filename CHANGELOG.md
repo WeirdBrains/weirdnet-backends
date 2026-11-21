@@ -9,7 +9,7 @@
 
 ### Changed
 
-- Breaking: the `node` feature needs `weirdnet-model` 0.5.1 (`hw::Hardware` and `hw::Budget` in `Capability` and `NodeService::with_hardware` are its types).
+- Breaking: the `node` feature needs `weirdnet-model` 0.5.1 and no longer takes 0.4. `hw::Hardware` and `hw::Budget` in `Capability` and `NodeService::with_hardware` are its types, so apps on weirdnet-model 0.4 move to 0.5.1 with it.
 
 ## [0.2.0] - 2026-11-20
 
