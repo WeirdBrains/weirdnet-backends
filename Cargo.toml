@@ -33,8 +33,9 @@ tracing = "0.1"
 weirdnet-agent = "0.5"
 
 serde_bytes = { version = "0.11", optional = true }
-# Any 0.4 or 0.5: `Hardware` and `Budget` are the same in both, and an app on 0.5 gets one copy.
-weirdnet-model = { version = ">=0.4, <0.6", optional = true }
+# models/1 needs weirdnet-model's Hub search, fit, tokens and split downloads (unreleased, after
+# 0.5.0). Release: publish weirdnet-model 0.5.1, set this to "0.5.1" and drop [patch.crates-io].
+weirdnet-model = { version = "0.5", optional = true }
 weirdnet-net = { version = "0.8.0", optional = true }
 weirdnet-sync = { version = ">=0.5, <0.8", optional = true }
 
@@ -42,6 +43,7 @@ weirdnet-sync = { version = ">=0.5, <0.8", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+tempfile = "3"
 axum = "0.8"
 weirdnet-net = "0.8.0"
 weirdnet-sync = ">=0.5, <0.8"
@@ -58,3 +60,7 @@ required-features = ["node"]
 
 [package.metadata.docs.rs]
 all-features = true
+
+# Branch only (ymir-models): weirdnet-model 0.5.1 is not on crates.io yet. main never carries this.
+[patch.crates-io]
+weirdnet-model = { git = "https://github.com/WeirdBrains/weirdnet-model", rev = "0d47320cb9bfff7b1e04fb51f43d65f7383ff2da" }

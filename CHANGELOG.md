@@ -4,11 +4,12 @@
 
 ### Added
 
+- `models` (feature `node`): `/weirdnet-backends/models/1` for the owner only (`ModelsService` takes an `Authorize`, such as `RosterAuth`): Hub search, a repo's files measured against the node's budget, pull with progress (split GGUFs too, the largest that fits by default) and serve without a restart, list and remove. `ModelsServer` and `ModelsClient`. The node's Hugging Face token stays on the node.
 - `Supervisor::add_model` and `Supervisor::remove_model`: serve a new model, or stop serving one, without a restart (`SupervisorEvent::Added` and `Removed`); `Supervisor::launches`.
 
 ### Changed
 
-- The `node` feature takes `weirdnet-model` 0.4 or 0.5 (`hw::Hardware` and `hw::Budget` are the same in both), so an app on `weirdnet-model` 0.5 gets one copy.
+- Breaking: the `node` feature needs `weirdnet-model` 0.5.1 (`hw::Hardware` and `hw::Budget` in `Capability` and `NodeService::with_hardware` are its types).
 
 ## [0.2.0] - 2026-11-20
 

@@ -38,6 +38,29 @@ sup.load("qwen3-8b").await?;
 let host = Arc::new(ModelHost::new(sup.clone(), auth)); // serve with weirdnet_agent::remote::infer::v2::serve
 ```
 
+
+## Managing model files (models/1)
+
+`models::ModelsService` serves `/weirdnet-backends/models/1` to the node's owner only: pass it
+an `Authorize` such as `weirdnet_agent::serve::RosterAuth` (the owner's linked devices, narrowed
+with `require_roles` if you like). Commands: `Search` (Hugging Face Hub, GGUF repos), `Files`
+(a repo's models with each footprint against the node's memory budget), `Pull` (download with
+progress, resuming a partial file; split GGUFs too; without a named model, the largest that
+fits), with `serve`/`load` to hand it to the supervisor without a restart, `List` and `Remove`.
+Closing a pull's stream cancels it. The Hugging Face token is the node's own
+([`weirdnet-model`](https://crates.io/crates/weirdnet-model) `HfToken`) and never crosses the
+wire. `ModelsServer::start` serves it on a `weirdnet-net` node; `ModelsClient` is the owner's side.
+
+```rust
+use weirdnet_backends::models::{ModelsService, ModelsServer, Pull};
+
+let svc = Arc::new(ModelsService::new(weirdnet_model::ModelStore::from_env(), supervisor.clone(), owner_auth).with_budget(budget));
+let _server = ModelsServer::start(&node, svc.clone())?;
+// From the owner's device:
+let fits = client.files(&model_node, "unsloth/Qwen3-8B-GGUF", Some(8192), Some(2)).await?;
+let pulled = client.pull(&model_node, Pull::new("unsloth/Qwen3-8B-GGUF").serving(true), |p| println!("{}/{}", p.done, p.total)).await?;
+```
+
 ## MLX-LM (Apple silicon)
 
 `EngineKind::Mlx` runs MLX-format models with `mlx_lm.server` on macOS on Apple silicon:

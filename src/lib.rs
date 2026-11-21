@@ -21,6 +21,9 @@
 //!   supervisor's models.
 //! - `node` (feature): `/weirdnet-backends/node/1` over `weirdnet-net`: signed capability
 //!   records, `Load`, `Unload`, `Drain`, `GroupUp`/`GroupDown` and health.
+//! - `models` (feature `node`): `/weirdnet-backends/models/1`, for the owner only: search the
+//!   Hugging Face Hub, see which files fit the node, pull (split GGUFs too) and serve without a
+//!   restart, list and remove.
 //!
 //! Platforms: the supervisor runs on Unix and Windows. On Unix an engine gets its own process
 //! group, stops with SIGTERM then SIGKILL after a grace period, and on Linux dies with its
@@ -33,6 +36,8 @@ pub mod host;
 #[cfg(feature = "node")]
 pub mod link;
 pub mod mlx;
+#[cfg(feature = "node")]
+pub mod models;
 #[cfg(feature = "node")]
 pub mod node;
 pub mod openai;
