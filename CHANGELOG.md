@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `Supervisor::add_model` and `Supervisor::remove_model`: serve a new model, or stop serving one, without a restart (`SupervisorEvent::Added` and `Removed`); `Supervisor::launches`.
+
+### Changed
+
+- The `node` feature takes `weirdnet-model` 0.4 or 0.5 (`hw::Hardware` and `hw::Budget` are the same in both), so an app on `weirdnet-model` 0.5 gets one copy.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

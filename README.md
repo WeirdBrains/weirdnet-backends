@@ -16,6 +16,7 @@ the engines and serves them to inference nodes; what to load is always the calle
 - `Supervisor`: load and unload with draining, **swap groups** (loading one model of a group
   unloads the others), **idle unload**, crash restarts with exponential backoff and crash-loop
   detection, `SupervisorEvent`s, per-model logs; chat, completion and embedding forwarding.
+  `add_model` and `remove_model` change the served models at run time, without a restart.
 - `ChunkDecoder` / `ToolCalls`: OpenAI server-sent events decoded into `Chunk`s (text,
   reasoning, tool-call fragments, finish reason and usage).
 - `ModelHost`: a [`weirdnet-agent`](https://crates.io/crates/weirdnet-agent) 0.5 `InferHost`

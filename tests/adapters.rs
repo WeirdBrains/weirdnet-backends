@@ -390,11 +390,40 @@ fn images_and_audio_reach_llama_server_with_a_projector() {
     })
 }
 
+fn models_added_and_removed_at_run_time() {
+    common::block_on(async {
+        let sup = supervisor(vec![launch("chat", EngineKind::Llamacpp)]);
+        let mut events = sup.subscribe();
+        assert!(sup.add_model(launch("chat", EngineKind::Llamacpp)).is_err(), "ids are unique");
+        let mut bad = launch("bad", EngineKind::Llamacpp);
+        bad.wrap = Some(Wrap { url: "http://example.com:8000".into(), api_key: None });
+        assert!(sup.add_model(bad).is_err(), "wrapped servers stay on loopback");
+        sup.add_model(launch("new", EngineKind::Llamacpp)).unwrap();
+        assert_eq!(sup.state("new"), Some(ModelState::Unloaded));
+        assert_eq!(sup.launches().iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["chat", "new"]);
+        sup.load("new").await.unwrap();
+        assert_eq!(text(&collect(&sup, "new", &Request::messages(vec![Message::user("hi")])).await), "Hello from new! You said: hi");
+        let gone = sup.remove_model("new").await.unwrap();
+        assert_eq!(gone.id, "new");
+        assert_eq!(sup.state("new"), None);
+        assert!(sup.status().iter().all(|m| m.id != "new"));
+        assert!(sup.remove_model("new").await.is_err());
+        let mut seen = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            seen.push(e);
+        }
+        assert!(seen.contains(&SupervisorEvent::Added { model: "new".into() }), "{seen:?}");
+        assert_eq!(seen.last(), Some(&SupervisorEvent::Removed { model: "new".into() }), "{seen:?}");
+        sup.shutdown().await;
+    })
+}
+
 fn main() {
     common::main(&[
         ("mlx_behind_its_proxy", mlx_behind_its_proxy as fn()),
         ("chat_reasoning_tools_prefix_completion_and_embeddings", chat_reasoning_tools_prefix_completion_and_embeddings as fn()),
         ("swap_groups_and_idle_unload", swap_groups_and_idle_unload as fn()),
+        ("models_added_and_removed_at_run_time", models_added_and_removed_at_run_time as fn()),
         ("wraps_a_loopback_server_and_refuses_others", wraps_a_loopback_server_and_refuses_others as fn()),
         #[cfg(unix)]
         ("crash_restarts_then_crash_loop", crash_restarts_then_crash_loop as fn()),

@@ -75,12 +75,39 @@ impl Default for SupervisorOptions {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SupervisorEvent {
-    Starting { model: String },
-    Ready { model: String, load_secs: f32 },
-    LoadFailed { model: String, why: String },
-    Crashed { model: String, why: String, crashes: usize, restart_in_secs: Option<f32> },
-    CrashLoop { model: String, crashes: usize },
-    Unloaded { model: String, idle: bool },
+    Starting {
+        model: String,
+    },
+    Ready {
+        model: String,
+        load_secs: f32,
+    },
+    LoadFailed {
+        model: String,
+        why: String,
+    },
+    Crashed {
+        model: String,
+        why: String,
+        crashes: usize,
+        restart_in_secs: Option<f32>,
+    },
+    CrashLoop {
+        model: String,
+        crashes: usize,
+    },
+    Unloaded {
+        model: String,
+        idle: bool,
+    },
+    /// A model was added at run time ([`Supervisor::add_model`]).
+    Added {
+        model: String,
+    },
+    /// A model was removed at run time ([`Supervisor::remove_model`]).
+    Removed {
+        model: String,
+    },
 }
 
 /// One model's row in the node's capability record.
@@ -141,6 +168,23 @@ struct Slot {
     restart_at: Option<Instant>,
 }
 
+impl Slot {
+    fn new(launch: ModelLaunch) -> Self {
+        Self {
+            launch,
+            state: ModelState::Unloaded,
+            running: None,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            last_used: Arc::new(AtomicU64::new(0)),
+            generation: 0,
+            load_secs: None,
+            crashes: Vec::new(),
+            crash_loop: false,
+            restart_at: None,
+        }
+    }
+}
+
 struct Inner {
     engines: HashMap<EngineKind, EngineConfig>,
     opts: SupervisorOptions,
@@ -160,24 +204,7 @@ pub struct Supervisor {
 
 impl Supervisor {
     pub fn new(engines: Vec<EngineConfig>, models: Vec<ModelLaunch>, opts: SupervisorOptions) -> Self {
-        let slots = models
-            .into_iter()
-            .map(|launch| {
-                let slot = Slot {
-                    launch: launch.clone(),
-                    state: ModelState::Unloaded,
-                    running: None,
-                    in_flight: Arc::new(AtomicUsize::new(0)),
-                    last_used: Arc::new(AtomicU64::new(0)),
-                    generation: 0,
-                    load_secs: None,
-                    crashes: Vec::new(),
-                    crash_loop: false,
-                    restart_at: None,
-                };
-                (launch.id, slot)
-            })
-            .collect();
+        let slots = models.into_iter().map(|launch| (launch.id.clone(), Slot::new(launch))).collect();
         let http =
             reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).no_proxy().build().expect("an HTTP client without TLS always builds");
         let (events, _) = broadcast::channel(256);
@@ -200,6 +227,48 @@ impl Supervisor {
 
     fn emit(&self, ev: SupervisorEvent) {
         let _ = self.inner.events.send(ev);
+    }
+
+    /// Adds a model the node may load from now on, without a restart (for example one just
+    /// downloaded). It starts unloaded. Refused when the id is taken; [`Supervisor::remove_model`]
+    /// first to replace one. Emits [`SupervisorEvent::Added`].
+    pub fn add_model(&self, launch: ModelLaunch) -> Result<(), RemoteError> {
+        if launch.id.trim().is_empty() {
+            return Err(bad_request("a model needs an id"));
+        }
+        if let Some(w) = &launch.wrap {
+            w.check().map_err(bad_request)?;
+        }
+        let id = launch.id.clone();
+        {
+            let mut slots = self.slots();
+            if slots.contains_key(&id) {
+                return Err(bad_request(format!("{id} is already configured on this node")));
+            }
+            slots.insert(id.clone(), Slot::new(launch));
+        }
+        self.emit(SupervisorEvent::Added { model: id });
+        Ok(())
+    }
+
+    /// Unloads `id` (draining requests under way) and forgets it. Emits
+    /// [`SupervisorEvent::Removed`]. Returns its launch settings.
+    pub async fn remove_model(&self, id: &str) -> Result<ModelLaunch, RemoteError> {
+        let _op = self.inner.ops.lock().await;
+        if !self.slots().contains_key(id) {
+            return Err(unknown_model(id));
+        }
+        self.stop(id, false).await;
+        let slot = self.slots().remove(id).ok_or_else(|| unknown_model(id))?;
+        self.emit(SupervisorEvent::Removed { model: id.into() });
+        Ok(slot.launch)
+    }
+
+    /// The configured models' launch settings, sorted by id.
+    pub fn launches(&self) -> Vec<ModelLaunch> {
+        let mut out: Vec<ModelLaunch> = self.slots().values().map(|s| s.launch.clone()).collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
     /// Engine events from now on.
