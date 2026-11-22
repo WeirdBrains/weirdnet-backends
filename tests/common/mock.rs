@@ -11,6 +11,10 @@
 //! `llama-server` without a projector otherwise. `/v1/completions` continues the prompt
 //! with " once upon a time"; `/v1/embeddings` returns `[chars, words, 1, 0]` per input.
 //!
+//! LoRA: llama.cpp `--lora PATH` (needs `--lora-init-without-apply`) and a request `"lora"`
+//! with a non-zero scale answer as "<alias>+<adapter file stem>"; vLLM `--lora-modules` JSON
+//! modules are served under their names.
+//!
 //! Started with `--max-tokens` it acts like `mlx_lm.server`: no API key, the model is called
 //! `default_model`, `/health` is 200 at once while completions fail with 500 until loaded, and
 //! there is no `/v1/embeddings`.
@@ -33,6 +37,10 @@ struct Mock {
     key: Option<String>,
     ready_at: Instant,
     mlx: bool,
+    /// llama.cpp `--lora` paths, by index.
+    loras: Vec<String>,
+    /// vLLM `--lora-modules` names.
+    modules: Vec<String>,
 }
 
 /// Runs the mock engine (the test binary re-executes itself with engine flags).
@@ -56,7 +64,17 @@ async fn serve() {
         (alias, std::env::var("LLAMA_API_KEY").or_else(|_| std::env::var("VLLM_API_KEY")).ok())
     };
     let projector = flag("--mmproj").is_some();
-    let st = Arc::new(Mock { projector, alias, key, ready_at: Instant::now() + Duration::from_millis(load_ms), mlx });
+    let loras: Vec<String> = args.windows(2).filter(|w| w[0] == "--lora").map(|w| w[1].clone()).collect();
+    assert!(loras.is_empty() || args.iter().any(|a| a == "--lora-init-without-apply"), "adapters must load unapplied");
+    let modules: Vec<String> = match args.iter().position(|a| a == "--lora-modules") {
+        Some(i) => args[i + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .map(|j| serde_json::from_str::<Value>(j).expect("JSON module")["name"].as_str().expect("a name").to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+    let st = Arc::new(Mock { projector, alias, key, ready_at: Instant::now() + Duration::from_millis(load_ms), mlx, loras, modules });
     let mut app = Router::new().route("/health", get(health)).route("/v1/chat/completions", post(chat)).route("/v1/completions", post(completions));
     if !mlx {
         app = app.route("/v1/embeddings", post(embeddings));
@@ -84,7 +102,7 @@ fn check(st: &Mock, headers: &HeaderMap, body: &Value) -> Option<Response> {
     if !authorized {
         return Some((StatusCode::UNAUTHORIZED, axum::Json(json!({"error": {"message": "Invalid API Key"}}))).into_response());
     }
-    if body["model"].as_str() != Some(st.alias.as_str()) {
+    if body["model"].as_str() != Some(st.alias.as_str()) && !st.modules.iter().any(|m| body["model"].as_str() == Some(m.as_str())) {
         let msg = format!("unknown model {}", body["model"]);
         return Some((StatusCode::BAD_REQUEST, axum::Json(json!({"error": {"message": msg}}))).into_response());
     }
@@ -183,7 +201,15 @@ async fn chat(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body):
             n += 1;
         }
         let continuing = messages.last().is_some_and(|m| m["role"] == "assistant");
-        let answer = if continuing { "world".to_string() } else { format!("Hello from {}! You said: {said}", st.alias) };
+        let mut name = body["model"].as_str().unwrap_or(&st.alias).to_string();
+        for l in body["lora"].as_array().into_iter().flatten() {
+            let path = l["id"].as_u64().and_then(|i| st.loras.get(i as usize));
+            if let Some(path) = path.filter(|_| l["scale"].as_f64().is_some_and(|s| s != 0.0)) {
+                let stem = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().into_owned();
+                name = format!("{name}+{stem}x{}", l["scale"]);
+            }
+        }
+        let answer = if continuing { "world".to_string() } else { format!("Hello from {name}! You said: {said}") };
         for w in answer.split_inclusive(' ') {
             events.push(chunk(json!({"content": w}), None));
             n += 1;

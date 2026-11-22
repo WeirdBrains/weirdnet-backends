@@ -1,6 +1,7 @@
 //! `/weirdnet-backends/models/1`: the owner manages a model node's model files over
 //! `weirdnet-net`: search the Hugging Face Hub, see which files fit the node, pull one (split
-//! GGUFs too) and serve it without a restart, list and remove what is on disk.
+//! GGUFs too) and serve it without a restart, list and remove what is on disk. LoRA adapters
+//! too: [`Pull::adapter_for`] pulls one for a served base model and adds it to that base.
 //!
 //! Only the owner may use it: [`ModelsService`] takes an [`Authorize`] and runs nothing before
 //! it admits the caller. Pass `weirdnet_agent::serve::RosterAuth` for the owner's linked devices
@@ -25,14 +26,14 @@ use weirdnet_agent::remote::{Authorize, Caller, Channel, Dialer, RemoteError, to
 use weirdnet_agent::serve::{channel, stream_limits};
 use weirdnet_model::fit::{self, Fit, FitOptions};
 use weirdnet_model::gguf::GgufInfo;
-use weirdnet_model::hf::{RepoModel, Search, SearchHit};
+use weirdnet_model::hf::{AdapterFormat, RepoAdapter, RepoModel, Search, SearchHit};
 use weirdnet_model::hw::Budget;
-use weirdnet_model::{Consent, ModelStore, Progress, StoredModel, download_parts};
+use weirdnet_model::{Consent, ModelStore, Progress, StoredAdapter, StoredModel, download_adapter, download_parts};
 use weirdnet_net::node::{Message, Node};
 
-use crate::engine::{EngineKind, ModelLaunch};
+use crate::engine::{EngineKind, LoraAdapter, ModelLaunch};
 use crate::error::bad_request;
-use crate::supervisor::{ModelState, Supervisor};
+use crate::supervisor::{AdapterChange, ModelState, Supervisor};
 
 /// The protocol id.
 pub const MODELS_PROTOCOL: &str = "/weirdnet-backends/models/1";
@@ -55,6 +56,12 @@ pub struct Pull {
     pub serve: bool,
     /// Also load it (implies `serve`).
     pub load: bool,
+    /// Pull a LoRA adapter of the repo (by [`Pull::model`], or its only one) for this served base
+    /// model (a supervisor id) instead of a model. The adapter's format must suit the base's
+    /// engine, and its architecture and base model must match the base's where both are known.
+    /// With `serve` it is added to the base ([`Supervisor::add_adapter`]).
+    #[serde(default)]
+    pub adapter_for: Option<String>,
 }
 
 impl Pull {
@@ -74,6 +81,12 @@ impl Pull {
 
     pub fn with_slots(mut self, slots: u32) -> Self {
         self.slots = Some(slots);
+        self
+    }
+
+    /// Pull an adapter for served base model `base` (see [`Pull::adapter_for`]).
+    pub fn with_adapter_for(mut self, base: impl Into<String>) -> Self {
+        self.adapter_for = Some(base.into());
         self
     }
 
@@ -119,7 +132,7 @@ pub struct ModelsRequest {
 }
 
 /// A repo's models against this node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RepoFits {
     pub repo: String,
@@ -134,6 +147,9 @@ pub struct RepoFits {
     pub fits: Vec<Fit>,
     /// The largest that fits.
     pub best: Option<String>,
+    /// The repo's LoRA adapters (never in `fits`).
+    #[serde(default)]
+    pub adapters: Vec<RepoAdapter>,
 }
 
 /// A finished pull.
@@ -148,16 +164,46 @@ pub struct Pulled {
     /// Added to the supervisor (now or before).
     pub served: bool,
     pub loaded: bool,
+    /// For an adapter: the base model it was pulled for.
+    #[serde(default)]
+    pub adapter_for: Option<String>,
+    /// For an adapter added to its base now: when it serves.
+    #[serde(default)]
+    pub change: Option<AdapterChange>,
 }
 
-/// A stored model and, when the supervisor serves it, its state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A stored model or LoRA adapter and, when the supervisor serves it, its state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct StoredEntry {
-    pub model: StoredModel,
+    /// A model on disk (`None` for an adapter).
+    #[serde(default)]
+    pub model: Option<StoredModel>,
+    /// An adapter on disk (`None` for a model).
+    #[serde(default)]
+    pub adapter: Option<StoredAdapter>,
     /// The supervisor's id for it, when served.
     pub served_as: Option<String>,
     pub state: Option<ModelState>,
+    /// For a served adapter: the base model it runs on.
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+impl StoredEntry {
+    /// The stored model's or adapter's id.
+    pub fn id(&self) -> &str {
+        match (&self.model, &self.adapter) {
+            (Some(m), _) => &m.id,
+            (_, Some(a)) => &a.id,
+            _ => "",
+        }
+    }
+
+    /// Bytes on disk.
+    pub fn size(&self) -> u64 {
+        self.model.as_ref().map(|m| m.size).or(self.adapter.as_ref().map(|a| a.size)).unwrap_or(0)
+    }
 }
 
 /// What a models/1 node answers.
@@ -260,12 +306,100 @@ impl ModelsService {
         let budget = self.budget.unwrap_or(Budget { pool_bytes: 0, reserve_bytes: 0, usable_bytes: 0 });
         let fits = fit::rank(&models, &budget, &opts);
         let best = fits.iter().find(|f| f.fits).map(|f| f.model.id.clone());
-        Ok(RepoFits { repo: repo.into(), info, budget: self.budget, context: opts.context, slots: opts.slots, fits, best })
+        let adapters = self.adapters(repo).await.unwrap_or_default();
+        Ok(RepoFits { repo: repo.into(), info, budget: self.budget, context: opts.context, slots: opts.slots, fits, best, adapters })
+    }
+
+    async fn adapters(&self, repo: &str) -> Result<Vec<RepoAdapter>, RemoteError> {
+        let hub = self.store.hub_client();
+        let repo = repo.to_string();
+        blocking(move || hub.adapters(&repo)).await
+    }
+
+    /// Whether `adapter` suits served model `base`: the format for its engine (GGUF LoRA on
+    /// llama.cpp, PEFT on vLLM), and the architecture and base model against the base GGUF's
+    /// header where both sides are known.
+    fn check_adapter_for(&self, base: &str, adapter: &RepoAdapter) -> Result<(), RemoteError> {
+        let launch =
+            self.supervisor.launches().into_iter().find(|l| l.id == base).ok_or_else(|| bad_request(format!("{base} is not served on this node")))?;
+        match (launch.engine, adapter.format) {
+            (EngineKind::Llamacpp, AdapterFormat::GgufLora) | (EngineKind::Vllm, AdapterFormat::Peft) => {}
+            (engine, format) => return Err(bad_request(format!("{} is {format:?}, which {} can't serve", adapter.id, engine.name()))),
+        }
+        if launch.engine != EngineKind::Llamacpp {
+            return Ok(());
+        }
+        let header = std::fs::File::open(&launch.source)
+            .ok()
+            .and_then(|f| weirdnet_model::gguf::read_header(std::io::BufReader::new(f)).ok())
+            .ok_or_else(|| bad_request(format!("{base}: can't read the header of {}", launch.source)))?;
+        if let Some(arch) = &adapter.architecture
+            && *arch != header.architecture
+        {
+            return Err(bad_request(format!("{} is for {arch} models; {base} is {}", adapter.id, header.architecture)));
+        }
+        let known: Vec<&String> = header.base_model.iter().chain(header.repo.iter()).collect();
+        if let Some(want) = &adapter.base_model
+            && !known.is_empty()
+            && !known.iter().any(|k| k.eq_ignore_ascii_case(want))
+        {
+            return Err(bad_request(format!("{} is for {want}; {base} comes from {}", adapter.id, known[0])));
+        }
+        Ok(())
+    }
+
+    async fn pull_adapter(&self, pull: &Pull, base: &str, progress: impl FnMut(Progress) -> bool + Send + 'static) -> Result<Pulled, RemoteError> {
+        if !self.supervisor.launches().iter().any(|l| l.id == base) {
+            return Err(bad_request(format!("{base} is not served on this node")));
+        }
+        let adapters = self.adapters(&pull.repo).await?;
+        let adapter = match &pull.model {
+            Some(want) => {
+                adapters.iter().find(|a| a.id == *want || a.files.iter().any(|f| f.name == *want || f.name.rsplit('/').next() == Some(want.as_str())))
+            }
+            None if adapters.len() == 1 => adapters.first(),
+            None if adapters.is_empty() => None,
+            None => {
+                let ids: Vec<&str> = adapters.iter().map(|a| a.id.as_str()).collect();
+                return Err(bad_request(format!("{} has adapters {}; name one", pull.repo, ids.join(", "))));
+            }
+        }
+        .cloned()
+        .ok_or_else(|| bad_request(format!("{} has no adapter {}", pull.repo, pull.model.as_deref().unwrap_or(""))))?;
+        self.check_adapter_for(base, &adapter)?;
+        let key = format!("{}/{}", pull.repo, adapter.id);
+        if !self.pulling.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone()) {
+            return Err(RemoteError::Busy);
+        }
+        let (store, repo, a) = (self.store.clone(), pull.repo.clone(), adapter.clone());
+        let mut progress = progress;
+        let done = blocking(move || download_adapter(&store, &repo, &a, &Consent::given_adapter(&a), &mut progress)).await;
+        self.pulling.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        let path = done?;
+        let dir = format!("adapters/{}", adapter.id);
+        let files = adapter.files.iter().map(|f| format!("{dir}/{}", f.name.rsplit('/').next().unwrap_or(&f.name))).collect();
+        let (mut served, mut loaded, mut change) = (false, false, None);
+        if pull.serve || pull.load {
+            served = true;
+            let path = path.display().to_string();
+            let already = self.supervisor.launches().iter().any(|l| l.adapters.iter().any(|x| x.path == path));
+            if !already {
+                change = Some(self.supervisor.add_adapter(base, LoraAdapter::new(adapter.id.clone(), path))?);
+            }
+            if pull.load {
+                self.supervisor.load(&adapter.id).await?;
+                loaded = true;
+            }
+        }
+        Ok(Pulled { id: adapter.id, repo: pull.repo.clone(), files, size: adapter.size, served, loaded, adapter_for: Some(base.into()), change })
     }
 
     /// Downloads `pull` (resuming a partial file) and serves it if asked. `progress` returns
     /// `false` to cancel. One pull per model at a time.
     pub async fn pull(&self, pull: &Pull, progress: impl FnMut(Progress) -> bool + Send + 'static) -> Result<Pulled, RemoteError> {
+        if let Some(base) = &pull.adapter_for {
+            return self.pull_adapter(pull, base, progress).await;
+        }
         let (models, info) = self.repo(&pull.repo).await?;
         let model = match &pull.model {
             Some(want) => models
@@ -310,7 +444,7 @@ impl ModelsService {
                 loaded = true;
             }
         }
-        Ok(Pulled { id: model.id, repo: pull.repo.clone(), files, size: model.size, served, loaded })
+        Ok(Pulled { id: model.id, repo: pull.repo.clone(), files, size: model.size, served, loaded, adapter_for: None, change: None })
     }
 
     /// The supervisor id serving the file at `path`, if any.
@@ -319,37 +453,48 @@ impl ModelsService {
         self.supervisor.launches().into_iter().find(|l| l.wrap.is_none() && l.source == path).map(|l| l.id)
     }
 
-    /// The models on disk, with the supervisor's state for the served ones.
+    /// The models and then the adapters on disk, with the supervisor's state for the served ones.
     pub fn list(&self) -> Vec<StoredEntry> {
-        self.store
-            .list()
-            .into_iter()
-            .map(|model| {
-                let served_as = self.served_as(&self.store.dir().join(&model.files[0]));
-                let state = served_as.as_deref().and_then(|id| self.supervisor.state(id));
-                StoredEntry { model, served_as, state }
-            })
-            .collect()
+        let models = self.store.list().into_iter().map(|model| {
+            let served_as = self.served_as(&self.store.dir().join(&model.files[0]));
+            let state = served_as.as_deref().and_then(|id| self.supervisor.state(id));
+            StoredEntry { model: Some(model), adapter: None, served_as, state, base: None }
+        });
+        let launches = self.supervisor.launches();
+        let adapters = self.store.adapters().into_iter().map(|a| {
+            let path = a.path.display().to_string();
+            let served = launches.iter().find_map(|l| l.adapters.iter().find(|x| x.path == path).map(|x| (x.id.clone(), l.id.clone())));
+            let (served_as, base) = served.unzip();
+            let state = served_as.as_deref().and_then(|id| self.supervisor.state(id));
+            StoredEntry { model: None, adapter: Some(a), served_as, state, base }
+        });
+        models.chain(adapters).collect()
     }
 
     /// Stops serving `id` (a stored model's id, or the supervisor id serving it) and deletes its
     /// files. Returns the bytes freed.
     pub async fn remove(&self, id: &str) -> Result<u64, RemoteError> {
         let entries = self.list();
-        let matches: Vec<&StoredEntry> = entries.iter().filter(|e| e.model.id == id || e.served_as.as_deref() == Some(id)).collect();
+        let matches: Vec<&StoredEntry> = entries.iter().filter(|e| e.id() == id || e.served_as.as_deref() == Some(id)).collect();
         let entry = match matches.as_slice() {
             [one] => *one,
             [] => return Err(bad_request(format!("no stored model {id}"))),
             _ => return Err(bad_request(format!("{id} names {} stored models; remove by the served id", matches.len()))),
         };
-        if self.pulling.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|k| k.rsplit('/').next() == Some(entry.model.id.as_str())) {
+        if self.pulling.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|k| k.rsplit('/').next() == Some(entry.id())) {
             return Err(RemoteError::Busy);
         }
+        let store = self.store.clone();
+        if let Some(adapter) = entry.adapter.clone() {
+            if let (Some(served), Some(base)) = (&entry.served_as, &entry.base) {
+                self.supervisor.remove_adapter(base, served)?;
+            }
+            return blocking(move || store.remove_adapter(&adapter)).await;
+        }
+        let model = entry.model.clone().ok_or_else(|| bad_request(format!("no stored model {id}")))?;
         if let Some(served) = &entry.served_as {
             self.supervisor.remove_model(served).await?;
         }
-        let store = self.store.clone();
-        let model = entry.model.clone();
         blocking(move || store.remove_local(&model)).await
     }
 
@@ -577,6 +722,13 @@ mod tests {
         out
     }
 
+    /// A LoRA adapter GGUF header for `arch`, padded to `len` bytes.
+    fn lora(arch: &str, len: usize) -> Vec<u8> {
+        let mut out = crate::engine::tests::lora_gguf(arch);
+        out.resize(len, 0);
+        out
+    }
+
     /// The Hub: a search, repo `o/n` with a single Q4_0 file and a two-part Q8_0, and the files.
     fn hub() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -586,6 +738,8 @@ mod tests {
             {"rfilename":"Q8_0/m-Q8_0-00001-of-00002.gguf","size":3000},
             {"rfilename":"Q8_0/m-Q8_0-00002-of-00002.gguf","size":3000}]}"#;
         let search = r#"[{"id":"o/n","downloads":9,"likes":1}]"#;
+        let tune = r#"{"id":"o/tune","tags":["gguf","base_model:adapter:Org/Base"],"siblings":[
+            {"rfilename":"tune-LoRA-F16.gguf","size":600},{"rfilename":"qwen-LoRA-F16.gguf","size":600}]}"#;
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -605,6 +759,9 @@ mod tests {
                     "/o/n/resolve/main/m-Q4_0.gguf" => Some(gguf(4000)),
                     "/o/n/resolve/main/Q8_0/m-Q8_0-00001-of-00002.gguf" => Some(gguf(3000)),
                     "/o/n/resolve/main/Q8_0/m-Q8_0-00002-of-00002.gguf" => Some(vec![7; 3000]),
+                    "/api/models/o/tune" => Some(tune.into()),
+                    "/o/tune/resolve/main/tune-LoRA-F16.gguf" => Some(lora("llama", 600)),
+                    "/o/tune/resolve/main/qwen-LoRA-F16.gguf" => Some(lora("qwen3", 600)),
                     _ => None,
                 };
                 let _ = match body {
@@ -669,10 +826,7 @@ mod tests {
         assert!(matches!(err, RemoteError::BadRequest { .. }), "{err:?}");
 
         let list = owner.list("model-node").await.unwrap();
-        assert_eq!(
-            list.iter().map(|e| (e.model.id.as_str(), e.served_as.as_deref())).collect::<Vec<_>>(),
-            [("m-Q4_0", Some("m-Q4_0")), ("m-Q8_0", None)]
-        );
+        assert_eq!(list.iter().map(|e| (e.id(), e.served_as.as_deref())).collect::<Vec<_>>(), [("m-Q4_0", Some("m-Q4_0")), ("m-Q8_0", None)]);
         assert_eq!(list[0].state, Some(ModelState::Unloaded));
 
         assert_eq!(owner.remove("model-node", "m-Q4_0").await.unwrap(), 4000);
@@ -680,6 +834,42 @@ mod tests {
         assert_eq!(owner.remove("model-node", "m-Q8_0").await.unwrap(), 6000);
         assert!(owner.list("model-node").await.unwrap().is_empty());
         assert!(matches!(owner.remove("model-node", "m-Q8_0").await, Err(RemoteError::BadRequest { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adapters_pull_for_a_served_base_list_and_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = Supervisor::new(vec![], vec![], SupervisorOptions::default());
+        let auth: Arc<dyn Authorize> = Arc::new(|_: &Caller| Ok(()));
+        let svc = ModelsService::new(ModelStore::new(tmp.path()).with_hub(hub()), sup.clone(), auth);
+        let fits = svc.files("o/tune", None, None).await.unwrap();
+        assert!(fits.fits.is_empty(), "adapters are never fit-ranked");
+        assert_eq!(fits.adapters.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["qwen-LoRA-F16", "tune-LoRA-F16"]);
+
+        let err = svc.pull(&Pull::new("o/tune").with_adapter_for("m-Q4_0"), |_| true).await.unwrap_err();
+        assert!(err.to_string().contains("not served"), "{err}");
+        svc.pull(&Pull::new("o/n").with_model("m-Q4_0").serving(false), |_| true).await.unwrap();
+        let err = svc.pull(&Pull::new("o/tune").with_adapter_for("m-Q4_0"), |_| true).await.unwrap_err();
+        assert!(err.to_string().contains("name one"), "{err}");
+        let err = svc.pull(&Pull::new("o/tune").with_model("qwen-LoRA-F16").with_adapter_for("m-Q4_0"), |_| true).await.unwrap_err();
+        assert!(err.to_string().contains("qwen3"), "architecture mismatch: {err}");
+
+        let pulled = svc.pull(&Pull::new("o/tune").with_model("tune-LoRA-F16").with_adapter_for("m-Q4_0").serving(false), |_| true).await.unwrap();
+        assert_eq!((pulled.adapter_for.as_deref(), pulled.change, pulled.served), (Some("m-Q4_0"), Some(AdapterChange::Live), true));
+        assert_eq!(pulled.files, ["adapters/tune-LoRA-F16/tune-LoRA-F16.gguf"]);
+        assert_eq!(sup.state("tune-LoRA-F16"), Some(ModelState::Unloaded));
+        let base = sup.launches().into_iter().find(|l| l.id == "m-Q4_0").unwrap();
+        assert_eq!(base.adapters.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["tune-LoRA-F16"]);
+
+        let list = svc.list();
+        assert_eq!(
+            list.iter().map(|e| (e.id(), e.served_as.as_deref(), e.base.as_deref())).collect::<Vec<_>>(),
+            [("m-Q4_0", Some("m-Q4_0"), None), ("tune-LoRA-F16", Some("tune-LoRA-F16"), Some("m-Q4_0"))]
+        );
+        assert_eq!(list[1].size(), 600);
+        assert_eq!(svc.remove("tune-LoRA-F16").await.unwrap(), 600);
+        assert!(sup.state("tune-LoRA-F16").is_none(), "no longer served");
+        assert_eq!(svc.list().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

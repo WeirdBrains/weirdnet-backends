@@ -61,6 +61,35 @@ let fits = client.files(&model_node, "unsloth/Qwen3-8B-GGUF", Some(8192), Some(2
 let pulled = client.pull(&model_node, Pull::new("unsloth/Qwen3-8B-GGUF").serving(true), |p| println!("{}/{}", p.done, p.total)).await?;
 ```
 
+## LoRA adapters
+
+A `ModelLaunch` can carry LoRA adapters (`LoraAdapter::new(id, path)`, optionally
+`with_scale`), each served under its own id next to the base model. On llama.cpp the adapters
+are GGUF LoRA files for the base's architecture, loaded with `--lora` and
+`--lora-init-without-apply`; each request names its adapter and scale in the `lora` field, so
+the base stays plain. On vLLM they are PEFT LoRA directories (or Hub ids) in one
+`--lora-modules` list with `--enable-lora` and `--max-loras`, and a request names the adapter
+as its `model`. Embedding models and MLX-LM take no adapters.
+
+`Supervisor::add_adapter` adds one to a served base: `AdapterChange::Live` when the base is not
+running, `AdapterChange::NextLoad` when it is (loading the adapter's id restarts the base with
+it). `remove_adapter` takes one off; `remove_model` on a base removes its adapters too.
+`load(adapter)` loads its base and `unload(adapter)` is refused. `status()` has a row per adapter
+with `base` set.
+
+```rust
+use weirdnet_backends::{LoraAdapter, ModelLaunch};
+
+let chat = ModelLaunch::new("qwen3-8b", EngineKind::LlamaCpp, "/models/qwen3-8b-q4_k_m.gguf")
+    .with_adapters(vec![LoraAdapter::new("qwen3-8b-tune", "/models/adapters/tune/tune-LoRA-F16.gguf").with_scale(0.8)]);
+```
+
+With the `node` feature, models/1 pulls an adapter for a served base:
+`Pull::new(repo).with_adapter_for("qwen3-8b").serving(true)` downloads it with
+[`weirdnet-model`](https://crates.io/crates/weirdnet-model) `download_adapter` and adds it.
+Adapters whose architecture or base model does not match the base are refused. `Files` lists a
+repo's adapters in `RepoFits::adapters`, and `List` and `Remove` cover adapters.
+
 ## MLX-LM (Apple silicon)
 
 `EngineKind::Mlx` runs MLX-format models with `mlx_lm.server` on macOS on Apple silicon:

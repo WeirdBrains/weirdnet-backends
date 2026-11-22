@@ -4379,8 +4379,7 @@ dependencies = [
 [[package]]
 name = "weirdnet-model"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca6fae6824c09cb00cd8540e94beb9bc4d1fc27938749e31aa69e302ec0efbfd"
+source = "git+https://github.com/WeirdBrains/weirdnet-model?branch=lora-adapters#78711f016c77fab669cd2a8b81b5f5df0562c1fd"
 dependencies = [
  "dirs",
  "minijinja",

@@ -15,7 +15,8 @@ use weirdnet_agent::remote::pool::{NoEvents, Pool};
 use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
 use weirdnet_agent::{CancelToken, ContentPart, Message, ToolSpec};
 use weirdnet_backends::{
-    Capabilities, Chunk, EngineKind, ModelHost, ModelState, RAW_INFER_PROTOCOL, RawInferDialer, Supervisor, SupervisorEvent, Wrap,
+    AdapterChange, Capabilities, Chunk, EngineKind, LoraAdapter, ModelHost, ModelLaunch, ModelState, RAW_INFER_PROTOCOL, RawInferDialer, Supervisor,
+    SupervisorEvent, Wrap,
 };
 
 use common::{launch, serve, supervisor};
@@ -418,8 +419,106 @@ fn models_added_and_removed_at_run_time() {
     })
 }
 
+/// A GGUF header: `general.architecture` plus string and u32 keys.
+fn gguf(arch: &str, kv: &[(&str, &str)], ints: &[(&str, u32)]) -> Vec<u8> {
+    let mut out = b"GGUF".to_vec();
+    out.extend(3u32.to_le_bytes());
+    out.extend(0u64.to_le_bytes());
+    out.extend(((1 + kv.len() + ints.len()) as u64).to_le_bytes());
+    let s = |out: &mut Vec<u8>, s: &str| {
+        out.extend((s.len() as u64).to_le_bytes());
+        out.extend(s.as_bytes());
+    };
+    for (k, v) in std::iter::once(&("general.architecture", arch)).chain(kv) {
+        s(&mut out, k);
+        out.extend(8u32.to_le_bytes());
+        s(&mut out, v);
+    }
+    for (k, v) in ints {
+        s(&mut out, k);
+        out.extend(4u32.to_le_bytes());
+        out.extend(v.to_le_bytes());
+    }
+    out
+}
+
+async fn reply(sup: &Supervisor, id: &str) -> Result<String, RemoteError> {
+    let mut s = sup.chat(id, &Request::messages(vec![Message::user("hi")])).await?;
+    let mut out = String::new();
+    while let Some(c) = s.next().await {
+        if let Chunk::Text(t) = c? {
+            out.push_str(&t);
+        }
+    }
+    Ok(out)
+}
+
+fn lora_adapters_on_a_base() {
+    common::block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = |name: &str, b: Vec<u8>| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, b).unwrap();
+            p.display().to_string()
+        };
+        let lora = || gguf("qwen3", &[("general.type", "adapter"), ("adapter.type", "lora")], &[]);
+        let base = w("base.gguf", gguf("qwen3", &[], &[("qwen3.block_count", 1)]));
+        let (a, b) = (w("a.gguf", lora()), w("b.gguf", lora()));
+        let sup = supervisor(vec![]);
+        let mut events = sup.subscribe();
+        sup.add_model(ModelLaunch::new("qwen", EngineKind::Llamacpp, &base).with_adapters(vec![LoraAdapter::new("tune-a", &a).with_scale(0.5)]))
+            .unwrap();
+        assert!(matches!(events.recv().await.unwrap(), SupervisorEvent::Added { model } if model == "qwen"));
+        assert!(matches!(events.recv().await.unwrap(), SupervisorEvent::Added { model } if model == "tune-a"));
+        let rows = sup.status();
+        assert_eq!(rows.iter().map(|r| (r.id.as_str(), r.base.as_deref())).collect::<Vec<_>>(), [("qwen", None), ("tune-a", Some("qwen"))]);
+        assert_eq!(rows[1].capabilities, rows[0].capabilities);
+        assert!(sup.add_model(ModelLaunch::new("tune-a", EngineKind::Llamacpp, &base)).is_err(), "adapter ids are taken too");
+
+        sup.load("tune-a").await.unwrap();
+        assert_eq!((sup.state("qwen"), sup.state("tune-a")), (Some(ModelState::Ready), Some(ModelState::Ready)), "loading an adapter loads its base");
+        assert!(reply(&sup, "tune-a").await.unwrap().starts_with("Hello from qwen+ax0.5!"));
+        assert!(reply(&sup, "qwen").await.unwrap().starts_with("Hello from qwen!"), "the base runs without the adapter");
+
+        assert_eq!(sup.add_adapter("qwen", LoraAdapter::new("tune-b", &b)).unwrap(), AdapterChange::NextLoad);
+        assert_eq!(sup.state("tune-b"), Some(ModelState::Unloaded));
+        assert!(matches!(reply(&sup, "tune-b").await, Err(RemoteError::Unavailable { .. })));
+        sup.load("tune-b").await.unwrap();
+        assert!(reply(&sup, "tune-b").await.unwrap().starts_with("Hello from qwen+bx1.0!"), "the base restarted with it");
+        assert!(reply(&sup, "tune-a").await.unwrap().starts_with("Hello from qwen+ax0.5!"));
+        assert!(sup.add_adapter("qwen", LoraAdapter::new("tune-b", &b)).is_err(), "taken");
+        assert!(sup.add_adapter("qwen", LoraAdapter::new("bad", &base)).is_err(), "not a LoRA");
+
+        assert!(matches!(sup.unload("tune-a").await, Err(RemoteError::BadRequest { .. })));
+        assert!(matches!(sup.remove_model("tune-a").await, Err(RemoteError::BadRequest { .. })));
+        assert!(sup.embed("tune-a", &["x".into()]).await.is_err());
+        sup.remove_adapter("qwen", "tune-b").unwrap();
+        assert!(sup.state("tune-b").is_none());
+        assert!(reply(&sup, "tune-b").await.is_err());
+
+        let peft = tmp.path().join("vtune");
+        std::fs::create_dir(&peft).unwrap();
+        std::fs::write(peft.join("adapter_config.json"), br#"{"peft_type":"LORA"}"#).unwrap();
+        sup.add_model(
+            ModelLaunch::new("big", EngineKind::Vllm, "Qwen/Qwen3-8B").with_adapters(vec![LoraAdapter::new("vtune", peft.display().to_string())]),
+        )
+        .unwrap();
+        sup.load("vtune").await.unwrap();
+        assert!(reply(&sup, "vtune").await.unwrap().starts_with("Hello from vtune!"));
+        assert!(reply(&sup, "big").await.unwrap().starts_with("Hello from big!"));
+
+        sup.remove_model("qwen").await.unwrap();
+        assert!(sup.state("tune-a").is_none(), "removing a base removes its adapters");
+        assert_eq!(sup.add_adapter("big", LoraAdapter::new("hub", "owner/lora")).unwrap(), AdapterChange::NextLoad);
+        sup.unload("big").await.unwrap();
+        assert_eq!(sup.add_adapter("big", LoraAdapter::new("hub2", "owner/lora2")).unwrap(), AdapterChange::Live, "the base isn't running");
+        sup.shutdown().await;
+    });
+}
+
 fn main() {
     common::main(&[
+        ("lora_adapters_on_a_base", lora_adapters_on_a_base as fn()),
         ("mlx_behind_its_proxy", mlx_behind_its_proxy as fn()),
         ("chat_reasoning_tools_prefix_completion_and_embeddings", chat_reasoning_tools_prefix_completion_and_embeddings as fn()),
         ("swap_groups_and_idle_unload", swap_groups_and_idle_unload as fn()),

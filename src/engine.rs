@@ -142,6 +142,15 @@ impl EngineConfig {
                 if model.embedding {
                     cmd.arg("--embedding");
                 }
+                // Adapters load at scale 0; each request names its own (`"lora"` in the body).
+                // `--lora` rather than `--lora-scaled FNAME:SCALE`, which splits on `:` and so
+                // breaks on Windows paths; the scale is sent per request anyway.
+                for a in &model.adapters {
+                    cmd.args(["--lora", &a.path]);
+                }
+                if !model.adapters.is_empty() {
+                    cmd.arg("--lora-init-without-apply");
+                }
                 cmd.env("LLAMA_API_KEY", api_key);
             }
             EngineKind::Vllm => {
@@ -151,6 +160,14 @@ impl EngineConfig {
                 }
                 if let Some(slots) = model.slots {
                     cmd.args(["--max-num-seqs", &slots.to_string()]);
+                }
+                if !model.adapters.is_empty() {
+                    // One `--lora-modules` with every module: vLLM keeps only the last flag.
+                    cmd.args(["--enable-lora", "--lora-modules"]);
+                    for a in &model.adapters {
+                        cmd.arg(serde_json::json!({"name": a.id, "path": a.path, "base_model_name": model.id}).to_string());
+                    }
+                    cmd.args(["--max-loras", &model.adapters.len().to_string()]);
                 }
                 cmd.env("VLLM_API_KEY", api_key);
             }
@@ -166,8 +183,41 @@ impl EngineConfig {
     }
 }
 
+/// A LoRA adapter served on top of a [`ModelLaunch`]'s base model, under its own pool id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LoraAdapter {
+    /// Pool id; requests for it go to the base model's engine with the adapter applied.
+    pub id: String,
+    /// A LoRA GGUF for llama.cpp; a PEFT directory (or Hub id) for vLLM.
+    pub path: String,
+    /// How strongly it applies (llama.cpp per request; default 1.0). vLLM ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f32>,
+}
+
+// `check_adapters` refuses a scale that isn't finite, so equality is total for served adapters.
+impl Eq for LoraAdapter {}
+
+impl LoraAdapter {
+    pub fn new(id: impl Into<String>, path: impl Into<String>) -> Self {
+        Self { id: id.into(), path: path.into(), scale: None }
+    }
+
+    pub fn with_scale(mut self, scale: f32) -> Self {
+        self.scale = Some(scale);
+        self
+    }
+
+    /// The scale requests use: [`LoraAdapter::scale`], else 1.0.
+    pub fn effective_scale(&self) -> f32 {
+        self.scale.unwrap_or(1.0)
+    }
+}
+
 /// A model this node may be told to load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ModelLaunch {
     /// Pool id; also the engine's served model name.
     pub id: String,
@@ -191,6 +241,10 @@ pub struct ModelLaunch {
     /// started by hand) instead of starting an engine: the node only probes, advertises and forwards.
     #[serde(default)]
     pub wrap: Option<Wrap>,
+    /// LoRA adapters served on this base (llama.cpp and vLLM only; see
+    /// [`ModelLaunch::check_adapters`]). Each is its own pool id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adapters: Vec<LoraAdapter>,
 }
 
 /// A stock OpenAI-compatible server the node forwards to but doesn't own.
@@ -256,7 +310,98 @@ impl ModelLaunch {
             extra_args: Vec::new(),
             idle_ttl: None,
             wrap: None,
+            adapters: Vec::new(),
         }
+    }
+
+    pub fn with_adapters(mut self, adapters: Vec<LoraAdapter>) -> Self {
+        self.adapters = adapters;
+        self
+    }
+
+    /// The pool ids this launch serves: the base's, then each adapter's.
+    pub fn served_ids(&self) -> Vec<String> {
+        std::iter::once(self.id.clone()).chain(self.adapters.iter().map(|a| a.id.clone())).collect()
+    }
+
+    /// Whether the adapters can be served: llama.cpp or vLLM (not MLX-LM, not a wrapped server,
+    /// not an embedding model), unique non-empty ids other than the base's, finite scales, and
+    /// paths the engine takes. On llama.cpp each adapter must be a LoRA GGUF (`general.type` =
+    /// `adapter`, `adapter.type` = `lora`) with the base GGUF's architecture; both headers are
+    /// read. On vLLM a local adapter must be a PEFT LoRA directory; anything else must look like a
+    /// Hub id.
+    pub fn check_adapters(&self) -> Result<(), String> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        let id = &self.id;
+        if self.wrap.is_some() {
+            return Err(format!("{id}: a wrapped server can't take adapters from this node"));
+        }
+        if self.embedding {
+            return Err(format!("{id}: embedding models take no adapters"));
+        }
+        if !matches!(self.engine, EngineKind::Llamacpp | EngineKind::Vllm) {
+            return Err(format!("{id}: {} serves no adapters here; use llama.cpp or vLLM", self.engine.name()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for a in &self.adapters {
+            if a.id.trim().is_empty() {
+                return Err(format!("{id}: an adapter needs an id"));
+            }
+            if a.id == *id {
+                return Err(format!("{id}: adapter id {} is the base model's", a.id));
+            }
+            if !seen.insert(a.id.as_str()) {
+                return Err(format!("{id}: adapter id {} is used twice", a.id));
+            }
+            if a.scale.is_some_and(|s| !s.is_finite()) {
+                return Err(format!("{}: the scale must be a finite number", a.id));
+            }
+        }
+        match self.engine {
+            EngineKind::Llamacpp => {
+                let header = |path: &str| -> Result<weirdnet_model::gguf::GgufHeader, String> {
+                    let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+                    weirdnet_model::gguf::read_header(std::io::BufReader::new(f)).map_err(|e| format!("{path}: {e}"))
+                };
+                let base = header(&self.source)?;
+                if base.kind.is_adapter() {
+                    return Err(format!("{id}: {} is an adapter, not a base model", self.source));
+                }
+                for a in &self.adapters {
+                    if a.path.contains(',') {
+                        return Err(format!("{}: llama.cpp can't take a path with a comma ({})", a.id, a.path));
+                    }
+                    let h = header(&a.path)?;
+                    if !h.kind.is_lora() {
+                        return Err(format!("{}: {} is not a LoRA adapter GGUF", a.id, a.path));
+                    }
+                    if h.architecture != base.architecture {
+                        return Err(format!("{}: adapter architecture {} doesn't match the base's {}", a.id, h.architecture, base.architecture));
+                    }
+                }
+            }
+            _ => {
+                for a in &self.adapters {
+                    let p = Path::new(&a.path);
+                    if p.is_dir() {
+                        let config: serde_json::Value = std::fs::read(p.join("adapter_config.json"))
+                            .ok()
+                            .and_then(|b| serde_json::from_slice(&b).ok())
+                            .ok_or_else(|| format!("{}: {} has no readable adapter_config.json", a.id, a.path))?;
+                        if !config["peft_type"].as_str().unwrap_or("LORA").eq_ignore_ascii_case("lora") {
+                            return Err(format!("{}: {} is not a LoRA adapter", a.id, a.path));
+                        }
+                    } else if p.exists() {
+                        return Err(format!("{}: vLLM takes a PEFT directory, not the file {}", a.id, a.path));
+                    } else if weirdnet_model::hf::check_repo(&a.path).is_err() {
+                        return Err(format!("{}: {} is neither a directory nor a Hub id", a.id, a.path));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// What this model takes. Embedding models only embed (and can't run on MLX-LM at all). A
@@ -297,7 +442,7 @@ fn is_executable(p: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn args(cmd: &Command) -> Vec<String> {
@@ -316,6 +461,122 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--alias", "qwen3-8b"]));
         assert!(a.windows(2).any(|w| w == ["--parallel", "2"]));
         assert!(!a.iter().any(|x| x == "k"), "the key stays out of argv");
+    }
+
+    /// A GGUF header with string, u32 and f32 values (enough for adapter checks).
+    pub(crate) fn gguf(kv: &[(&str, serde_json::Value)]) -> Vec<u8> {
+        let mut out = b"GGUF".to_vec();
+        out.extend(3u32.to_le_bytes());
+        out.extend(0u64.to_le_bytes());
+        out.extend((kv.len() as u64).to_le_bytes());
+        let s = |out: &mut Vec<u8>, s: &str| {
+            out.extend((s.len() as u64).to_le_bytes());
+            out.extend(s.as_bytes());
+        };
+        for (k, v) in kv {
+            s(&mut out, k);
+            match v {
+                serde_json::Value::String(t) => {
+                    out.extend(8u32.to_le_bytes());
+                    s(&mut out, t);
+                }
+                serde_json::Value::Number(n) if n.is_u64() => {
+                    out.extend(4u32.to_le_bytes());
+                    out.extend((n.as_u64().unwrap() as u32).to_le_bytes());
+                }
+                serde_json::Value::Number(n) => {
+                    out.extend(6u32.to_le_bytes());
+                    out.extend((n.as_f64().unwrap() as f32).to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+        }
+        out
+    }
+
+    pub(crate) fn base_gguf(arch: &str) -> Vec<u8> {
+        gguf(&[("general.architecture", arch.into()), (format!("{arch}.block_count").as_str(), 1.into())])
+    }
+
+    pub(crate) fn lora_gguf(arch: &str) -> Vec<u8> {
+        gguf(&[
+            ("general.architecture", arch.into()),
+            ("general.type", "adapter".into()),
+            ("adapter.type", "lora".into()),
+            ("adapter.lora.alpha", 16.5.into()),
+        ])
+    }
+
+    #[test]
+    fn llama_adapter_args_and_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = |name: &str, b: Vec<u8>| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, b).unwrap();
+            p.display().to_string()
+        };
+        let base = w("base.gguf", base_gguf("qwen3"));
+        let (a, b) = (w("a.gguf", lora_gguf("qwen3")), w("b.gguf", lora_gguf("qwen3")));
+        let m = ModelLaunch::new("qwen", EngineKind::Llamacpp, &base)
+            .with_adapters(vec![LoraAdapter::new("tune-a", &a).with_scale(0.5), LoraAdapter::new("tune-b", &b)]);
+        assert_eq!(m.served_ids(), ["qwen", "tune-a", "tune-b"]);
+        m.check_adapters().unwrap();
+        let argv = args(&EngineConfig::llamacpp("llama-server").command(&m, 1, "k"));
+        let loras: Vec<&String> = argv.windows(2).filter(|w| w[0] == "--lora").map(|w| &w[1]).collect();
+        assert_eq!(loras, [&a, &b], "one --lora per adapter, in order");
+        assert!(argv.iter().any(|x| x == "--lora-init-without-apply"));
+        assert!(
+            !args(&EngineConfig::llamacpp("l").command(&ModelLaunch::new("x", EngineKind::Llamacpp, &base), 1, "k"))
+                .iter()
+                .any(|x| x.starts_with("--lora"))
+        );
+
+        let bad =
+            |adapters: Vec<LoraAdapter>| ModelLaunch::new("qwen", EngineKind::Llamacpp, &base).with_adapters(adapters).check_adapters().unwrap_err();
+        assert!(bad(vec![LoraAdapter::new("qwen", &a)]).contains("base model's"));
+        assert!(bad(vec![LoraAdapter::new("t", &a), LoraAdapter::new("t", &b)]).contains("twice"));
+        assert!(bad(vec![LoraAdapter::new("t", &a).with_scale(f32::NAN)]).contains("finite"));
+        assert!(bad(vec![LoraAdapter::new("t", &base)]).contains("not a LoRA"));
+        assert!(bad(vec![LoraAdapter::new("t", w("llama.gguf", lora_gguf("llama")))]).contains("architecture"));
+        assert!(bad(vec![LoraAdapter::new("t", tmp.path().join("missing.gguf").display().to_string())]).contains("missing.gguf"));
+        assert!(bad(vec![LoraAdapter::new("t", w("a,b.gguf", lora_gguf("qwen3")))]).contains("comma"));
+        let mut emb = m.clone();
+        emb.embedding = true;
+        assert!(emb.check_adapters().unwrap_err().contains("embedding"));
+        let mut wrapped = m.clone();
+        wrapped.wrap = Some(Wrap { url: "http://127.0.0.1:1".into(), api_key: None });
+        assert!(wrapped.check_adapters().unwrap_err().contains("wrapped"));
+        let mlx = ModelLaunch::new("m", EngineKind::Mlx, &base).with_adapters(vec![LoraAdapter::new("t", &a)]);
+        assert!(mlx.check_adapters().unwrap_err().contains("mlx"));
+        let json = serde_json::to_string(&ModelLaunch::new("x", EngineKind::Llamacpp, "/m")).unwrap();
+        assert!(!json.contains("adapters"), "no adapters, same JSON as before");
+    }
+
+    #[test]
+    fn vllm_adapter_args_and_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peft = tmp.path().join("tune");
+        std::fs::create_dir(&peft).unwrap();
+        std::fs::write(peft.join("adapter_config.json"), br#"{"peft_type":"LORA","r":8}"#).unwrap();
+        let peft = peft.display().to_string();
+        let m = ModelLaunch::new("big", EngineKind::Vllm, "Qwen/Qwen3-8B")
+            .with_adapters(vec![LoraAdapter::new("tune", &peft), LoraAdapter::new("hub", "owner/some-lora")]);
+        m.check_adapters().unwrap();
+        let a = args(&EngineConfig::vllm("vllm").command(&m, 9000, "k"));
+        assert_eq!(a.iter().filter(|x| *x == "--lora-modules").count(), 1, "vLLM keeps only the last --lora-modules");
+        let at = a.iter().position(|x| x == "--lora-modules").unwrap();
+        let mods: Vec<serde_json::Value> = a[at + 1..at + 3].iter().map(|j| serde_json::from_str(j).unwrap()).collect();
+        assert_eq!(mods[0], serde_json::json!({"name": "tune", "path": peft, "base_model_name": "big"}));
+        assert_eq!(mods[1]["name"], "hub");
+        assert!(a.iter().any(|x| x == "--enable-lora"));
+        assert!(a.windows(2).any(|w| w == ["--max-loras", "2"]));
+        let file = tmp.path().join("x.gguf");
+        std::fs::write(&file, lora_gguf("qwen3")).unwrap();
+        let bad = |path: String| {
+            ModelLaunch::new("big", EngineKind::Vllm, "Q/Q").with_adapters(vec![LoraAdapter::new("t", path)]).check_adapters().unwrap_err()
+        };
+        assert!(bad(file.display().to_string()).contains("PEFT directory"));
+        assert!(bad("/no/such/dir".into()).contains("Hub id"));
     }
 
     #[test]

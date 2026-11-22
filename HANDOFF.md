@@ -2,6 +2,22 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-22: LoRA adapters (branch lora-adapters)
+
+What changed (the [lora-adapters](https://github.com/WeirdBrains/weirdnet-backends/tree/lora-adapters) branch, not on main; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`):
+
+- `LoraAdapter` and `ModelLaunch::adapters` (`ModelLaunch` is now `#[non_exhaustive]`), `with_adapters`, `served_ids`, `check_adapters`. llama.cpp: `--lora PATH` per adapter and `--lora-init-without-apply`; each request sets `"lora":[{id,scale}]` (a base with adapters sends `"lora":[]`). vLLM: `--enable-lora`, a single `--lora-modules` list (only the last flag counts in vLLM) and `--max-loras N`; a request names the adapter as `model`.
+- `openai::Target`, `chat_body_for`, `completion_body_for`.
+- Supervisor: adapters resolve to their base for chat, completion, state and capabilities; `load(adapter)` loads the base (restarting it when the adapter was added while it ran); `unload` and `embed` of an adapter are refused; `remove_model(base)` removes its adapters; `ModelStatus::base` and a row per adapter; `add_adapter` (`AdapterChange::Live`/`NextLoad`) and `remove_adapter`.
+- models/1: `Pull::adapter_for`, `RepoFits::adapters`, `StoredEntry` covers adapters; architecture and base-model mismatches are refused.
+- `Cargo.toml` takes `weirdnet-model` from git (`[patch.crates-io]`, its lora-adapters branch) for the unreleased adapter API, and `weirdnet-model` is no longer optional. This is why the work stays off main.
+
+Checks run: `cargo fmt --check`; clippy `-D warnings` default, `--all-features` and `--no-default-features`; tests default, `--all-features` (32 unit, 9 adapter, 2 node) and `--no-default-features`; `cargo doc` with `-D warnings`. Engine-free: the mock engine parses `--lora`/`--lora-modules` and answers per adapter and scale; GGUF LoRA headers are written by the tests. `cargo package` was skipped (the git patch).
+
+Not tested: a real llama.cpp or vLLM with adapters (checked against the llama.cpp b12590 server source: the per-request `lora` field, ids not listed get scale 0, an empty list uses the global scales, which `--lora-init-without-apply` sets to 0); a real Hub adapter pull.
+
+What's left and next: once weirdnet-model 0.5.2 is published, set `weirdnet-model = "0.5.2"`, drop `[patch.crates-io]`, `cargo update -p weirdnet-model`, merge to main and release as 0.4.0 (breaking), after m3talsmith approves.
+
 ## 2026-11-21: release 0.3.0
 
 What changed: `release: v0.3.0` with `scripts/weirdnet_release.py` (approved by m3talsmith together with [weirdnet-model](https://crates.io/crates/weirdnet-model) 0.5.1 and [weirdnet-alerts](https://crates.io/crates/weirdnet-alerts) 0.2.0, released in that order). Tag `v0.3.0`, published to [crates.io](https://crates.io/crates/weirdnet-backends/0.3.0), docs on [docs.rs](https://docs.rs/weirdnet-backends/0.3.0). Breaking for `node` users: weirdnet-model 0.5.1 is required and 0.4 is no longer accepted.

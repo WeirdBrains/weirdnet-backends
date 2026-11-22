@@ -63,8 +63,46 @@ fn sampling(obj: &mut Map<String, Value>, s: &Sampling, engine: EngineKind) {
     }
 }
 
-fn streaming(obj: &mut Map<String, Value>, alias: &str) {
-    obj.insert("model".into(), alias.into());
+/// Which model a request body is for: a base model, or a LoRA adapter on one.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Target {
+    /// The engine's alias for the model, with no adapter applied.
+    Base {
+        alias: String,
+        /// The base has adapters loaded (llama.cpp then gets an explicit empty `"lora"` list).
+        has_adapters: bool,
+    },
+    /// Adapter `id` on `base`: llama.cpp gets `"lora": [{"id": index, "scale": scale}]` with
+    /// `index` its position in the engine's `--lora` list; vLLM gets `"model": id`.
+    Adapter { base: String, index: usize, id: String, scale: f32 },
+}
+
+impl Target {
+    /// A base model without adapters.
+    pub fn base(alias: impl Into<String>) -> Self {
+        Target::Base { alias: alias.into(), has_adapters: false }
+    }
+}
+
+fn streaming(obj: &mut Map<String, Value>, target: &Target, engine: EngineKind) {
+    let model = match (target, engine) {
+        (Target::Adapter { id, .. }, EngineKind::Vllm) => id.as_str(),
+        (Target::Adapter { base, .. }, _) => base.as_str(),
+        (Target::Base { alias, .. }, _) => alias.as_str(),
+    };
+    obj.insert("model".into(), model.into());
+    if engine == EngineKind::Llamacpp {
+        match target {
+            Target::Adapter { index, scale, .. } => {
+                obj.insert("lora".into(), json!([{"id": index, "scale": scale}]));
+            }
+            Target::Base { has_adapters: true, .. } => {
+                obj.insert("lora".into(), json!([]));
+            }
+            _ => {}
+        }
+    }
     obj.insert("stream".into(), true.into());
     obj.insert("stream_options".into(), json!({"include_usage": true}));
 }
@@ -73,6 +111,11 @@ fn streaming(obj: &mut Map<String, Value>, alias: &str) {
 /// final assistant message the engine continues (llama.cpp prefills a trailing assistant
 /// message; vLLM gets `continue_final_message`). Reasoning in the prefix is not continued.
 pub fn chat_body(request: &Request, alias: &str, engine: EngineKind) -> Result<Value, RemoteError> {
+    chat_body_for(request, &Target::base(alias), engine)
+}
+
+/// [`chat_body`] for a [`Target`]: a base model or an adapter on one.
+pub fn chat_body_for(request: &Request, target: &Target, engine: EngineKind) -> Result<Value, RemoteError> {
     let Input::Messages(messages) = &request.input else {
         return Err(bad_request("chat takes assembled messages, not a context_ref or a raw prompt"));
     };
@@ -106,25 +149,46 @@ pub fn chat_body(request: &Request, alias: &str, engine: EngineKind) -> Result<V
     if !request.tools.is_empty() {
         obj.insert("tools".into(), request.tools.iter().map(tool).collect());
     }
-    streaming(&mut obj, alias);
+    streaming(&mut obj, target, engine);
     Ok(Value::Object(obj))
 }
 
 /// The streaming `/v1/completions` body for a raw `prompt`.
 pub fn completion_body(prompt: &str, s: &Sampling, seed: Option<u64>, alias: &str, engine: EngineKind) -> Value {
+    completion_body_for(prompt, s, seed, &Target::base(alias), engine)
+}
+
+/// [`completion_body`] for a [`Target`].
+pub fn completion_body_for(prompt: &str, s: &Sampling, seed: Option<u64>, target: &Target, engine: EngineKind) -> Value {
     let mut obj = Map::new();
     obj.insert("prompt".into(), prompt.into());
     sampling(&mut obj, s, engine);
     if let Some(seed) = seed {
         obj.insert("seed".into(), seed.into());
     }
-    streaming(&mut obj, alias);
+    streaming(&mut obj, target, engine);
     Value::Object(obj)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_targets() {
+        let r = Request::messages(vec![Message::user("hi")]);
+        let a = Target::Adapter { base: "qwen".into(), index: 1, id: "tune".into(), scale: 0.5 };
+        let b = chat_body_for(&r, &a, EngineKind::Llamacpp).unwrap();
+        assert_eq!((b["model"].as_str(), &b["lora"]), (Some("qwen"), &json!([{"id": 1, "scale": 0.5}])));
+        let b = chat_body_for(&r, &a, EngineKind::Vllm).unwrap();
+        assert_eq!(b["model"], "tune");
+        assert!(b.get("lora").is_none());
+        let base = Target::Base { alias: "qwen".into(), has_adapters: true };
+        let b = completion_body_for("x", &Sampling::default(), None, &base, EngineKind::Llamacpp);
+        assert_eq!((b["model"].as_str(), &b["lora"]), (Some("qwen"), &json!([])));
+        let b = chat_body(&r, "qwen", EngineKind::Llamacpp).unwrap();
+        assert!(b.get("lora").is_none(), "no adapters, no lora field");
+    }
     use weirdnet_agent::ToolCall;
     use weirdnet_agent::remote::infer::v2::{ContextRef, Prefix};
 

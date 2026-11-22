@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- LoRA adapters: `LoraAdapter` (`new`, `with_scale`), `ModelLaunch::adapters`, `ModelLaunch::with_adapters`, `served_ids` and `check_adapters`. llama.cpp loads GGUF LoRA files with `--lora` and `--lora-init-without-apply` and each request sets its adapter in `lora`; vLLM gets `--enable-lora`, one `--lora-modules` list and `--max-loras`.
+- `openai::Target` (`Base`, `Adapter`) with `chat_body_for` and `completion_body_for`.
+- `Supervisor::add_adapter` (`AdapterChange::Live` or `NextLoad`) and `Supervisor::remove_adapter`. Chat, completion, state and capabilities resolve an adapter to its base; `load(adapter)` loads the base; `unload(adapter)` and `embed(adapter)` are refused; `remove_model(base)` removes its adapters. `ModelStatus::base` and a status row per adapter.
+- `models` (feature `node`): `Pull::adapter_for` (`with_adapter_for`) pulls an adapter for a served base and, with `serve`, adds it; `RepoFits::adapters`; `List` and `Remove` cover adapters. Adapters whose architecture or base model does not match are refused.
+
+### Changed
+
+- Breaking: `ModelLaunch` is `#[non_exhaustive]`; build it with `ModelLaunch::new` and the `with_` methods.
+- Breaking: `models::StoredEntry::model` is an `Option` and `StoredEntry` gains `adapter` and `base`; `StoredEntry` and `RepoFits` no longer implement `Eq`. 0.3 clients cannot decode a `List` reply that has adapters.
+- `weirdnet-model` (0.5.2) is now always a dependency, not only with `node`, to read GGUF adapter headers.
+
 ## [0.3.0] - 2026-11-21
 
 ### Added

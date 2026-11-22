@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use weirdnet_agent::remote::RemoteError;
 use weirdnet_agent::remote::infer::v2::{Request, Sampling};
 
-use crate::engine::{Capabilities, EngineConfig, EngineKind, ModelLaunch};
+use crate::engine::{Capabilities, EngineConfig, EngineKind, LoraAdapter, ModelLaunch};
 
 /// An engine's answer as it streams.
 pub type ChunkStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<Chunk, RemoteError>> + Send>>;
@@ -33,7 +33,7 @@ pub enum ModelState {
     Failed(String),
 }
 use crate::error::{bad_request, engine_error, unavailable, unknown_model};
-use crate::openai;
+use crate::openai::{self, Target};
 use crate::sse::{Chunk, ChunkDecoder, SseParser};
 
 #[derive(Debug, Clone)]
@@ -139,10 +139,34 @@ pub struct ModelStatus {
     /// 0.1.3, where only `embedding` is known.
     #[serde(default)]
     pub capabilities: Option<Capabilities>,
+    /// For a LoRA adapter's row: the base model it runs on (it shares the base's engine, state
+    /// and capabilities). `None` for models.
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+/// When an adapter added with [`Supervisor::add_adapter`] can serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AdapterChange {
+    /// Now, or whenever the base is next ready: the base wasn't running.
+    Live,
+    /// After the base's next load: its engine is running without the adapter. Loading the
+    /// adapter ([`Supervisor::load`]) restarts the base.
+    NextLoad,
+}
+
+/// Where a pool id goes: its base model's slot, and the adapter if it is one.
+struct Route {
+    base: String,
+    adapter: Option<LoraAdapter>,
 }
 
 struct Running {
     base: String,
+    /// The adapter ids the engine was started with, in `--lora` order.
+    adapters: Vec<String>,
     api_key: Option<String>,
     pid: Option<u32>,
     stop: Option<oneshot::Sender<()>>,
@@ -229,6 +253,57 @@ impl Supervisor {
         let _ = self.inner.events.send(ev);
     }
 
+    /// The slot serving `id`: a model's own, or the base of an adapter.
+    fn route(&self, id: &str) -> Result<Route, RemoteError> {
+        let slots = self.slots();
+        if slots.contains_key(id) {
+            return Ok(Route { base: id.to_string(), adapter: None });
+        }
+        slots
+            .values()
+            .find_map(|s| s.launch.adapters.iter().find(|a| a.id == id).map(|a| Route { base: s.launch.id.clone(), adapter: Some(a.clone()) }))
+            .ok_or_else(|| unknown_model(id))
+    }
+
+    /// Whether `id` names a model or an adapter on this node.
+    fn taken(slots: &HashMap<String, Slot>, id: &str) -> bool {
+        slots.contains_key(id) || slots.values().any(|s| s.launch.adapters.iter().any(|a| a.id == id))
+    }
+
+    /// Adds LoRA adapter `adapter` to model `base`, after [`ModelLaunch::check_adapters`]. Its id
+    /// must be free on the node. Returns [`AdapterChange::NextLoad`] when the base's engine is
+    /// running (llama.cpp and vLLM take adapters at start here), else [`AdapterChange::Live`].
+    /// Emits [`SupervisorEvent::Added`] for the adapter.
+    pub fn add_adapter(&self, base: &str, adapter: LoraAdapter) -> Result<AdapterChange, RemoteError> {
+        let mut launch = self.slots().get(base).map(|s| s.launch.clone()).ok_or_else(|| unknown_model(base))?;
+        launch.adapters.push(adapter.clone());
+        launch.check_adapters().map_err(bad_request)?;
+        let running = {
+            let mut slots = self.slots();
+            if Self::taken(&slots, &adapter.id) {
+                return Err(bad_request(format!("{} is already configured on this node", adapter.id)));
+            }
+            let slot = slots.get_mut(base).ok_or_else(|| unknown_model(base))?;
+            slot.launch.adapters.push(adapter.clone());
+            slot.running.is_some()
+        };
+        self.emit(SupervisorEvent::Added { model: adapter.id });
+        Ok(if running { AdapterChange::NextLoad } else { AdapterChange::Live })
+    }
+
+    /// Stops serving adapter `id` on `base` (requests for it fail from now on; the engine keeps
+    /// it loaded until the base's next load). Emits [`SupervisorEvent::Removed`].
+    pub fn remove_adapter(&self, base: &str, id: &str) -> Result<LoraAdapter, RemoteError> {
+        let removed = {
+            let mut slots = self.slots();
+            let slot = slots.get_mut(base).ok_or_else(|| unknown_model(base))?;
+            let at = slot.launch.adapters.iter().position(|a| a.id == id).ok_or_else(|| bad_request(format!("{base} has no adapter {id}")))?;
+            slot.launch.adapters.remove(at)
+        };
+        self.emit(SupervisorEvent::Removed { model: id.into() });
+        Ok(removed)
+    }
+
     /// Adds a model the node may load from now on, without a restart (for example one just
     /// downloaded). It starts unloaded. Refused when the id is taken; [`Supervisor::remove_model`]
     /// first to replace one. Emits [`SupervisorEvent::Added`].
@@ -239,28 +314,35 @@ impl Supervisor {
         if let Some(w) = &launch.wrap {
             w.check().map_err(bad_request)?;
         }
+        launch.check_adapters().map_err(bad_request)?;
         let id = launch.id.clone();
+        let ids = launch.served_ids();
         {
             let mut slots = self.slots();
-            if slots.contains_key(&id) {
-                return Err(bad_request(format!("{id} is already configured on this node")));
+            if let Some(t) = ids.iter().find(|i| Self::taken(&slots, i)) {
+                return Err(bad_request(format!("{t} is already configured on this node")));
             }
             slots.insert(id.clone(), Slot::new(launch));
         }
-        self.emit(SupervisorEvent::Added { model: id });
+        for model in ids {
+            self.emit(SupervisorEvent::Added { model });
+        }
         Ok(())
     }
 
-    /// Unloads `id` (draining requests under way) and forgets it. Emits
-    /// [`SupervisorEvent::Removed`]. Returns its launch settings.
+    /// Unloads `id` (draining requests under way) and forgets it, with its adapters. Emits
+    /// [`SupervisorEvent::Removed`] for each. Returns its launch settings. An adapter's id is
+    /// refused: use [`Supervisor::remove_adapter`].
     pub async fn remove_model(&self, id: &str) -> Result<ModelLaunch, RemoteError> {
         let _op = self.inner.ops.lock().await;
-        if !self.slots().contains_key(id) {
-            return Err(unknown_model(id));
+        if let Route { base, adapter: Some(_) } = self.route(id)? {
+            return Err(bad_request(format!("{id} is an adapter on {base}; remove it with remove_adapter")));
         }
         self.stop(id, false).await;
         let slot = self.slots().remove(id).ok_or_else(|| unknown_model(id))?;
-        self.emit(SupervisorEvent::Removed { model: id.into() });
+        for model in slot.launch.served_ids() {
+            self.emit(SupervisorEvent::Removed { model });
+        }
         Ok(slot.launch)
     }
 
@@ -280,29 +362,56 @@ impl Supervisor {
         self.inner.epoch.elapsed().as_millis() as u64
     }
 
+    /// One row per model, and one per adapter (with [`ModelStatus::base`] set, the base's engine,
+    /// capabilities and state; `Unloaded` while the base runs without it).
     pub fn status(&self) -> Vec<ModelStatus> {
         let mut out: Vec<ModelStatus> = self
             .slots()
             .values()
-            .map(|s| ModelStatus {
-                id: s.launch.id.clone(),
-                engine: s.launch.engine,
-                state: s.state.clone(),
-                in_flight: s.in_flight.load(Ordering::SeqCst),
-                swap_group: s.launch.swap_group.clone(),
-                embedding: s.launch.embedding,
-                pid: s.running.as_ref().and_then(|r| r.pid),
-                last_load_secs: s.load_secs,
-                size_bytes: if s.launch.wrap.is_some() { None } else { std::fs::metadata(&s.launch.source).ok().map(|m| m.len()) },
-                wrapped: s.launch.wrap.is_some(),
-                crashes: s.crashes.len(),
-                context: s.launch.context,
-                slots: s.launch.slots,
-                capabilities: Some(s.launch.capabilities()),
+            .flat_map(|s| {
+                let row = Self::row(s);
+                let adapters: Vec<ModelStatus> = s
+                    .launch
+                    .adapters
+                    .iter()
+                    .map(|a| {
+                        let mut r = row.clone();
+                        let loaded = s.running.as_ref().is_none_or(|run| run.adapters.contains(&a.id));
+                        if !loaded {
+                            r.state = ModelState::Unloaded;
+                            r.pid = None;
+                        }
+                        r.id = a.id.clone();
+                        r.base = Some(s.launch.id.clone());
+                        r.size_bytes = std::fs::metadata(&a.path).ok().filter(|m| m.is_file()).map(|m| m.len());
+                        r
+                    })
+                    .collect();
+                std::iter::once(row).chain(adapters)
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
+    }
+
+    fn row(s: &Slot) -> ModelStatus {
+        ModelStatus {
+            id: s.launch.id.clone(),
+            engine: s.launch.engine,
+            state: s.state.clone(),
+            in_flight: s.in_flight.load(Ordering::SeqCst),
+            swap_group: s.launch.swap_group.clone(),
+            embedding: s.launch.embedding,
+            pid: s.running.as_ref().and_then(|r| r.pid),
+            last_load_secs: s.load_secs,
+            size_bytes: if s.launch.wrap.is_some() { None } else { std::fs::metadata(&s.launch.source).ok().map(|m| m.len()) },
+            wrapped: s.launch.wrap.is_some(),
+            crashes: s.crashes.len(),
+            context: s.launch.context,
+            slots: s.launch.slots,
+            capabilities: Some(s.launch.capabilities()),
+            base: None,
+        }
     }
 
     /// Requests under way across all models.
@@ -310,13 +419,21 @@ impl Supervisor {
         self.slots().values().map(|s| s.in_flight.load(Ordering::SeqCst)).sum()
     }
 
+    /// `id`'s state; an adapter has its base's (`Unloaded` while the base runs without it).
     pub fn state(&self, id: &str) -> Option<ModelState> {
-        self.slots().get(id).map(|s| s.state.clone())
+        let route = self.route(id).ok()?;
+        let slots = self.slots();
+        let s = slots.get(&route.base)?;
+        match (&route.adapter, &s.running) {
+            (Some(a), Some(r)) if !r.adapters.contains(&a.id) => Some(ModelState::Unloaded),
+            _ => Some(s.state.clone()),
+        }
     }
 
-    /// What `id` takes ([`ModelLaunch::capabilities`]).
+    /// What `id` takes ([`ModelLaunch::capabilities`]); an adapter takes what its base does.
     pub fn capabilities(&self, id: &str) -> Option<Capabilities> {
-        self.slots().get(id).map(|s| s.launch.capabilities())
+        let route = self.route(id).ok()?;
+        self.slots().get(&route.base).map(|s| s.launch.capabilities())
     }
 
     /// Starts `id` and waits until it is ready (see [`Supervisor::load_with`]).
@@ -328,7 +445,13 @@ impl Supervisor {
     /// group's other models first. Already ready: returns at once. A model in a crash loop or
     /// waiting for its restart refuses unless `force` (an operator's explicit load), which also
     /// clears the crash history.
+    ///
+    /// An adapter loads its base. When the base is ready without it (added after the base
+    /// started), the base is restarted.
     pub async fn load_with(&self, id: &str, force: bool) -> Result<(), RemoteError> {
+        let route = self.route(id)?;
+        let wanted = route.adapter.map(|a| a.id);
+        let id = route.base.as_str();
         // A request during a crash backoff waits it out (at most `backoff_max`) rather than
         // failing; the scheduled restart and this load serialize on `ops`.
         if !force {
@@ -345,7 +468,8 @@ impl Supervisor {
         let (launch, group_mates) = {
             let mut slots = self.slots();
             let slot = slots.get_mut(id).ok_or_else(|| unknown_model(id))?;
-            if slot.state == ModelState::Ready {
+            let has_wanted = wanted.as_ref().is_none_or(|w| slot.running.as_ref().is_some_and(|r| r.adapters.contains(w)));
+            if slot.state == ModelState::Ready && has_wanted {
                 return Ok(());
             }
             if force {
@@ -394,10 +518,11 @@ impl Supervisor {
     }
 
     /// Drains and stops `id`. A wrapped server is only detached (the node doesn't own it).
+    /// An adapter's id is refused: unload its base.
     pub async fn unload(&self, id: &str) -> Result<(), RemoteError> {
         let _op = self.inner.ops.lock().await;
-        if !self.slots().contains_key(id) {
-            return Err(unknown_model(id));
+        if let Route { base, adapter: Some(_) } = self.route(id)? {
+            return Err(bad_request(format!("{id} is an adapter on {base}; unload {base} instead")));
         }
         self.stop(id, false).await;
         Ok(())
@@ -473,7 +598,7 @@ impl Supervisor {
             return Err(unavailable(format!("{}: wrapped server {base} is not answering /health", launch.id)));
         }
         slot.state = ModelState::Ready;
-        slot.running = Some(Running { base, api_key, pid: None, stop: None, exited: rx, _exit_tx: Some(tx), _proxy: proxy });
+        slot.running = Some(Running { base, adapters: Vec::new(), api_key, pid: None, stop: None, exited: rx, _exit_tx: Some(tx), _proxy: proxy });
         Ok(())
     }
 
@@ -484,6 +609,12 @@ impl Supervisor {
             .get(&launch.engine)
             .ok_or_else(|| unavailable(format!("engine {} is not configured on this node", launch.engine.name())))?
             .clone();
+        if let Err(why) = launch.check_adapters() {
+            if let Some(s) = self.slots().get_mut(&launch.id) {
+                s.state = ModelState::Failed(why.clone());
+            }
+            return Err(bad_request(why));
+        }
         let mlx = launch.engine == EngineKind::Mlx;
         if mlx && launch.embedding {
             let why = "MLX-LM serves no embeddings; run embedding models on llama.cpp or vLLM".to_string();
@@ -545,6 +676,7 @@ impl Supervisor {
             slot.state = ModelState::Loading;
             slot.running = Some(Running {
                 base: format!("http://127.0.0.1:{port}"),
+                adapters: launch.adapters.iter().map(|a| a.id.clone()).collect(),
                 api_key: Some(api_key),
                 pid,
                 stop: Some(stop_tx),
@@ -708,6 +840,31 @@ impl Supervisor {
         self.emit(SupervisorEvent::Unloaded { model: id.into(), idle });
     }
 
+    /// The engine, request target, URL, key and in-flight guard for pool id `id` (a model, or an
+    /// adapter on a ready base that was started with it).
+    fn routed(&self, id: &str) -> Result<(EngineKind, Target, String, Option<String>, InFlight), RemoteError> {
+        let route = self.route(id)?;
+        let (engine, target) = {
+            let slots = self.slots();
+            let slot = slots.get(&route.base).ok_or_else(|| unknown_model(id))?;
+            let engine = slot.launch.engine;
+            let target = match &route.adapter {
+                None => Target::Base { alias: route.base.clone(), has_adapters: slot.running.as_ref().is_some_and(|r| !r.adapters.is_empty()) },
+                Some(a) => {
+                    let index = slot
+                        .running
+                        .as_ref()
+                        .and_then(|r| r.adapters.iter().position(|x| *x == a.id))
+                        .ok_or_else(|| unavailable(format!("{id} is not loaded; load it (this restarts {})", route.base)))?;
+                    Target::Adapter { base: route.base.clone(), index, id: a.id.clone(), scale: a.effective_scale() }
+                }
+            };
+            (engine, target)
+        };
+        let (base, key, guard) = self.target(&route.base)?;
+        Ok((engine, target, base, key, guard))
+    }
+
     /// Where requests for `id` go, with the in-flight guard taken.
     fn target(&self, id: &str) -> Result<(String, Option<String>, InFlight), RemoteError> {
         let slots = self.slots();
@@ -743,9 +900,8 @@ impl Supervisor {
     /// Streams a chat answer from `id`, which must be ready. Dropping the stream aborts the engine
     /// request.
     pub async fn chat(&self, id: &str, request: &Request) -> Result<ChunkStream, RemoteError> {
-        let engine = self.engine_of(id)?;
-        let body = openai::chat_body(request, id, engine)?;
-        let (base, key, guard) = self.target(id)?;
+        let (engine, target, base, key, guard) = self.routed(id)?;
+        let body = openai::chat_body_for(request, &target, engine)?;
         let resp = self.post(format!("{base}/v1/chat/completions"), key.as_deref(), &body).await?;
         Ok(stream_chunks(resp, guard))
     }
@@ -753,14 +909,16 @@ impl Supervisor {
     /// Streams a raw text completion of `prompt` from `id`, which must be ready. Response
     /// formats and tools don't apply.
     pub async fn complete(&self, id: &str, prompt: &str, sampling: &Sampling, seed: Option<u64>) -> Result<ChunkStream, RemoteError> {
-        let engine = self.engine_of(id)?;
-        let body = openai::completion_body(prompt, sampling, seed, id, engine);
-        let (base, key, guard) = self.target(id)?;
+        let (engine, target, base, key, guard) = self.routed(id)?;
+        let body = openai::completion_body_for(prompt, sampling, seed, &target, engine);
         let resp = self.post(format!("{base}/v1/completions"), key.as_deref(), &body).await?;
         Ok(stream_chunks(resp, guard))
     }
 
     fn engine_of(&self, id: &str) -> Result<EngineKind, RemoteError> {
+        if let Route { base, adapter: Some(_) } = self.route(id)? {
+            return Err(bad_request(format!("{id} is an adapter on {base}; adapters serve chat and completions only")));
+        }
         self.slots().get(id).map(|s| s.launch.engine).ok_or_else(|| unknown_model(id))
     }
 

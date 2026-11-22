@@ -6,14 +6,15 @@
 //!
 //! - [`engine`]: how llama.cpp `llama-server`, `vllm serve` and MLX-LM's `mlx_lm.server` are
 //!   launched and probed, each model's [`Capabilities`] (chat, embeddings, images, audio), and
-//!   [`Wrap`] for a stock OpenAI-compatible server on loopback.
+//!   [`Wrap`] for a stock OpenAI-compatible server on loopback, and [`LoraAdapter`]s served
+//!   next to a llama.cpp or vLLM base model.
 //! - [`mlx`]: installing a pinned `mlx-lm` into a venv, and the proxy the supervisor puts in front
 //!   of `mlx_lm.server` (API key check, readiness after a one-token completion, `default_model`
 //!   rewrite, text only).
 //! - [`supervisor`]: the local supervisor: load (random loopback port, per-process API key in
 //!   the environment, readiness probe), drain and unload, swap groups, idle unload, crash
 //!   restarts with backoff and crash loops, [`SupervisorEvent`]s and per-model logs; chat,
-//!   completion and embedding forwarding.
+//!   completion and embedding forwarding; adapters routed to their base ([`AdapterChange`]).
 //! - [`sse`]: OpenAI server-sent events decoded into [`Chunk`]s, and [`ToolCalls`] to join
 //!   streamed tool calls.
 //! - [`openai`]: engine request bodies from `weirdnet-agent` infer/2 requests.
@@ -23,7 +24,7 @@
 //!   records, `Load`, `Unload`, `Drain`, `GroupUp`/`GroupDown` and health.
 //! - `models` (feature `node`): `/weirdnet-backends/models/1`, for the owner only: search the
 //!   Hugging Face Hub, see which files fit the node, pull (split GGUFs too) and serve without a
-//!   restart, list and remove.
+//!   restart, list and remove; LoRA adapters for a served base too.
 //!
 //! Platforms: the supervisor runs on Unix and Windows. On Unix an engine gets its own process
 //! group, stops with SIGTERM then SIGKILL after a grace period, and on Linux dies with its
@@ -44,7 +45,8 @@ pub mod openai;
 pub mod sse;
 pub mod supervisor;
 
-pub use engine::{Capabilities, EngineConfig, EngineKind, ModelLaunch, Wrap, find_in_path};
+pub use engine::{Capabilities, EngineConfig, EngineKind, LoraAdapter, ModelLaunch, Wrap, find_in_path};
 pub use host::{EngineModel, ModelHost, RAW_INFER_PROTOCOL, RawInferDialer, Speed};
+pub use openai::Target;
 pub use sse::{Chunk, ChunkDecoder, SseParser, ToolCalls};
-pub use supervisor::{ChunkStream, ModelState, ModelStatus, Supervisor, SupervisorEvent, SupervisorOptions};
+pub use supervisor::{AdapterChange, ChunkStream, ModelState, ModelStatus, Supervisor, SupervisorEvent, SupervisorOptions};
