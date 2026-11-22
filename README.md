@@ -80,7 +80,7 @@ with `base` set.
 ```rust
 use weirdnet_backends::{LoraAdapter, ModelLaunch};
 
-let chat = ModelLaunch::new("qwen3-8b", EngineKind::LlamaCpp, "/models/qwen3-8b-q4_k_m.gguf")
+let chat = ModelLaunch::new("qwen3-8b", EngineKind::Llamacpp, "/models/qwen3-8b-q4_k_m.gguf")
     .with_adapters(vec![LoraAdapter::new("qwen3-8b-tune", "/models/adapters/tune/tune-LoRA-F16.gguf").with_scale(0.8)]);
 ```
 
