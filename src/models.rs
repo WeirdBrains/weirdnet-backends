@@ -1,7 +1,10 @@
 //! `/weirdnet-backends/models/1`: the owner manages a model node's model files over
 //! `weirdnet-net`: search the Hugging Face Hub, see which files fit the node, pull one (split
 //! GGUFs too) and serve it without a restart, list and remove what is on disk. LoRA adapters
-//! too: [`Pull::adapter_for`] pulls one for a served base model and adds it to that base.
+//! too: [`Pull::adapter_for`] pulls one for a served base model and adds it to that base;
+//! [`ModelsCommand::ServeAdapter`], [`ModelsCommand::UnserveAdapter`] and
+//! [`ModelsCommand::AdapterScale`] add a stored one to a base, take one off and change its scale
+//! while the base keeps running where the engine allows (see [`Supervisor::add_adapter_live`]).
 //!
 //! Only the owner may use it: [`ModelsService`] takes an [`Authorize`] and runs nothing before
 //! it admits the caller. Pass `weirdnet_agent::serve::RosterAuth` for the owner's linked devices
@@ -98,8 +101,8 @@ impl Pull {
     }
 }
 
-/// A models/1 request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A models/1 request. Nodes before 0.4.1 refuse the adapter commands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ModelsCommand {
     /// Hub repos (GGUF only), most downloaded first.
@@ -120,7 +123,29 @@ pub enum ModelsCommand {
     Remove {
         id: String,
     },
+    /// Serve stored adapter `id` ([`StoredAdapter::id`]) on served base model `base`, under the
+    /// same id, live where the engine allows ([`Supervisor::add_adapter_live`]). `scale` as in
+    /// [`LoraAdapter::scale`].
+    ServeAdapter {
+        id: String,
+        base: String,
+        #[serde(default)]
+        scale: Option<f32>,
+    },
+    /// Stop serving adapter `id` (its served id), keeping its files
+    /// ([`Supervisor::remove_adapter_live`]).
+    UnserveAdapter {
+        id: String,
+    },
+    /// Change served adapter `id`'s scale ([`Supervisor::set_adapter_scale`]).
+    AdapterScale {
+        id: String,
+        scale: Option<f32>,
+    },
 }
+
+// The service refuses scales that aren't finite, so equality is total for the commands it runs.
+impl Eq for ModelsCommand {}
 
 /// What a client sends: its certificate and one command.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -212,10 +237,32 @@ impl StoredEntry {
 pub enum ModelsReply {
     Hits(Vec<SearchHit>),
     Fits(Box<RepoFits>),
-    Progress { done: u64, total: u64 },
+    Progress {
+        done: u64,
+        total: u64,
+    },
     Pulled(Pulled),
     List(Vec<StoredEntry>),
-    Removed { id: String, freed: u64 },
+    Removed {
+        id: String,
+        freed: u64,
+    },
+    /// [`ModelsCommand::ServeAdapter`] done: when it serves.
+    AdapterServed {
+        id: String,
+        base: String,
+        change: AdapterChange,
+    },
+    /// [`ModelsCommand::UnserveAdapter`] done.
+    AdapterUnserved {
+        id: String,
+        base: String,
+    },
+    /// [`ModelsCommand::AdapterScale`] done.
+    AdapterScaled {
+        id: String,
+        scale: Option<f32>,
+    },
     Failed(RemoteError),
 }
 
@@ -384,7 +431,7 @@ impl ModelsService {
             let path = path.display().to_string();
             let already = self.supervisor.launches().iter().any(|l| l.adapters.iter().any(|x| x.path == path));
             if !already {
-                change = Some(self.supervisor.add_adapter(base, LoraAdapter::new(adapter.id.clone(), path))?);
+                change = Some(self.supervisor.add_adapter_live(base, LoraAdapter::new(adapter.id.clone(), path)).await?);
             }
             if pull.load {
                 self.supervisor.load(&adapter.id).await?;
@@ -487,7 +534,7 @@ impl ModelsService {
         let store = self.store.clone();
         if let Some(adapter) = entry.adapter.clone() {
             if let (Some(served), Some(base)) = (&entry.served_as, &entry.base) {
-                self.supervisor.remove_adapter(base, served)?;
+                self.supervisor.remove_adapter_live(base, served).await?;
             }
             return blocking(move || store.remove_adapter(&adapter)).await;
         }
@@ -498,6 +545,31 @@ impl ModelsService {
         blocking(move || store.remove_local(&model)).await
     }
 
+    /// Serves stored adapter `id` on served base model `base` (see [`ModelsCommand::ServeAdapter`]).
+    pub async fn serve_adapter(&self, id: &str, base: &str, scale: Option<f32>) -> Result<AdapterChange, RemoteError> {
+        let stored = self.store.adapters().into_iter().find(|a| a.id == id).ok_or_else(|| bad_request(format!("no stored adapter {id}")))?;
+        let path = stored.path.display().to_string();
+        if let Some(l) = self.supervisor.launches().iter().find(|l| l.adapters.iter().any(|x| x.path == path)) {
+            return Err(bad_request(format!("{id} is already served on {}", l.id)));
+        }
+        let mut adapter = LoraAdapter::new(id, path);
+        adapter.scale = scale;
+        self.supervisor.add_adapter_live(base, adapter).await
+    }
+
+    /// Stops serving adapter `id` and keeps its files. Returns the base it was on.
+    pub async fn unserve_adapter(&self, id: &str) -> Result<String, RemoteError> {
+        let base = self
+            .supervisor
+            .launches()
+            .into_iter()
+            .find(|l| l.adapters.iter().any(|a| a.id == id))
+            .map(|l| l.id)
+            .ok_or_else(|| bad_request(format!("no served adapter {id}")))?;
+        self.supervisor.remove_adapter_live(&base, id).await?;
+        Ok(base)
+    }
+
     async fn run(&self, command: ModelsCommand) -> Result<ModelsReply, RemoteError> {
         Ok(match command {
             ModelsCommand::Search { query, limit } => ModelsReply::Hits(self.search(&query, limit).await?),
@@ -506,6 +578,18 @@ impl ModelsService {
             ModelsCommand::Remove { id } => {
                 let freed = self.remove(&id).await?;
                 ModelsReply::Removed { id, freed }
+            }
+            ModelsCommand::ServeAdapter { id, base, scale } => {
+                let change = self.serve_adapter(&id, &base, scale).await?;
+                ModelsReply::AdapterServed { id, base, change }
+            }
+            ModelsCommand::UnserveAdapter { id } => {
+                let base = self.unserve_adapter(&id).await?;
+                ModelsReply::AdapterUnserved { id, base }
+            }
+            ModelsCommand::AdapterScale { id, scale } => {
+                self.supervisor.set_adapter_scale(&id, scale)?;
+                ModelsReply::AdapterScaled { id, scale }
             }
             ModelsCommand::Pull(_) => unreachable!("handled by serve"),
         })
@@ -669,6 +753,30 @@ impl ModelsClient {
         match self.call(node, ModelsCommand::List).await? {
             ModelsReply::List(l) => Ok(l),
             other => Err(Self::unexpected("a list", other)),
+        }
+    }
+
+    /// Serves stored adapter `id` on `base` on `node`; returns when it serves.
+    pub async fn serve_adapter(&self, node: &str, id: &str, base: &str, scale: Option<f32>) -> Result<AdapterChange, RemoteError> {
+        match self.call(node, ModelsCommand::ServeAdapter { id: id.into(), base: base.into(), scale }).await? {
+            ModelsReply::AdapterServed { change, .. } => Ok(change),
+            other => Err(Self::unexpected("adapter served", other)),
+        }
+    }
+
+    /// Stops serving adapter `id` on `node`, keeping its files; returns the base it was on.
+    pub async fn unserve_adapter(&self, node: &str, id: &str) -> Result<String, RemoteError> {
+        match self.call(node, ModelsCommand::UnserveAdapter { id: id.into() }).await? {
+            ModelsReply::AdapterUnserved { base, .. } => Ok(base),
+            other => Err(Self::unexpected("adapter unserved", other)),
+        }
+    }
+
+    /// Changes served adapter `id`'s scale on `node` (`None`: 1.0).
+    pub async fn set_adapter_scale(&self, node: &str, id: &str, scale: Option<f32>) -> Result<(), RemoteError> {
+        match self.call(node, ModelsCommand::AdapterScale { id: id.into(), scale }).await? {
+            ModelsReply::AdapterScaled { .. } => Ok(()),
+            other => Err(Self::unexpected("adapter scaled", other)),
         }
     }
 
@@ -867,6 +975,24 @@ mod tests {
             [("m-Q4_0", Some("m-Q4_0"), None), ("tune-LoRA-F16", Some("tune-LoRA-F16"), Some("m-Q4_0"))]
         );
         assert_eq!(list[1].size(), 600);
+
+        // Take it off and put it back with a scale, over models/1, keeping the files.
+        let svc = Arc::new(svc);
+        let owner = ModelsClient::new(dialer(svc.clone(), "owner"));
+        assert_eq!(owner.unserve_adapter("model-node", "tune-LoRA-F16").await.unwrap(), "m-Q4_0");
+        assert!(sup.state("tune-LoRA-F16").is_none());
+        assert!(matches!(owner.unserve_adapter("model-node", "tune-LoRA-F16").await, Err(RemoteError::BadRequest { .. })));
+        assert_eq!(svc.list()[1].served_as, None, "still on disk");
+        assert!(matches!(owner.serve_adapter("model-node", "nope", "m-Q4_0", None).await, Err(RemoteError::BadRequest { .. })));
+        assert_eq!(owner.serve_adapter("model-node", "tune-LoRA-F16", "m-Q4_0", Some(0.5)).await.unwrap(), AdapterChange::Live);
+        assert!(matches!(owner.serve_adapter("model-node", "tune-LoRA-F16", "m-Q4_0", None).await, Err(RemoteError::BadRequest { .. })), "served");
+        owner.set_adapter_scale("model-node", "tune-LoRA-F16", Some(0.25)).await.unwrap();
+        let scale = |sup: &Supervisor| sup.launches()[0].adapters[0].scale;
+        assert_eq!(scale(&sup), Some(0.25));
+        assert!(matches!(owner.set_adapter_scale("model-node", "m-Q4_0", Some(0.25)).await, Err(RemoteError::BadRequest { .. })));
+        assert!(owner.set_adapter_scale("model-node", "tune-LoRA-F16", Some(f32::INFINITY)).await.is_err());
+        assert_eq!(scale(&sup), Some(0.25));
+
         assert_eq!(svc.remove("tune-LoRA-F16").await.unwrap(), 600);
         assert!(sup.state("tune-LoRA-F16").is_none(), "no longer served");
         assert_eq!(svc.list().len(), 1);

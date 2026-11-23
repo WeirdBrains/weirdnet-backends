@@ -2,6 +2,17 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-23: live LoRA adapter changes and per-request scale (0.4.1)
+
+What changed (see [CHANGELOG.md](CHANGELOG.md)): `Supervisor::add_adapter_live`/`remove_adapter_live` (vLLM run-time `/v1/load_lora_adapter` and `/v1/unload_lora_adapter`; vLLM with LoRA on starts with `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`; `ModelLaunch::lora_slots` turns LoRA on with no adapters at start); `set_adapter_scale` (llama.cpp, live); `Request::adapter_scale` per request (weirdnet-agent 0.5.2) and `complete_scaled`; llama.cpp re-adding a file the engine has loaded is live; models/1 `ServeAdapter`, `UnserveAdapter`, `AdapterScale`. Additive, so a patch release.
+
+Checks run: fmt; clippy `-D warnings` default and `--all-features`; tests `--all-features` (32 unit, 10 adapter, 2 node); `cargo doc -D warnings`. The mock engine now serves vLLM's run-time LoRA endpoints and checks `--max-loras`.
+
+Not tested: real llama-server and vLLM. Checked against llama.cpp b12628 server source: llama-server cannot load a new adapter file at run time (`POST /lora-adapters` only rescales those from `--lora`), so a new file on llama.cpp still needs a base restart. vLLM's run-time endpoints follow its docs; not run on a GPU here.
+
+What's left and next: weirdnet-alerts to accept 0.4; Ymir to use the live calls.
+
+
 ## 2026-11-22: weirdnet-model 0.5.2 from crates.io
 
 What changed: `weirdnet-model = "0.5.2"` from crates.io; dropped the development `[patch.crates-io]` that pointed at weirdnet-model's lora-adapters branch. Ready to merge to main and release 0.4.0.

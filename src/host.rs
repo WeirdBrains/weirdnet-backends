@@ -179,7 +179,7 @@ impl InferBackend for EngineModel {
                 if let Some(p) = &request.assistant_prefix {
                     prompt.push_str(&p.text);
                 }
-                self.supervisor.complete(&self.id, &prompt, &request.sampling, request.seed).await?
+                self.supervisor.complete_scaled(&self.id, &prompt, &request.sampling, request.seed, request.adapter_scale).await?
             }
             _ => self.supervisor.chat(&self.id, request).await?,
         };

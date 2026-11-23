@@ -509,6 +509,9 @@ fn lora_adapters_on_a_base() {
 
         sup.remove_model("qwen").await.unwrap();
         assert!(sup.state("tune-a").is_none(), "removing a base removes its adapters");
+        // `big` started with an adapter, so LoRA is on and more go in at run time.
+        assert_eq!(sup.add_adapter_live("big", LoraAdapter::new("vlive", "owner/live")).await.unwrap(), AdapterChange::Live);
+        assert!(reply(&sup, "vlive").await.unwrap().starts_with("Hello from vlive!"));
         assert_eq!(sup.add_adapter("big", LoraAdapter::new("hub", "owner/lora")).unwrap(), AdapterChange::NextLoad);
         sup.unload("big").await.unwrap();
         assert_eq!(sup.add_adapter("big", LoraAdapter::new("hub2", "owner/lora2")).unwrap(), AdapterChange::Live, "the base isn't running");
@@ -516,9 +519,84 @@ fn lora_adapters_on_a_base() {
     });
 }
 
+/// Adding, removing and rescaling adapters while the base keeps running: llama.cpp per-request
+/// scales and re-adding a file it has loaded; vLLM run-time loading.
+fn live_adapter_changes() {
+    common::block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = |name: &str, b: Vec<u8>| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, b).unwrap();
+            p.display().to_string()
+        };
+        let lora = || gguf("qwen3", &[("general.type", "adapter"), ("adapter.type", "lora")], &[]);
+        let base = w("base.gguf", gguf("qwen3", &[], &[("qwen3.block_count", 1)]));
+        let (a, b) = (w("a.gguf", lora()), w("b.gguf", lora()));
+        let sup = supervisor(vec![]);
+        sup.add_model(ModelLaunch::new("qwen", EngineKind::Llamacpp, &base).with_adapters(vec![LoraAdapter::new("tune-a", &a)])).unwrap();
+        sup.load("qwen").await.unwrap();
+        let pid = sup.status()[0].pid;
+        let scaled = |s: Option<f32>| {
+            let mut r = Request::messages(vec![Message::user("hi")]);
+            if let Some(s) = s {
+                r = r.with_adapter_scale(s);
+            }
+            r
+        };
+        assert!(text(&collect(&sup, "tune-a", &scaled(None)).await).starts_with("Hello from qwen+ax1.0!"));
+        assert!(text(&collect(&sup, "tune-a", &scaled(Some(0.25))).await).starts_with("Hello from qwen+ax0.25!"), "per request");
+        assert!(matches!(sup.chat("qwen", &scaled(Some(0.5))).await.err(), Some(RemoteError::BadRequest { .. })), "not an adapter");
+        assert!(matches!(sup.chat("tune-a", &scaled(Some(f32::NAN))).await.err(), Some(RemoteError::BadRequest { .. })));
+        let mut s = sup.complete_scaled("tune-a", "Tell me", &Sampling::default(), None, Some(0.5)).await.unwrap();
+        while s.next().await.is_some() {}
+
+        sup.set_adapter_scale("tune-a", Some(0.75)).unwrap();
+        assert!(reply(&sup, "tune-a").await.unwrap().starts_with("Hello from qwen+ax0.75!"), "the new scale, same engine");
+        assert!(sup.set_adapter_scale("qwen", Some(1.0)).is_err());
+        assert!(sup.set_adapter_scale("tune-a", Some(100.0)).is_err());
+
+        // Removed then added back (under another id too): the engine still has the file.
+        sup.remove_adapter_live("qwen", "tune-a").await.unwrap();
+        assert!(reply(&sup, "tune-a").await.is_err());
+        assert_eq!(sup.add_adapter_live("qwen", LoraAdapter::new("tune-a2", &a).with_scale(0.5)).await.unwrap(), AdapterChange::Live);
+        assert_eq!(sup.state("tune-a2"), Some(ModelState::Ready));
+        assert!(reply(&sup, "tune-a2").await.unwrap().starts_with("Hello from qwen+ax0.5!"));
+        // A new file can't go into a running llama-server.
+        assert_eq!(sup.add_adapter_live("qwen", LoraAdapter::new("tune-b", &b)).await.unwrap(), AdapterChange::NextLoad);
+        assert_eq!(sup.status()[0].pid, pid, "the base never restarted");
+
+        // vLLM with run-time LoRA but no adapters at start.
+        sup.add_model(ModelLaunch::new("big", EngineKind::Vllm, "Qwen/Qwen3-8B").with_lora_slots(2)).unwrap();
+        sup.load("big").await.unwrap();
+        let pid = sup.status().iter().find(|r| r.id == "big").unwrap().pid;
+        assert_eq!(sup.add_adapter_live("big", LoraAdapter::new("v1", "owner/v1")).await.unwrap(), AdapterChange::Live);
+        assert_eq!(sup.state("v1"), Some(ModelState::Ready));
+        assert!(reply(&sup, "v1").await.unwrap().starts_with("Hello from v1!"));
+        assert!(matches!(sup.chat("v1", &scaled(Some(0.5))).await.err(), Some(RemoteError::BadRequest { .. })), "vLLM takes no scale");
+        assert!(sup.set_adapter_scale("v1", Some(0.5)).is_err());
+        assert!(sup.add_adapter_live("big", LoraAdapter::new("v2", "owner/broken")).await.is_err(), "the engine refused it");
+        assert!(sup.state("v2").is_none(), "and it was taken off again");
+        sup.remove_adapter_live("big", "v1").await.unwrap();
+        assert!(sup.state("v1").is_none());
+        assert_eq!(
+            sup.add_adapter_live("big", LoraAdapter::new("v1", "owner/v1")).await.unwrap(),
+            AdapterChange::Live,
+            "unloaded, so it loads again"
+        );
+        assert_eq!(sup.status().iter().find(|r| r.id == "big").unwrap().pid, pid, "the base never restarted");
+
+        // Without run-time LoRA a vLLM base must restart.
+        sup.add_model(ModelLaunch::new("plain", EngineKind::Vllm, "Qwen/Qwen3-4B")).unwrap();
+        sup.load("plain").await.unwrap();
+        assert_eq!(sup.add_adapter_live("plain", LoraAdapter::new("p1", "owner/p1")).await.unwrap(), AdapterChange::NextLoad);
+        sup.shutdown().await;
+    });
+}
+
 fn main() {
     common::main(&[
         ("lora_adapters_on_a_base", lora_adapters_on_a_base as fn()),
+        ("live_adapter_changes", live_adapter_changes),
         ("mlx_behind_its_proxy", mlx_behind_its_proxy as fn()),
         ("chat_reasoning_tools_prefix_completion_and_embeddings", chat_reasoning_tools_prefix_completion_and_embeddings as fn()),
         ("swap_groups_and_idle_unload", swap_groups_and_idle_unload as fn()),

@@ -4310,9 +4310,9 @@ dependencies = [
 
 [[package]]
 name = "weirdnet-agent"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95f0920cbb8119f1eba0aea20e23b278f5d97a3469c1d0fce21a095b556c13aa"
+checksum = "24bd8f1d320657607ec709c0467ff3d6444c7417e31f56ee9a8258b353975143"
 dependencies = [
  "async-trait",
  "cbor4ii",

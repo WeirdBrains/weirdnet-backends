@@ -13,7 +13,10 @@
 //!
 //! LoRA: llama.cpp `--lora PATH` (needs `--lora-init-without-apply`) and a request `"lora"`
 //! with a non-zero scale answer as "<alias>+<adapter file stem>"; vLLM `--lora-modules` JSON
-//! modules are served under their names.
+//! modules are served under their names; with `--enable-lora` and
+//! `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`, `/v1/load_lora_adapter` and
+//! `/v1/unload_lora_adapter` add and remove modules while it runs (a path containing
+//! "broken" is refused).
 //!
 //! Started with `--max-tokens` it acts like `mlx_lm.server`: no API key, the model is called
 //! `default_model`, `/health` is 200 at once while completions fail with 500 until loaded, and
@@ -39,8 +42,10 @@ struct Mock {
     mlx: bool,
     /// llama.cpp `--lora` paths, by index.
     loras: Vec<String>,
-    /// vLLM `--lora-modules` names.
-    modules: Vec<String>,
+    /// vLLM `--lora-modules` names, and those loaded at run time.
+    modules: std::sync::Mutex<Vec<String>>,
+    /// vLLM run-time LoRA updates allowed.
+    runtime_lora: bool,
 }
 
 /// Runs the mock engine (the test binary re-executes itself with engine flags).
@@ -74,8 +79,24 @@ async fn serve() {
             .collect(),
         None => Vec::new(),
     };
-    let st = Arc::new(Mock { projector, alias, key, ready_at: Instant::now() + Duration::from_millis(load_ms), mlx, loras, modules });
+    let enable_lora = args.iter().any(|a| a == "--enable-lora");
+    assert!(modules.is_empty() || enable_lora, "--lora-modules needs --enable-lora");
+    assert!(!enable_lora || flag("--max-loras").is_some_and(|n| n.parse::<u32>().unwrap() >= modules.len().max(1) as u32), "--max-loras");
+    let runtime_lora = enable_lora && std::env::var("VLLM_ALLOW_RUNTIME_LORA_UPDATING").as_deref() == Ok("True");
+    let st = Arc::new(Mock {
+        projector,
+        alias,
+        key,
+        ready_at: Instant::now() + Duration::from_millis(load_ms),
+        mlx,
+        loras,
+        modules: std::sync::Mutex::new(modules),
+        runtime_lora,
+    });
     let mut app = Router::new().route("/health", get(health)).route("/v1/chat/completions", post(chat)).route("/v1/completions", post(completions));
+    if runtime_lora {
+        app = app.route("/v1/load_lora_adapter", post(load_lora)).route("/v1/unload_lora_adapter", post(unload_lora));
+    }
     if !mlx {
         app = app.route("/v1/embeddings", post(embeddings));
     }
@@ -102,11 +123,42 @@ fn check(st: &Mock, headers: &HeaderMap, body: &Value) -> Option<Response> {
     if !authorized {
         return Some((StatusCode::UNAUTHORIZED, axum::Json(json!({"error": {"message": "Invalid API Key"}}))).into_response());
     }
-    if body["model"].as_str() != Some(st.alias.as_str()) && !st.modules.iter().any(|m| body["model"].as_str() == Some(m.as_str())) {
+    if body["model"].as_str() != Some(st.alias.as_str()) && !st.modules.lock().unwrap().iter().any(|m| body["model"].as_str() == Some(m.as_str())) {
         let msg = format!("unknown model {}", body["model"]);
         return Some((StatusCode::BAD_REQUEST, axum::Json(json!({"error": {"message": msg}}))).into_response());
     }
     None
+}
+
+fn authorized(st: &Mock, headers: &HeaderMap) -> bool {
+    st.key.as_ref().is_none_or(|k| headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(&format!("Bearer {k}")))
+}
+
+async fn load_lora(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>) -> Response {
+    assert!(st.runtime_lora);
+    if !authorized(&st, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let (name, path) = (body["lora_name"].as_str().unwrap_or(""), body["lora_path"].as_str().unwrap_or(""));
+    let mut modules = st.modules.lock().unwrap();
+    if name.is_empty() || path.contains("broken") || modules.iter().any(|m| m == name) {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": {"message": format!("can't load {name}")}}))).into_response();
+    }
+    modules.push(name.to_string());
+    format!("Success: LoRA adapter '{name}' added successfully.").into_response()
+}
+
+async fn unload_lora(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>) -> Response {
+    if !authorized(&st, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let name = body["lora_name"].as_str().unwrap_or("");
+    let mut modules = st.modules.lock().unwrap();
+    let Some(at) = modules.iter().position(|m| m == name) else {
+        return (StatusCode::NOT_FOUND, axum::Json(json!({"error": {"message": format!("no {name}")}}))).into_response();
+    };
+    modules.remove(at);
+    format!("Success: LoRA adapter '{name}' removed successfully.").into_response()
 }
 
 fn sse(events: Vec<Value>) -> Response {

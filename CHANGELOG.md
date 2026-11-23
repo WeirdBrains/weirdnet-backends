@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- Live adapter changes: `Supervisor::add_adapter_live` and `remove_adapter_live` load and unload an adapter in a running vLLM engine (`/v1/load_lora_adapter`, `/v1/unload_lora_adapter`) without restarting the base. vLLM with LoRA on now starts with `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`; `ModelLaunch::lora_slots` (`with_lora_slots`, `runtime_lora`) turns LoRA on without adapters at start.
+- `Supervisor::set_adapter_scale` changes a llama.cpp adapter's scale from the next request, with no restart. `Supervisor::chat` takes weirdnet-agent 0.5.2's `Request::adapter_scale` for one request, and `complete_scaled` does the same for completions; raw infer/2 passes it through. vLLM refuses both. `MAX_ADAPTER_SCALE`.
+- `models` (feature `node`): `ModelsCommand::ServeAdapter`, `UnserveAdapter` and `AdapterScale` with their replies, and `ModelsClient::serve_adapter`, `unserve_adapter` and `set_adapter_scale`. Pulling an adapter for a base and removing one now use the live calls. Nodes before 0.4.1 refuse the new commands.
+
+### Changed
+
+- llama.cpp: an adapter added to a running base whose engine already has its file (removed and added back, under any id) is `AdapterChange::Live`, not `NextLoad`. Requests find an adapter in the engine by file on llama.cpp.
+- Needs weirdnet-agent 0.5.2.
+
 ## [0.4.0] - 2026-11-22
 
 ### Added
