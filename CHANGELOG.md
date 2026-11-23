@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-22
+
 ### Added
 
 - LoRA adapters: `LoraAdapter` (`new`, `with_scale`), `ModelLaunch::adapters`, `ModelLaunch::with_adapters`, `served_ids` and `check_adapters`. llama.cpp loads GGUF LoRA files with `--lora` and `--lora-init-without-apply` and each request sets its adapter in `lora`; vLLM gets `--enable-lora`, one `--lora-modules` list and `--max-loras`.
