@@ -2,6 +2,10 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-23: released 0.4.1
+
+What changed: Released with `scripts/weirdnet_release.py` (approved by Michael, 2026-11-23). Release commit [`8681927`](https://github.com/WeirdBrains/weirdnet-backends/commit/8681927f0ef71feb5c953efa3a18a35c9aefedda), tag [`v0.4.1`](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.1), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.1) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.1). See the entry below and [CHANGELOG.md](CHANGELOG.md).
+
 ## 2026-11-23: live LoRA adapter changes and per-request scale (0.4.1)
 
 What changed (see [CHANGELOG.md](CHANGELOG.md)): `Supervisor::add_adapter_live`/`remove_adapter_live` (vLLM run-time `/v1/load_lora_adapter` and `/v1/unload_lora_adapter`; vLLM with LoRA on starts with `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`; `ModelLaunch::lora_slots` turns LoRA on with no adapters at start); `set_adapter_scale` (llama.cpp, live); `Request::adapter_scale` per request (weirdnet-agent 0.5.2) and `complete_scaled`; llama.cpp re-adding a file the engine has loaded is live; models/1 `ServeAdapter`, `UnserveAdapter`, `AdapterScale`. Additive, so a patch release.
