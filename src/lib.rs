@@ -49,4 +49,4 @@ pub use engine::{Capabilities, EngineConfig, EngineKind, LoraAdapter, ModelLaunc
 pub use host::{EngineModel, ModelHost, RAW_INFER_PROTOCOL, RawInferDialer, Speed};
 pub use openai::Target;
 pub use sse::{Chunk, ChunkDecoder, SseParser, ToolCalls};
-pub use supervisor::{AdapterChange, ChunkStream, ModelState, ModelStatus, Supervisor, SupervisorEvent, SupervisorOptions};
+pub use supervisor::{AdapterChange, ChunkStream, MAX_ADAPTER_SCALE, ModelState, ModelStatus, Supervisor, SupervisorEvent, SupervisorOptions};

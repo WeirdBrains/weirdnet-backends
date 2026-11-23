@@ -161,13 +161,20 @@ impl EngineConfig {
                 if let Some(slots) = model.slots {
                     cmd.args(["--max-num-seqs", &slots.to_string()]);
                 }
-                if !model.adapters.is_empty() {
-                    // One `--lora-modules` with every module: vLLM keeps only the last flag.
-                    cmd.args(["--enable-lora", "--lora-modules"]);
-                    for a in &model.adapters {
-                        cmd.arg(serde_json::json!({"name": a.id, "path": a.path, "base_model_name": model.id}).to_string());
+                if model.runtime_lora() {
+                    cmd.arg("--enable-lora");
+                    if !model.adapters.is_empty() {
+                        // One `--lora-modules` with every module: vLLM keeps only the last flag.
+                        cmd.arg("--lora-modules");
+                        for a in &model.adapters {
+                            cmd.arg(serde_json::json!({"name": a.id, "path": a.path, "base_model_name": model.id}).to_string());
+                        }
                     }
-                    cmd.args(["--max-loras", &model.adapters.len().to_string()]);
+                    let max = (model.adapters.len() as u32).max(model.lora_slots.unwrap_or(0)).max(1);
+                    cmd.args(["--max-loras", &max.to_string()]);
+                    // Lets the supervisor add and remove adapters on the running engine
+                    // (`/v1/load_lora_adapter`); the endpoints sit behind the API key on loopback.
+                    cmd.env("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "True");
                 }
                 cmd.env("VLLM_API_KEY", api_key);
             }
@@ -245,6 +252,12 @@ pub struct ModelLaunch {
     /// [`ModelLaunch::check_adapters`]). Each is its own pool id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub adapters: Vec<LoraAdapter>,
+    /// vLLM only: start the engine with LoRA on (`--enable-lora`, `--max-loras` at least this)
+    /// even without adapters, so adapters can be added and removed while it runs
+    /// ([`crate::Supervisor::add_adapter_live`]). A vLLM base started with adapters can take more
+    /// at run time without it. llama.cpp ignores it: llama-server loads adapter files only at start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora_slots: Option<u32>,
 }
 
 /// A stock OpenAI-compatible server the node forwards to but doesn't own.
@@ -311,7 +324,20 @@ impl ModelLaunch {
             idle_ttl: None,
             wrap: None,
             adapters: Vec::new(),
+            lora_slots: None,
         }
+    }
+
+    /// See [`ModelLaunch::lora_slots`].
+    pub fn with_lora_slots(mut self, slots: u32) -> Self {
+        self.lora_slots = Some(slots);
+        self
+    }
+
+    /// Whether the engine starts able to take adapters at run time: vLLM with adapters or
+    /// [`ModelLaunch::lora_slots`].
+    pub fn runtime_lora(&self) -> bool {
+        self.engine == EngineKind::Vllm && self.wrap.is_none() && (!self.adapters.is_empty() || self.lora_slots.is_some_and(|n| n > 0))
     }
 
     pub fn with_adapters(mut self, adapters: Vec<LoraAdapter>) -> Self {
@@ -570,6 +596,18 @@ pub(crate) mod tests {
         assert_eq!(mods[1]["name"], "hub");
         assert!(a.iter().any(|x| x == "--enable-lora"));
         assert!(a.windows(2).any(|w| w == ["--max-loras", "2"]));
+        let cmd = EngineConfig::vllm("vllm").command(&m, 9000, "k");
+        let env: Vec<_> = cmd.as_std().get_envs().map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect();
+        assert!(env.iter().any(|(k, v)| k == "VLLM_ALLOW_RUNTIME_LORA_UPDATING" && v.as_deref() == Some("True".as_ref())));
+        // LoRA on without adapters at start, for adapters added while it runs.
+        let empty = ModelLaunch::new("big", EngineKind::Vllm, "Qwen/Qwen3-8B").with_lora_slots(4);
+        assert!(empty.runtime_lora());
+        let a = args(&EngineConfig::vllm("vllm").command(&empty, 9000, "k"));
+        assert!(a.iter().any(|x| x == "--enable-lora") && !a.iter().any(|x| x == "--lora-modules"));
+        assert!(a.windows(2).any(|w| w == ["--max-loras", "4"]));
+        let plain = args(&EngineConfig::vllm("vllm").command(&ModelLaunch::new("big", EngineKind::Vllm, "Q/Q"), 9000, "k"));
+        assert!(!plain.iter().any(|x| x == "--enable-lora"));
+        assert!(!ModelLaunch::new("q", EngineKind::Llamacpp, "/q.gguf").with_lora_slots(2).runtime_lora(), "llama.cpp ignores it");
         let file = tmp.path().join("x.gguf");
         std::fs::write(&file, lora_gguf("qwen3")).unwrap();
         let bad = |path: String| {

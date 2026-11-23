@@ -145,15 +145,19 @@ pub struct ModelStatus {
     pub base: Option<String>,
 }
 
-/// When an adapter added with [`Supervisor::add_adapter`] can serve.
+/// When an adapter added with [`Supervisor::add_adapter`] or [`Supervisor::add_adapter_live`]
+/// can serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AdapterChange {
-    /// Now, or whenever the base is next ready: the base wasn't running.
+    /// Now, or whenever the base is next ready: the base wasn't running, or its engine has the
+    /// adapter loaded already (llama.cpp: the same file, loaded at start; vLLM: loaded at start
+    /// or at run time).
     Live,
-    /// After the base's next load: its engine is running without the adapter. Loading the
-    /// adapter ([`Supervisor::load`]) restarts the base.
+    /// After the base's next load: its engine is running without the adapter (llama-server
+    /// loads adapter files only at start). Loading the adapter ([`Supervisor::load`]) restarts
+    /// the base.
     NextLoad,
 }
 
@@ -165,8 +169,11 @@ struct Route {
 
 struct Running {
     base: String,
-    /// The adapter ids the engine was started with, in `--lora` order.
-    adapters: Vec<String>,
+    /// The adapters the engine has loaded: llama.cpp's in `--lora` order (they stay loaded for
+    /// the engine's life); vLLM's by name, including those loaded at run time.
+    adapters: Vec<LoraAdapter>,
+    /// vLLM started with LoRA on and run-time updates allowed ([`ModelLaunch::runtime_lora`]).
+    runtime_lora: bool,
     api_key: Option<String>,
     pid: Option<u32>,
     stop: Option<oneshot::Sender<()>>,
@@ -192,7 +199,23 @@ struct Slot {
     restart_at: Option<Instant>,
 }
 
+impl Running {
+    /// Where the engine has `a` loaded: llama.cpp's `--lora` index (any id with the same file);
+    /// vLLM's module with the same name and path.
+    fn index(&self, engine: EngineKind, a: &LoraAdapter) -> Option<usize> {
+        match engine {
+            EngineKind::Llamacpp => self.adapters.iter().position(|x| x.path == a.path),
+            _ => self.adapters.iter().position(|x| x.id == a.id && x.path == a.path),
+        }
+    }
+}
+
 impl Slot {
+    /// Whether adapter `a` can serve on the running engine (or the base isn't running).
+    fn serves(&self, a: &LoraAdapter) -> bool {
+        self.running.as_ref().is_none_or(|r| r.index(self.launch.engine, a).is_some())
+    }
+
     fn new(launch: ModelLaunch) -> Self {
         Self {
             launch,
@@ -271,9 +294,11 @@ impl Supervisor {
     }
 
     /// Adds LoRA adapter `adapter` to model `base`, after [`ModelLaunch::check_adapters`]. Its id
-    /// must be free on the node. Returns [`AdapterChange::NextLoad`] when the base's engine is
-    /// running (llama.cpp and vLLM take adapters at start here), else [`AdapterChange::Live`].
-    /// Emits [`SupervisorEvent::Added`] for the adapter.
+    /// must be free on the node. Returns [`AdapterChange::Live`] when the base isn't running or
+    /// its engine already has the adapter loaded (on llama.cpp: the same file, for example one
+    /// removed and added back), else [`AdapterChange::NextLoad`]. It never touches the engine:
+    /// [`Supervisor::add_adapter_live`] also loads it into a running vLLM engine. Emits
+    /// [`SupervisorEvent::Added`] for the adapter.
     pub fn add_adapter(&self, base: &str, adapter: LoraAdapter) -> Result<AdapterChange, RemoteError> {
         let mut launch = self.slots().get(base).map(|s| s.launch.clone()).ok_or_else(|| unknown_model(base))?;
         launch.adapters.push(adapter.clone());
@@ -285,14 +310,94 @@ impl Supervisor {
             }
             let slot = slots.get_mut(base).ok_or_else(|| unknown_model(base))?;
             slot.launch.adapters.push(adapter.clone());
-            slot.running.is_some()
+            !slot.serves(&adapter)
         };
         self.emit(SupervisorEvent::Added { model: adapter.id });
         Ok(if running { AdapterChange::NextLoad } else { AdapterChange::Live })
     }
 
+    /// [`Supervisor::add_adapter`], then, when the base runs on vLLM with LoRA on
+    /// ([`ModelLaunch::runtime_lora`]), loads the adapter into the running engine
+    /// (`/v1/load_lora_adapter`) so it serves at once, without restarting the base. If the engine
+    /// refuses it, the adapter is taken off the base again and the engine's error returned.
+    /// On llama.cpp an adapter file the engine didn't start with still waits for the next load
+    /// ([`AdapterChange::NextLoad`]).
+    pub async fn add_adapter_live(&self, base: &str, adapter: LoraAdapter) -> Result<AdapterChange, RemoteError> {
+        let _op = self.inner.ops.lock().await;
+        let change = self.add_adapter(base, adapter.clone())?;
+        if change == AdapterChange::Live {
+            return Ok(change);
+        }
+        let Some((url, key)) = self.runtime_engine(base) else { return Ok(change) };
+        let body = json!({"lora_name": adapter.id, "lora_path": adapter.path});
+        match self.post(format!("{url}/v1/load_lora_adapter"), key.as_deref(), &body).await {
+            Ok(_) => {
+                if let Some(r) = self.slots().get_mut(base).and_then(|s| s.running.as_mut()) {
+                    r.adapters.push(adapter);
+                }
+                Ok(AdapterChange::Live)
+            }
+            Err(e) => {
+                let _ = self.remove_adapter(base, &adapter.id);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Supervisor::remove_adapter`], then, on a running vLLM engine with run-time LoRA, unloads
+    /// it from the engine too (`/v1/unload_lora_adapter`), freeing its memory. llama-server keeps
+    /// the file loaded (unused) until the base's next load; adding it back is then live.
+    pub async fn remove_adapter_live(&self, base: &str, id: &str) -> Result<LoraAdapter, RemoteError> {
+        let _op = self.inner.ops.lock().await;
+        let removed = self.remove_adapter(base, id)?;
+        let Some((url, key)) = self.runtime_engine(base) else { return Ok(removed) };
+        let loaded = self.slots().get(base).and_then(|s| s.running.as_ref()).is_some_and(|r| r.adapters.iter().any(|x| x.id == id));
+        if loaded {
+            match self.post(format!("{url}/v1/unload_lora_adapter"), key.as_deref(), &json!({"lora_name": id})).await {
+                Ok(_) => {
+                    if let Some(r) = self.slots().get_mut(base).and_then(|s| s.running.as_mut()) {
+                        r.adapters.retain(|x| x.id != id);
+                    }
+                }
+                Err(e) => tracing::warn!(model = %base, adapter = %id, "engine kept the adapter loaded: {e}"),
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Changes how strongly adapter `id` applies, from the next request on (`None`: 1.0). Live:
+    /// llama.cpp takes the scale per request, so the base keeps running. Requests may still set
+    /// their own ([`Request::adapter_scale`]). vLLM applies adapters at full strength and refuses.
+    pub fn set_adapter_scale(&self, id: &str, scale: Option<f32>) -> Result<(), RemoteError> {
+        if let Some(s) = scale {
+            check_scale(s)?;
+        }
+        let route = self.route(id)?;
+        if route.adapter.is_none() {
+            return Err(bad_request(format!("{id} is not an adapter")));
+        }
+        let mut slots = self.slots();
+        let slot = slots.get_mut(&route.base).ok_or_else(|| unknown_model(id))?;
+        if slot.launch.engine != EngineKind::Llamacpp {
+            return Err(bad_request(format!("{id} runs on {}, which applies adapters at full strength", slot.launch.engine.name())));
+        }
+        if let Some(a) = slot.launch.adapters.iter_mut().find(|a| a.id == id) {
+            a.scale = scale;
+        }
+        Ok(())
+    }
+
+    /// The URL and key of `base`'s engine when it is ready and takes adapters at run time.
+    fn runtime_engine(&self, base: &str) -> Option<(String, Option<String>)> {
+        let slots = self.slots();
+        let s = slots.get(base)?;
+        let r = s.running.as_ref().filter(|r| r.runtime_lora && s.state == ModelState::Ready)?;
+        Some((r.base.clone(), r.api_key.clone()))
+    }
+
     /// Stops serving adapter `id` on `base` (requests for it fail from now on; the engine keeps
-    /// it loaded until the base's next load). Emits [`SupervisorEvent::Removed`].
+    /// it loaded until the base's next load, see [`Supervisor::remove_adapter_live`]). Emits
+    /// [`SupervisorEvent::Removed`].
     pub fn remove_adapter(&self, base: &str, id: &str) -> Result<LoraAdapter, RemoteError> {
         let removed = {
             let mut slots = self.slots();
@@ -376,8 +481,7 @@ impl Supervisor {
                     .iter()
                     .map(|a| {
                         let mut r = row.clone();
-                        let loaded = s.running.as_ref().is_none_or(|run| run.adapters.contains(&a.id));
-                        if !loaded {
+                        if !s.serves(a) {
                             r.state = ModelState::Unloaded;
                             r.pid = None;
                         }
@@ -424,8 +528,8 @@ impl Supervisor {
         let route = self.route(id).ok()?;
         let slots = self.slots();
         let s = slots.get(&route.base)?;
-        match (&route.adapter, &s.running) {
-            (Some(a), Some(r)) if !r.adapters.contains(&a.id) => Some(ModelState::Unloaded),
+        match &route.adapter {
+            Some(a) if !s.serves(a) => Some(ModelState::Unloaded),
             _ => Some(s.state.clone()),
         }
     }
@@ -450,7 +554,7 @@ impl Supervisor {
     /// started), the base is restarted.
     pub async fn load_with(&self, id: &str, force: bool) -> Result<(), RemoteError> {
         let route = self.route(id)?;
-        let wanted = route.adapter.map(|a| a.id);
+        let wanted = route.adapter;
         let id = route.base.as_str();
         // A request during a crash backoff waits it out (at most `backoff_max`) rather than
         // failing; the scheduled restart and this load serialize on `ops`.
@@ -468,7 +572,7 @@ impl Supervisor {
         let (launch, group_mates) = {
             let mut slots = self.slots();
             let slot = slots.get_mut(id).ok_or_else(|| unknown_model(id))?;
-            let has_wanted = wanted.as_ref().is_none_or(|w| slot.running.as_ref().is_some_and(|r| r.adapters.contains(w)));
+            let has_wanted = wanted.as_ref().is_none_or(|w| slot.running.is_some() && slot.serves(w));
             if slot.state == ModelState::Ready && has_wanted {
                 return Ok(());
             }
@@ -598,7 +702,17 @@ impl Supervisor {
             return Err(unavailable(format!("{}: wrapped server {base} is not answering /health", launch.id)));
         }
         slot.state = ModelState::Ready;
-        slot.running = Some(Running { base, adapters: Vec::new(), api_key, pid: None, stop: None, exited: rx, _exit_tx: Some(tx), _proxy: proxy });
+        slot.running = Some(Running {
+            base,
+            adapters: Vec::new(),
+            runtime_lora: false,
+            api_key,
+            pid: None,
+            stop: None,
+            exited: rx,
+            _exit_tx: Some(tx),
+            _proxy: proxy,
+        });
         Ok(())
     }
 
@@ -676,7 +790,8 @@ impl Supervisor {
             slot.state = ModelState::Loading;
             slot.running = Some(Running {
                 base: format!("http://127.0.0.1:{port}"),
-                adapters: launch.adapters.iter().map(|a| a.id.clone()).collect(),
+                adapters: launch.adapters.clone(),
+                runtime_lora: launch.runtime_lora(),
                 api_key: Some(api_key),
                 pid,
                 stop: Some(stop_tx),
@@ -841,9 +956,15 @@ impl Supervisor {
     }
 
     /// The engine, request target, URL, key and in-flight guard for pool id `id` (a model, or an
-    /// adapter on a ready base that was started with it).
-    fn routed(&self, id: &str) -> Result<(EngineKind, Target, String, Option<String>, InFlight), RemoteError> {
+    /// adapter its ready base's engine has loaded). `scale` overrides the adapter's own.
+    fn routed(&self, id: &str, scale: Option<f32>) -> Result<(EngineKind, Target, String, Option<String>, InFlight), RemoteError> {
         let route = self.route(id)?;
+        if let Some(s) = scale {
+            check_scale(s)?;
+            if route.adapter.is_none() {
+                return Err(bad_request(format!("{id} is not an adapter; an adapter scale doesn't apply")));
+            }
+        }
         let (engine, target) = {
             let slots = self.slots();
             let slot = slots.get(&route.base).ok_or_else(|| unknown_model(id))?;
@@ -851,12 +972,15 @@ impl Supervisor {
             let target = match &route.adapter {
                 None => Target::Base { alias: route.base.clone(), has_adapters: slot.running.as_ref().is_some_and(|r| !r.adapters.is_empty()) },
                 Some(a) => {
+                    if scale.is_some() && engine != EngineKind::Llamacpp {
+                        return Err(bad_request(format!("{id} runs on {}, which applies adapters at full strength", engine.name())));
+                    }
                     let index = slot
                         .running
                         .as_ref()
-                        .and_then(|r| r.adapters.iter().position(|x| *x == a.id))
+                        .and_then(|r| r.index(engine, a))
                         .ok_or_else(|| unavailable(format!("{id} is not loaded; load it (this restarts {})", route.base)))?;
-                    Target::Adapter { base: route.base.clone(), index, id: a.id.clone(), scale: a.effective_scale() }
+                    Target::Adapter { base: route.base.clone(), index, id: a.id.clone(), scale: scale.unwrap_or(a.effective_scale()) }
                 }
             };
             (engine, target)
@@ -898,9 +1022,9 @@ impl Supervisor {
     }
 
     /// Streams a chat answer from `id`, which must be ready. Dropping the stream aborts the engine
-    /// request.
+    /// request. For an adapter on llama.cpp, [`Request::adapter_scale`] overrides its scale.
     pub async fn chat(&self, id: &str, request: &Request) -> Result<ChunkStream, RemoteError> {
-        let (engine, target, base, key, guard) = self.routed(id)?;
+        let (engine, target, base, key, guard) = self.routed(id, request.adapter_scale)?;
         let body = openai::chat_body_for(request, &target, engine)?;
         let resp = self.post(format!("{base}/v1/chat/completions"), key.as_deref(), &body).await?;
         Ok(stream_chunks(resp, guard))
@@ -909,7 +1033,20 @@ impl Supervisor {
     /// Streams a raw text completion of `prompt` from `id`, which must be ready. Response
     /// formats and tools don't apply.
     pub async fn complete(&self, id: &str, prompt: &str, sampling: &Sampling, seed: Option<u64>) -> Result<ChunkStream, RemoteError> {
-        let (engine, target, base, key, guard) = self.routed(id)?;
+        self.complete_scaled(id, prompt, sampling, seed, None).await
+    }
+
+    /// [`Supervisor::complete`] with an adapter scale for this request (llama.cpp adapters only;
+    /// `None` uses the adapter's own).
+    pub async fn complete_scaled(
+        &self,
+        id: &str,
+        prompt: &str,
+        sampling: &Sampling,
+        seed: Option<u64>,
+        adapter_scale: Option<f32>,
+    ) -> Result<ChunkStream, RemoteError> {
+        let (engine, target, base, key, guard) = self.routed(id, adapter_scale)?;
         let body = openai::completion_body_for(prompt, sampling, seed, &target, engine);
         let resp = self.post(format!("{base}/v1/completions"), key.as_deref(), &body).await?;
         Ok(stream_chunks(resp, guard))
@@ -966,6 +1103,18 @@ impl Supervisor {
         format!("; log {}:\n{}", dir.join(format!("{id}.log")).display(), tail.join("\n"))
     }
 }
+
+/// Adapter scales must be finite and within ±[`MAX_ADAPTER_SCALE`].
+fn check_scale(s: f32) -> Result<(), RemoteError> {
+    if s.is_finite() && s.abs() <= MAX_ADAPTER_SCALE {
+        Ok(())
+    } else {
+        Err(bad_request(format!("adapter scale {s} must be within ±{MAX_ADAPTER_SCALE}")))
+    }
+}
+
+/// The largest adapter scale a request or [`Supervisor::set_adapter_scale`] may set.
+pub const MAX_ADAPTER_SCALE: f32 = 16.0;
 
 /// `base * 2^(n-1)`, at most `max`.
 fn backoff(base: Duration, max: Duration, n: usize) -> Duration {

@@ -77,6 +77,20 @@ it). `remove_adapter` takes one off; `remove_model` on a base removes its adapte
 `load(adapter)` loads its base and `unload(adapter)` is refused. `status()` has a row per adapter
 with `base` set.
 
+Changes while the base keeps running:
+
+- `add_adapter_live` and `remove_adapter_live` also load and unload the adapter in a running
+  vLLM engine (`/v1/load_lora_adapter`, `/v1/unload_lora_adapter`). The supervisor starts vLLM
+  with `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True` whenever LoRA is on: the base has adapters, or
+  `ModelLaunch::with_lora_slots(n)` turns it on with none (`--max-loras` is at least `n`).
+- llama-server loads adapter files only at start. An adapter whose file the running engine
+  already has (removed and added back, under any id) is live at once; a new file is
+  `AdapterChange::NextLoad`.
+- `set_adapter_scale(id, scale)` changes a llama.cpp adapter's scale from the next request, and
+  a request can set its own with infer/2 `Request::adapter_scale` (weirdnet-agent 0.5.2;
+  `complete_scaled` for raw completions). vLLM applies adapters at full strength and refuses
+  both. Scales must be finite and within ±`MAX_ADAPTER_SCALE`.
+
 ```rust
 use weirdnet_backends::{LoraAdapter, ModelLaunch};
 
@@ -89,6 +103,9 @@ With the `node` feature, models/1 pulls an adapter for a served base:
 [`weirdnet-model`](https://crates.io/crates/weirdnet-model) `download_adapter` and adds it.
 Adapters whose architecture or base model does not match the base are refused. `Files` lists a
 repo's adapters in `RepoFits::adapters`, and `List` and `Remove` cover adapters.
+`ServeAdapter`, `UnserveAdapter` and `AdapterScale` (`ModelsClient::serve_adapter`,
+`unserve_adapter`, `set_adapter_scale`) put a stored adapter on a base, take one off while
+keeping its files, and change its scale, live where the engine allows.
 
 ## MLX-LM (Apple silicon)
 
