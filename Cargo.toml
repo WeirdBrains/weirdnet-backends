@@ -34,7 +34,7 @@ weirdnet-agent = "0.5"
 
 serde_bytes = { version = "0.11", optional = true }
 # GGUF headers for adapter checks; Hub, fit and downloads (adapters too) for models/1.
-weirdnet-model = "0.5.1"
+weirdnet-model = "0.5.2"
 weirdnet-net = { version = "0.8.0", optional = true }
 weirdnet-sync = { version = ">=0.5, <0.8", optional = true }
 
@@ -59,9 +59,3 @@ required-features = ["node"]
 
 [package.metadata.docs.rs]
 all-features = true
-
-
-# Development only (branch lora-adapters): unreleased weirdnet-model adapter API. Removed, with
-# weirdnet-model = "0.5.2", once that release is on crates.io.
-[patch.crates-io]
-weirdnet-model = { git = "https://github.com/WeirdBrains/weirdnet-model", branch = "lora-adapters" }

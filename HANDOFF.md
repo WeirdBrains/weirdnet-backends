@@ -2,6 +2,17 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-22: weirdnet-model 0.5.2 from crates.io
+
+What changed: `weirdnet-model = "0.5.2"` from crates.io; dropped the development `[patch.crates-io]` that pointed at weirdnet-model's lora-adapters branch. Ready to merge to main and release 0.4.0.
+
+Checks run: after this change, on this checkout: fmt; clippy `-D warnings` with `--all-features` and `--no-default-features`; tests with `--all-features`, default and `--no-default-features`; `cargo doc -D warnings` with `--all-features`.
+
+Not tested: as in the entry below.
+
+What's left and next: merge to main and release 0.4.0 (approved).
+
+
 ## 2026-11-22: LoRA adapters (branch lora-adapters)
 
 What changed (the [lora-adapters](https://github.com/WeirdBrains/weirdnet-backends/tree/lora-adapters) branch, not on main; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`):
