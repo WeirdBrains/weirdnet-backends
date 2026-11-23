@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-23
+
 ### Added
 
 - Live adapter changes: `Supervisor::add_adapter_live` and `remove_adapter_live` load and unload an adapter in a running vLLM engine (`/v1/load_lora_adapter`, `/v1/unload_lora_adapter`) without restarting the base. vLLM with LoRA on now starts with `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`; `ModelLaunch::lora_slots` (`with_lora_slots`, `runtime_lora`) turns LoRA on without adapters at start.
