@@ -570,6 +570,11 @@ impl ModelsService {
         Ok(base)
     }
 
+    /// Changes served adapter `id`'s scale (see [`ModelsCommand::AdapterScale`]).
+    pub fn set_adapter_scale(&self, id: &str, scale: Option<f32>) -> Result<(), RemoteError> {
+        self.supervisor.set_adapter_scale(id, scale)
+    }
+
     async fn run(&self, command: ModelsCommand) -> Result<ModelsReply, RemoteError> {
         Ok(match command {
             ModelsCommand::Search { query, limit } => ModelsReply::Hits(self.search(&query, limit).await?),
@@ -588,7 +593,7 @@ impl ModelsService {
                 ModelsReply::AdapterUnserved { id, base }
             }
             ModelsCommand::AdapterScale { id, scale } => {
-                self.supervisor.set_adapter_scale(&id, scale)?;
+                self.set_adapter_scale(&id, scale)?;
                 ModelsReply::AdapterScaled { id, scale }
             }
             ModelsCommand::Pull(_) => unreachable!("handled by serve"),
