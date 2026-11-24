@@ -110,6 +110,26 @@ pub enum SupervisorEvent {
     },
 }
 
+/// A hold on the node's accelerators ([`Supervisor::reserve`]): while it lasts the supervisor
+/// starts no engine, so nothing is placed on the node. For a job that needs the GPU to itself,
+/// such as a training run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Reservation {
+    /// Who holds it: the application's name for the job (for example a run id). Releasing takes
+    /// the same name.
+    pub holder: String,
+    /// When it was taken, in Unix milliseconds.
+    pub since_ms: i64,
+}
+
+impl Reservation {
+    pub fn new(holder: impl Into<String>) -> Self {
+        let since_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+        Self { holder: holder.into(), since_ms }
+    }
+}
+
 /// One model's row in the node's capability record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -241,6 +261,8 @@ struct Inner {
     ops: tokio::sync::Mutex<()>,
     events: broadcast::Sender<SupervisorEvent>,
     epoch: Instant,
+    /// The node's reservation, if any.
+    reserved: watch::Sender<Option<Reservation>>,
 }
 
 /// The per-node supervisor. Cheap to clone.
@@ -264,6 +286,7 @@ impl Supervisor {
                 ops: tokio::sync::Mutex::new(()),
                 events,
                 epoch: Instant::now(),
+                reserved: watch::Sender::new(None),
             }),
         }
     }
@@ -552,8 +575,11 @@ impl Supervisor {
     ///
     /// An adapter loads its base. When the base is ready without it (added after the base
     /// started), the base is restarted.
+    ///
+    /// While the node is reserved ([`Supervisor::reserve`]) every load is refused, `force` too.
     pub async fn load_with(&self, id: &str, force: bool) -> Result<(), RemoteError> {
         let route = self.route(id)?;
+        self.check_unreserved()?;
         let wanted = route.adapter;
         let id = route.base.as_str();
         // A request during a crash backoff waits it out (at most `backoff_max`) rather than
@@ -569,6 +595,8 @@ impl Supervisor {
             }
         }
         let _op = self.inner.ops.lock().await;
+        // Checked again under `ops`: a reservation taken while this load waited wins.
+        self.check_unreserved()?;
         let (launch, group_mates) = {
             let mut slots = self.slots();
             let slot = slots.get_mut(id).ok_or_else(|| unknown_model(id))?;
@@ -630,6 +658,86 @@ impl Supervisor {
         }
         self.stop(id, false).await;
         Ok(())
+    }
+
+    /// Reserves the node for `holder`: from now on no engine starts (loads, loads on demand,
+    /// crash restarts and swaps are refused as unavailable), and every running engine is drained
+    /// (waiting up to `drain_timeout` for requests under way) and stopped. Returns once they are
+    /// stopped. Taking it again under the same holder is a no-op; another holder's reservation is
+    /// refused as unavailable. Held in memory until [`Supervisor::release`]: an application that
+    /// must keep it across a restart records it and reserves again at start.
+    pub async fn reserve(&self, holder: &str) -> Result<Reservation, RemoteError> {
+        let holder = holder.trim();
+        if holder.is_empty() {
+            return Err(bad_request("a reservation needs a holder"));
+        }
+        let mut taken = None;
+        let mut busy = None;
+        self.inner.reserved.send_if_modified(|r| match r {
+            Some(cur) if cur.holder == holder => {
+                taken = Some(cur.clone());
+                false
+            }
+            Some(cur) => {
+                busy = Some(cur.holder.clone());
+                false
+            }
+            None => {
+                let new = Reservation::new(holder);
+                taken = Some(new.clone());
+                *r = Some(new);
+                true
+            }
+        });
+        if let Some(other) = busy {
+            return Err(unavailable(format!("this node is reserved by {other}")));
+        }
+        let _op = self.inner.ops.lock().await;
+        let ids: Vec<String> = self.slots().values().filter(|s| s.running.is_some()).map(|s| s.launch.id.clone()).collect();
+        for id in ids {
+            tracing::info!(model = %id, holder, "reserved: unloading");
+            self.stop(&id, false).await;
+        }
+        Ok(taken.expect("set above"))
+    }
+
+    /// Ends `holder`'s reservation; models load again on the next request or load. `false` when
+    /// the node was not reserved; another holder's reservation is refused as a bad request.
+    pub fn release(&self, holder: &str) -> Result<bool, RemoteError> {
+        let holder = holder.trim();
+        let mut other = None;
+        let released = self.inner.reserved.send_if_modified(|r| match r {
+            Some(cur) if cur.holder == holder => {
+                *r = None;
+                true
+            }
+            Some(cur) => {
+                other = Some(cur.holder.clone());
+                false
+            }
+            None => false,
+        });
+        match other {
+            Some(o) => Err(bad_request(format!("this node is reserved by {o}, not {holder}"))),
+            None => Ok(released),
+        }
+    }
+
+    /// The node's reservation, if any.
+    pub fn reservation(&self) -> Option<Reservation> {
+        self.inner.reserved.borrow().clone()
+    }
+
+    /// Changes to the reservation, from now on.
+    pub fn reservation_changes(&self) -> watch::Receiver<Option<Reservation>> {
+        self.inner.reserved.subscribe()
+    }
+
+    fn check_unreserved(&self) -> Result<(), RemoteError> {
+        match &*self.inner.reserved.borrow() {
+            Some(r) => Err(unavailable(format!("this node is reserved by {}: it starts no model until released", r.holder))),
+            None => Ok(()),
+        }
     }
 
     /// Stops every engine (daemon shutdown).

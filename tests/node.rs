@@ -81,6 +81,10 @@ async fn until(sub: &mut Subscription, want: impl Fn(&Capability) -> bool) -> Ca
     tokio::time::timeout(Duration::from_secs(10), wait).await.expect("no matching record")
 }
 
+fn cap_reserved(cap: &Capability) -> Option<String> {
+    cap.reserved.as_ref().map(|r| r.holder.clone())
+}
+
 fn state(cap: &Capability, id: &str) -> ModelState {
     cap.models.iter().find(|m| m.status.id == id).unwrap().status.state.clone()
 }
@@ -155,6 +159,24 @@ fn node1_round_trip() {
         assert!(matches!(client.load(&peer, "chat", false).await, Err(RemoteError::Unavailable { .. })));
         client.drain(&peer, false).await.unwrap();
         until(&mut sub, |c| !c.draining).await;
+
+        // Reserve: engines stop, nothing loads or runs, the record says who holds it; then back.
+        client.load(&peer, "chat", false).await.unwrap();
+        assert!(cap_reserved(&client.record(&peer).await.unwrap()).is_none());
+        client.reserve(&peer, "train-1").await.unwrap();
+        let cap = until(&mut sub, |c| c.reserved.is_some()).await;
+        assert_eq!((cap_reserved(&cap), state(&cap, "chat")), (Some("train-1".to_string()), ModelState::Unloaded));
+        assert!(matches!(client.load(&peer, "chat", true).await, Err(RemoteError::Unavailable { .. })));
+        let err = pool.infer(Request::messages(vec![Message::user("hi")]).with_model("chat").raw(), &NoEvents, &cancel).await.unwrap_err();
+        assert!(matches!(err.error, RemoteError::Unavailable { .. }), "{:?}", err.error);
+        let plan = GroupPlan::new("big", peer.clone()).with_worker("rpc-server").with_link("10.0.0.2:50052");
+        assert!(matches!(client.group_up(&peer, plan).await, Err(RemoteError::Unavailable { .. })));
+        assert!(matches!(client.reserve(&peer, "train-2").await, Err(RemoteError::Unavailable { .. })));
+        assert!(client.health(&peer).await.unwrap().reserved.is_some());
+        assert!(client.release(&peer, "train-2").await.is_err(), "only the holder releases");
+        client.release(&peer, "train-1").await.unwrap();
+        until(&mut sub, |c| c.reserved.is_none()).await;
+        client.load(&peer, "chat", false).await.unwrap();
 
         // A stranger with another user's certificate is refused.
         let foreign = Keypair::generate_ed25519();

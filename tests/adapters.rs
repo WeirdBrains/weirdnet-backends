@@ -625,6 +625,40 @@ fn live_adapter_changes() {
     });
 }
 
+fn a_reservation_stops_every_engine_and_starts_none() {
+    common::block_on(async {
+        let sup = supervisor(vec![launch("a", EngineKind::Llamacpp), launch("b", EngineKind::Llamacpp)]);
+        let changes = sup.reservation_changes();
+        sup.load("a").await.unwrap();
+        sup.load("b").await.unwrap();
+        assert!(sup.reserve(" ").await.is_err(), "a holder is required");
+
+        let r = sup.reserve("train-1").await.unwrap();
+        assert_eq!(r.holder, "train-1");
+        assert!(changes.has_changed().unwrap());
+        assert_eq!((sup.state("a"), sup.state("b")), (Some(ModelState::Unloaded), Some(ModelState::Unloaded)), "engines stopped");
+        assert_eq!(sup.reservation(), Some(r.clone()));
+        let err = sup.load_with("a", true).await.unwrap_err();
+        assert!(matches!(&err, RemoteError::Unavailable { message } if message.contains("reserved by train-1")), "{err:?}");
+        assert_eq!(sup.reserve("train-1").await.unwrap(), r, "the same holder again is a no-op");
+        assert!(matches!(sup.reserve("other").await, Err(RemoteError::Unavailable { .. })), "another holder waits");
+        assert!(matches!(sup.release("other"), Err(RemoteError::BadRequest { .. })), "only its holder releases it");
+
+        // The host refuses requests, wait_for_model too.
+        let host = weirdnet_backends::ModelHost::new(sup.clone(), Arc::new(|_: &Caller| Ok(())));
+        let req = Request::messages(vec![Message::user("hi")]).with_model("a").raw().with_wait_for_model(true);
+        let refused = weirdnet_agent::remote::infer::InferHost::open_request(&host, &Caller::new("x"), &req);
+        assert!(matches!(refused, Err(RemoteError::Unavailable { .. })));
+
+        assert!(sup.release("train-1").unwrap());
+        assert!(!sup.release("train-1").unwrap(), "already released");
+        assert_eq!(sup.reservation(), None);
+        sup.load("a").await.unwrap();
+        assert_eq!(sup.state("a"), Some(ModelState::Ready));
+        sup.shutdown().await;
+    })
+}
+
 fn main() {
     common::main(&[
         ("lora_adapters_on_a_base", lora_adapters_on_a_base as fn()),
@@ -632,6 +666,7 @@ fn main() {
         ("mlx_behind_its_proxy", mlx_behind_its_proxy as fn()),
         ("chat_reasoning_tools_prefix_completion_and_embeddings", chat_reasoning_tools_prefix_completion_and_embeddings as fn()),
         ("swap_groups_and_idle_unload", swap_groups_and_idle_unload as fn()),
+        ("a_reservation_stops_every_engine_and_starts_none", a_reservation_stops_every_engine_and_starts_none as fn()),
         ("models_added_and_removed_at_run_time", models_added_and_removed_at_run_time as fn()),
         ("wraps_a_loopback_server_and_refuses_others", wraps_a_loopback_server_and_refuses_others as fn()),
         #[cfg(unix)]
