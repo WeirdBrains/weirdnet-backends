@@ -6,7 +6,9 @@ the engines and serves them to inference nodes; what to load is always the calle
 
 - `EngineConfig` / `ModelLaunch`: how `llama-server`, `vllm serve` and MLX-LM's
   `mlx_lm.server` are launched (loopback only, random port, per-process API key in the
-  environment, or checked by a proxy for MLX-LM) and probed. `Wrap` attaches to a stock
+  environment, or checked by a proxy for MLX-LM) and probed. Ready means the server on the
+  port takes the launch's key and lists its model; a port taken by another process before the
+  engine binds it is retried on a new one. `Wrap` attaches to a stock
   OpenAI-compatible server on loopback without owning it.
 - `Capabilities`: what each model takes (chat, embeddings, images, audio), in `ModelStatus`
   and so in capability records, so routing keeps image, audio and embedding requests off

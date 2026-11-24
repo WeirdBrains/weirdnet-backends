@@ -21,6 +21,13 @@
 //! Started with `--max-tokens` it acts like `mlx_lm.server`: no API key, the model is called
 //! `default_model`, `/health` is 200 at once while completions fail with 500 until loaded, and
 //! there is no `/v1/embeddings`.
+//!
+//! `/v1/models` lists the alias and modules, behind the key, like llama-server (b12628) and vLLM.
+//!
+//! Port races: with `--mock-port-race MODE FILE`, the first launch (while FILE doesn't exist)
+//! creates FILE and misbehaves: `impostor` serves as a stranger would (another key, healthy at
+//! once), `in-use` logs llama-server's "couldn't bind" line and exits, `held` has another process
+//! take the port and exits. Later launches behave.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +65,37 @@ async fn serve() {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let host = flag("--host").unwrap_or_else(|| "127.0.0.1".into());
     let port: u16 = flag("--port").and_then(|p| p.parse().ok()).unwrap_or(8080);
+    if args.iter().any(|a| a == "--mock-hold") {
+        // Another process holding the port for a while.
+        let _l = std::net::TcpListener::bind((host.as_str(), port)).expect("hold");
+        std::thread::sleep(Duration::from_secs(5));
+        return;
+    }
+    let mut impostor = false;
+    if let Some(i) = args.iter().position(|a| a == "--mock-port-race") {
+        let (mode, file) = (args[i + 1].as_str(), std::path::Path::new(&args[i + 2]));
+        if !file.exists() {
+            std::fs::write(file, mode).unwrap();
+            match mode {
+                "impostor" => impostor = true,
+                "in-use" => {
+                    eprintln!("srv  start: couldn't bind HTTP server socket, hostname: {host}, port: {port}");
+                    std::process::exit(1);
+                }
+                "held" => {
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--host", &host, "--port", &port.to_string(), "--mock-hold"])
+                        .spawn()
+                        .unwrap();
+                    while std::net::TcpStream::connect((host.as_str(), port)).is_err() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    std::process::exit(1);
+                }
+                other => panic!("--mock-port-race {other}"),
+            }
+        }
+    }
     let alias = flag("--alias").or_else(|| flag("--served-model-name")).or_else(|| flag("--model")).unwrap_or_else(|| "mock".into());
     let load_ms = std::env::var("WEIRDNET_MOCK_LOAD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
     assert_eq!(host, "127.0.0.1", "engines must bind loopback only");
@@ -68,6 +106,7 @@ async fn serve() {
     } else {
         (alias, std::env::var("LLAMA_API_KEY").or_else(|_| std::env::var("VLLM_API_KEY")).ok())
     };
+    let key = if impostor { Some("someone-else".to_string()) } else { key };
     let projector = flag("--mmproj").is_some();
     let loras: Vec<String> = args.windows(2).filter(|w| w[0] == "--lora").map(|w| w[1].clone()).collect();
     assert!(loras.is_empty() || args.iter().any(|a| a == "--lora-init-without-apply"), "adapters must load unapplied");
@@ -87,13 +126,17 @@ async fn serve() {
         projector,
         alias,
         key,
-        ready_at: Instant::now() + Duration::from_millis(load_ms),
+        ready_at: Instant::now() + Duration::from_millis(if impostor { 0 } else { load_ms }),
         mlx,
         loras,
         modules: std::sync::Mutex::new(modules),
         runtime_lora,
     });
-    let mut app = Router::new().route("/health", get(health)).route("/v1/chat/completions", post(chat)).route("/v1/completions", post(completions));
+    let mut app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/completions", post(completions));
     if runtime_lora {
         app = app.route("/v1/load_lora_adapter", post(load_lora)).route("/v1/unload_lora_adapter", post(unload_lora));
     }
@@ -110,6 +153,15 @@ async fn health(State(st): State<Arc<Mock>>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error": {"message": "Loading model", "code": 503}}))).into_response();
     }
     axum::Json(json!({"status": "ok"})).into_response()
+}
+
+async fn models(State(st): State<Arc<Mock>>, headers: HeaderMap) -> Response {
+    if st.key.as_ref().is_some_and(|k| headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {k}"))) {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({"error": {"message": "Invalid API Key"}}))).into_response();
+    }
+    let mut data = vec![json!({"id": st.alias, "object": "model"})];
+    data.extend(st.modules.lock().unwrap().iter().map(|m| json!({"id": m, "object": "model"})));
+    axum::Json(json!({"object": "list", "data": data})).into_response()
 }
 
 fn check(st: &Mock, headers: &HeaderMap, body: &Value) -> Option<Response> {

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -729,15 +729,34 @@ impl Supervisor {
             }
             return Err(bad_request(why));
         }
-        let mlx = launch.engine == EngineKind::Mlx;
-        if mlx && launch.embedding {
+        if launch.engine == EngineKind::Mlx && launch.embedding {
             let why = "MLX-LM serves no embeddings; run embedding models on llama.cpp or vLLM".to_string();
             if let Some(s) = self.slots().get_mut(&launch.id) {
                 s.state = ModelState::Failed(why.clone());
             }
             return Err(bad_request(format!("{}: {why}", launch.id)));
         }
-        let no_port = |e: std::io::Error| unavailable(format!("no free loopback port: {e}"));
+        // The engine is told a free port, which is free when picked but not held (it can't be
+        // handed over): another process can bind it before the engine does. Then the engine fails
+        // to bind and exits, or another server answers on the port, and either is caught below and
+        // the launch is tried again on a new port.
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            match self.start_once(launch, &engine).await {
+                Ok(()) => return Ok(()),
+                Err(Start::PortTaken(e)) if tries < PORT_TRIES => {
+                    tracing::warn!(model = %launch.id, "{e}; trying another port");
+                }
+                Err(Start::PortTaken(e) | Start::Failed(e)) => return Err(e),
+            }
+        }
+    }
+
+    /// One launch of `launch` on a newly picked port, up to ready.
+    async fn start_once(&self, launch: &ModelLaunch, engine: &EngineConfig) -> Result<(), Start> {
+        let mlx = launch.engine == EngineKind::Mlx;
+        let no_port = |e: std::io::Error| Start::Failed(unavailable(format!("no free loopback port: {e}")));
         // MLX-LM has no API key: it gets a private port, and the advertised one is the proxy's,
         // bound now so nothing else can take it.
         let (port, proxy_listener) = if mlx {
@@ -749,6 +768,7 @@ impl Supervisor {
         };
         let engine_port = if mlx { free_port().map_err(no_port)? } else { port };
         let api_key = random_hex(24);
+        let log_from = self.log_len(&launch.id);
         let mut cmd = engine.command(launch, engine_port, &api_key);
         cmd.stdin(Stdio::null());
         match self.log_file(&launch.id) {
@@ -771,13 +791,13 @@ impl Supervisor {
                 });
             }
         }
-        let mut child = cmd.spawn().map_err(|e| unavailable(format!("could not start {}: {e}", engine.program.display())))?;
+        let mut child = cmd.spawn().map_err(|e| Start::Failed(unavailable(format!("could not start {}: {e}", engine.program.display()))))?;
         let pid = child.id();
         let proxy = match proxy_listener.map(tokio::net::TcpListener::from_std) {
             Some(Ok(l)) => Some(crate::mlx::spawn_proxy(l, format!("http://127.0.0.1:{engine_port}"), launch.id.clone(), api_key.clone())),
             Some(Err(e)) => {
                 let _ = terminate(&mut child, pid, self.inner.opts.stop_grace).await;
-                return Err(unavailable(format!("mlx proxy: {e}")));
+                return Err(Start::Failed(unavailable(format!("mlx proxy: {e}"))));
             }
             None => None,
         };
@@ -792,7 +812,7 @@ impl Supervisor {
                 base: format!("http://127.0.0.1:{port}"),
                 adapters: launch.adapters.clone(),
                 runtime_lora: launch.runtime_lora(),
-                api_key: Some(api_key),
+                api_key: Some(api_key.clone()),
                 pid,
                 stop: Some(stop_tx),
                 exited: exit_rx.clone(),
@@ -807,6 +827,8 @@ impl Supervisor {
         let grace = self.inner.opts.stop_grace;
         let me = self.clone();
         let id = launch.id.clone();
+        let port_taken = Arc::new(AtomicBool::new(false));
+        let taken = port_taken.clone();
         tokio::spawn(async move {
             let status = tokio::select! {
                 s = child.wait() => s,
@@ -816,8 +838,12 @@ impl Supervisor {
                 Ok(s) => format!("engine exited ({s})"),
                 Err(e) => format!("engine wait failed: {e}"),
             };
+            // An engine that dies while loading because its port was taken is not a crash: the
+            // launch is tried again on another port.
+            let lost_port = me.is_loading(&id, generation) && me.lost_port(&id, engine_port, log_from);
+            taken.store(lost_port, Ordering::SeqCst);
             // Record the exit (and count a crash) before anyone waiting on it wakes up.
-            me.exited(&id, generation, desc.clone());
+            me.exited(&id, generation, desc.clone(), lost_port);
             let _ = exit_tx.send(Some(desc));
         });
 
@@ -827,16 +853,39 @@ impl Supervisor {
         loop {
             let gone = exited.borrow().clone();
             if let Some(desc) = gone {
-                return Err(self.failed(&launch.id, generation, format!("{desc} while loading{}", self.log_tail(&launch.id))));
+                if port_taken.load(Ordering::SeqCst) {
+                    return Err(Start::PortTaken(self.failed(
+                        &launch.id,
+                        generation,
+                        format!("{desc} while loading: port {engine_port} was taken by another process"),
+                    )));
+                }
+                return Err(Start::Failed(self.failed(&launch.id, generation, format!("{desc} while loading{}", self.log_tail(&launch.id)))));
             }
             if let Ok(resp) = self.inner.http.get(&health).timeout(Duration::from_secs(2)).send().await
                 && resp.status().is_success()
             {
-                break;
+                match self.identify(launch, port, &api_key).await {
+                    Some(true) => break,
+                    // Healthy, but not ours: another server holds the port and ours can't bind it.
+                    Some(false) => {
+                        self.stop(&launch.id, false).await;
+                        return Err(Start::PortTaken(self.failed(
+                            &launch.id,
+                            generation,
+                            format!("another server answers on port {port} (not this launch's key or model)"),
+                        )));
+                    }
+                    None => {}
+                }
             }
             if started.elapsed() > engine.ready_timeout {
                 self.stop(&launch.id, false).await;
-                return Err(self.failed(&launch.id, generation, format!("not ready after {:?}{}", engine.ready_timeout, self.log_tail(&launch.id))));
+                return Err(Start::Failed(self.failed(
+                    &launch.id,
+                    generation,
+                    format!("not ready after {:?}{}", engine.ready_timeout, self.log_tail(&launch.id)),
+                )));
             }
             let _ = tokio::time::timeout(Duration::from_millis(200), exited.changed()).await;
         }
@@ -847,19 +896,67 @@ impl Supervisor {
             tracing::info!(model = %launch.id, secs = started.elapsed().as_secs_f32(), "engine ready");
             Ok(())
         } else {
-            Err(unavailable(format!("{} stopped while loading", launch.id)))
+            Err(Start::Failed(unavailable(format!("{} stopped while loading", launch.id))))
         }
+    }
+
+    /// Whether the server answering on `port` is this launch's engine: it takes the launch's key
+    /// on `/v1/models` (llama-server and vLLM check it there) and lists the launch's id. `None`
+    /// while that can't be told yet (no answer, or a server error). MLX-LM has no key and its port
+    /// is the proxy's, bound before the engine starts, so it is always ours.
+    async fn identify(&self, launch: &ModelLaunch, port: u16, key: &str) -> Option<bool> {
+        if launch.engine == EngineKind::Mlx {
+            return Some(true);
+        }
+        let resp =
+            self.inner.http.get(format!("http://127.0.0.1:{port}/v1/models")).bearer_auth(key).timeout(Duration::from_secs(5)).send().await.ok()?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Some(false);
+        }
+        if !status.is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        Some(lists_model(&v, &launch.id))
+    }
+
+    fn is_loading(&self, id: &str, generation: u64) -> bool {
+        self.slots().get(id).is_some_and(|s| s.generation == generation && s.state == ModelState::Loading)
+    }
+
+    /// Whether an engine that just exited lost its port to another process: something else holds
+    /// `port` now, or its log since the launch (from byte `log_from`) says the address was in use.
+    fn lost_port(&self, id: &str, port: u16, log_from: u64) -> bool {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            return true;
+        }
+        let Some(dir) = &self.inner.opts.log_dir else { return false };
+        let Ok(bytes) = std::fs::read(dir.join(format!("{id}.log"))) else { return false };
+        let new = bytes.get(log_from as usize..).unwrap_or_default();
+        says_address_in_use(&String::from_utf8_lossy(new))
+    }
+
+    fn log_len(&self, id: &str) -> u64 {
+        let Some(dir) = &self.inner.opts.log_dir else { return 0 };
+        std::fs::metadata(dir.join(format!("{id}.log"))).map(|m| m.len()).unwrap_or(0)
     }
 
     /// The monitor saw the engine exit. A stop sets `Unloaded` before signalling, so anything else
     /// is a crash: count it, and schedule a restart with backoff unless it is a crash loop.
-    fn exited(&self, id: &str, generation: u64, desc: String) {
+    /// `lost_port`: it died while loading because its port was taken; the launch is retried, so
+    /// it is not counted as a crash.
+    fn exited(&self, id: &str, generation: u64, desc: String, lost_port: bool) {
         let opts = &self.inner.opts;
         let (event, restart_in) = {
             let mut slots = self.slots();
             let Some(slot) = slots.get_mut(id).filter(|s| s.generation == generation) else { return };
             slot.running = None;
             if slot.state == ModelState::Unloaded {
+                return;
+            }
+            if lost_port {
+                slot.state = ModelState::Failed(format!("{desc}: its port was taken"));
                 return;
             }
             let was_serving = slot.state == ModelState::Ready;
@@ -1221,6 +1318,31 @@ async fn terminate(child: &mut tokio::process::Child, pid: Option<u32>, grace: D
     child.wait().await
 }
 
+/// How many ports a launch tries when the one it was given turns out to be taken.
+const PORT_TRIES: usize = 3;
+
+/// How one launch attempt failed.
+enum Start {
+    /// Another process took the port it was given; worth another try on a new port.
+    PortTaken(RemoteError),
+    Failed(RemoteError),
+}
+
+/// `/v1/models` lists `id` (as a model id, or a llama-server alias).
+fn lists_model(v: &Value, id: &str) -> bool {
+    v["data"].as_array().is_some_and(|d| {
+        d.iter().any(|m| m["id"].as_str() == Some(id) || m["aliases"].as_array().is_some_and(|a| a.iter().any(|x| x.as_str() == Some(id))))
+    })
+}
+
+/// An engine's log says it could not bind its address (llama-server, uvicorn/vLLM, MLX-LM).
+fn says_address_in_use(log: &str) -> bool {
+    let l = log.to_ascii_lowercase();
+    ["address already in use", "couldn't bind", "could not bind", "errno 98", "errno 48", "eaddrinuse", "os error 98", "os error 48", "error 10048"]
+        .iter()
+        .any(|p| l.contains(p))
+}
+
 fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
 }
@@ -1240,6 +1362,17 @@ fn trim(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_engine_is_recognised_by_its_model_list() {
+        assert!(lists_model(&json!({"data": [{"id": "qwen"}]}), "qwen"));
+        assert!(lists_model(&json!({"data": [{"id": "x.gguf", "aliases": ["qwen"]}]}), "qwen"));
+        assert!(!lists_model(&json!({"data": [{"id": "other"}]}), "qwen"));
+        assert!(!lists_model(&json!({"status": "ok"}), "qwen"));
+        assert!(says_address_in_use("srv  start: couldn't bind HTTP server socket, hostname: 127.0.0.1, port: 4100"));
+        assert!(says_address_in_use("ERROR:    [Errno 98] error while attempting to bind on address ('127.0.0.1', 8000): address already in use"));
+        assert!(!says_address_in_use("loading model\nCUDA error: out of memory"));
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {
