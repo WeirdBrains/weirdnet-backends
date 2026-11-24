@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-24
+
 ### Added
 
 - Node reservations: `Supervisor::reserve(holder)` holds the node's GPU for one job. It stops every engine and starts none (loads, requests, crash restarts) until `Supervisor::release(holder)`. `Reservation`, `Supervisor::reservation` and `reservation_changes`.
