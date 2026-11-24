@@ -2,6 +2,10 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-24: released 0.4.3
+
+What changed: Released with `scripts/weirdnet_release.py` (the reserve command was approved by Michael, 2026-11-24). Release commit [`cbd2a19`](https://github.com/WeirdBrains/weirdnet-backends/commit/cbd2a19), tag [`v0.4.3`](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.3), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.3) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.3). See the entry below and [CHANGELOG.md](CHANGELOG.md). Next: Ymir P3a uses it.
+
 ## 2026-11-24: node reservations (0.4.3)
 
 What changed (see [CHANGELOG.md](CHANGELOG.md)): Michael approved a "hold this GPU, place nothing here" command for Ymir's training plan (P3a), 2026-11-24. `Supervisor::reserve(holder)` sets the reservation first, so loads waiting on `ops` see it. It then stops every running engine under `ops` (each drains up to `drain_timeout`). `load_with` refuses while reserved (checked before the backoff wait and again under `ops`; `force` too), so loads on demand, swaps and crash restarts start nothing. `ModelHost` refuses requests (with `wait_for_model` too). The same holder again is a no-op; another holder gets `Unavailable`; `release` by another holder gets `BadRequest`. The reservation is in memory only: an application that must keep it across a restart records it and reserves again at start (Ymir does). node/1: `Reserve { holder }`, `Release { holder }`, `NodeClient::reserve`/`release`, `Capability::reserved`, `Health::reserved` (serde default, skipped when none, so records stay the same for unreserved nodes and older readers), and `GroupUp` refused while reserved. `NodeService::watch` pushes a fresh record on every reservation change. There are no new `SupervisorEvent` variants, because older readers of `Health::events` would fail on them. Additive, so a patch release.
