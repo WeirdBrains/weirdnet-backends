@@ -53,7 +53,8 @@ impl Speed {
 /// the default). A request with image or audio parts is refused (`Unsupported`, so a pool tries
 /// elsewhere) unless the model takes them ([`ModelLaunch::capabilities`](crate::ModelLaunch::capabilities));
 /// remote image URLs are a `BadRequest`. A model that is not ready is refused as unavailable unless the request has
-/// `wait_for_model` or the host loads on demand. While draining, new requests are refused.
+/// `wait_for_model` or the host loads on demand. While draining or reserved
+/// ([`Supervisor::reserve`](crate::Supervisor::reserve)), new requests are refused.
 pub struct ModelHost {
     supervisor: Supervisor,
     auth: Arc<dyn Authorize>,
@@ -101,6 +102,9 @@ impl ModelHost {
     fn pick(&self, model: Option<&str>, wait: bool, needed: Modalities) -> Result<(String, bool), RemoteError> {
         if self.draining() {
             return Err(unavailable("this node is draining"));
+        }
+        if let Some(r) = self.supervisor.reservation() {
+            return Err(unavailable(format!("this node is reserved by {}", r.holder)));
         }
         let id = model.map(str::to_string).or_else(|| self.default_model.clone()).ok_or_else(|| bad_request("no model named and no default"))?;
         if let Some(what) = self.supervisor.capabilities(&id).and_then(|c| c.lacking(needed)) {

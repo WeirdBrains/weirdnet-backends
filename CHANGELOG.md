@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Node reservations: `Supervisor::reserve(holder)` holds the node's GPU for one job. It stops every engine and starts none (loads, requests, crash restarts) until `Supervisor::release(holder)`. `Reservation`, `Supervisor::reservation` and `reservation_changes`.
+- node/1 `Command::Reserve` and `Command::Release`, `NodeClient::reserve` and `release`, and `Capability::reserved` and `Health::reserved`, so placement can skip a reserved node. A reserved node refuses `GroupUp`. Nodes before 0.4.3 fail the new commands.
+
 ## [0.4.2] - 2026-11-24
 
 ### Fixed

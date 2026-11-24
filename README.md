@@ -18,6 +18,8 @@ the engines and serves them to inference nodes; what to load is always the calle
 - `Supervisor`: load and unload with draining, **swap groups** (loading one model of a group
   unloads the others), **idle unload**, crash restarts with exponential backoff and crash-loop
   detection, `SupervisorEvent`s, per-model logs; chat, completion and embedding forwarding.
+  `Supervisor::reserve(holder)` holds the node's GPU for one job (a training run, say): it
+  stops every engine and starts none until `release(holder)`.
   `add_model` and `remove_model` change the served models at run time, without a restart.
 - `ChunkDecoder` / `ToolCalls`: OpenAI server-sent events decoded into `Chunk`s (text,
   reasoning, tool-call fragments, finish reason and usage).
@@ -147,7 +149,7 @@ How inference nodes drive model nodes over [`weirdnet-net`](https://crates.io/cr
   ([`weirdnet-model`](https://crates.io/crates/weirdnet-model) `hw`), engines, every
   configured model (state, revision, quantization, context and slot limits, load-time
   estimate, measured prefill/decode speed and time to first token), load (queued, active,
-  slots, in flight), warm prefix hashes, swap groups, draining, whether the node takes
+  slots, in flight), warm prefix hashes, swap groups, draining, its reservation, whether the node takes
   group jobs and its private links (`NodeService::set_links`, `link::local_links`: address,
   class, interface, nominal and declared speed; public and CGNAT addresses are never
   advertised). Each is signed by the node key, chained to the user by its `NodeCert`, carries
@@ -156,7 +158,8 @@ How inference nodes drive model nodes over [`weirdnet-net`](https://crates.io/cr
   certificate, and with `Verifier::with_roster` that the node is still linked (a revoked
   node's record is refused even with its old certificate); `Subscription` also rejects sequence numbers that go backwards.
 - **Commands**: `Load` (with `force` for a crash loop), `Unload`, `Drain` (stop admissions and
-  wait for requests under way, or resume), `GroupUp`/`GroupDown`, `Health`. Cross-machine swap
+  wait for requests under way, or resume), `Reserve`/`Release` (hold the GPU for a holder:
+  nothing loads, runs or joins a group there until released; since 0.4.3), `GroupUp`/`GroupDown`, `Health`. Cross-machine swap
   groups (a Ray worker, an `rpc-server` on a private link) are started by the application's
   `GroupWorkers`; without one a node answers `Unsupported` and advertises `group_jobs: false`.
 - `NodeServer::start` serves node/1 and raw inference on `/weirdnet-backends/infer/1`

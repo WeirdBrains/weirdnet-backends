@@ -3,7 +3,8 @@
 //! A model node pushes a [`Capability`] record to every subscriber: signed by the node's key,
 //! chained to the user by its [`NodeCert`], with a sequence number and a 90 second expiry,
 //! refreshed every 15 seconds and on every change. It takes [`Command`]s: `Load`, `Unload`,
-//! `Drain`, `GroupUp`/`GroupDown` and `Health`. Inference itself is raw infer/2 framing through
+//! `Drain`, `Reserve`/`Release` (hold the node's GPU for one job: nothing is placed there until
+//! released; nodes before 0.4.3 fail these calls), `GroupUp`/`GroupDown` and `Health`. Inference itself is raw infer/2 framing through
 //! [`ModelHost`], served next to node/1 by [`NodeServer`] on [`RAW_INFER_PROTOCOL`]
 //! (`/weirdnet-backends/infer/1`) and, unless [`NodeServerOptions::legacy_infer2`] is off, on
 //! `/weirdnet-agent/infer/2` as in 0.1.0. Inference nodes dial model nodes through
@@ -38,7 +39,7 @@ use weirdnet_net::{AppBody, AppResponse, Keypair, PeerId, PublicKey};
 use crate::engine::EngineKind;
 use crate::host::{ModelHost, RAW_INFER_PROTOCOL, Speed};
 pub use crate::link::{AddrClass, LinkInfo, LinkMeasure};
-use crate::supervisor::{ModelState, ModelStatus, SupervisorEvent};
+use crate::supervisor::{ModelState, ModelStatus, Reservation, SupervisorEvent};
 use weirdnet_agent::serve::RosterView;
 
 /// The protocol id.
@@ -88,6 +89,11 @@ pub struct Capability {
     pub draining: bool,
     /// Takes group jobs (`GroupUp`).
     pub group_jobs: bool,
+    /// Reserved for a job ([`Command::Reserve`]): it runs no model, and nothing should be
+    /// placed on it until it is released. Absent when not reserved, and in records from nodes
+    /// before 0.4.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved: Option<Reservation>,
     /// Private interfaces (never public or CGNAT addresses), for placing swap groups. Absent
     /// in records from 0.1.1 nodes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -304,6 +310,16 @@ pub enum Command {
     Drain {
         on: bool,
     },
+    /// Hold the node's GPU for `holder`: drain and stop every engine and start none (loads,
+    /// requests and group jobs are refused) until `Release` by the same holder
+    /// ([`Supervisor::reserve`](crate::Supervisor::reserve)). Since 0.4.3.
+    Reserve {
+        holder: String,
+    },
+    /// End `holder`'s reservation. Since 0.4.3.
+    Release {
+        holder: String,
+    },
     GroupUp {
         plan: GroupPlan,
     },
@@ -347,6 +363,9 @@ pub struct Health {
     /// No model failed or in a crash loop.
     pub ok: bool,
     pub draining: bool,
+    /// The node's reservation (since 0.4.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved: Option<Reservation>,
     pub in_flight: u32,
     pub uptime_secs: u64,
     pub models: Vec<ModelHealth>,
@@ -531,6 +550,7 @@ impl NodeService {
             groups: self.groups.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             draining: self.host.draining(),
             group_jobs: self.workers.is_some(),
+            reserved: self.host.supervisor().reservation(),
             links: self.links.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
     }
@@ -548,6 +568,7 @@ impl NodeService {
             at_ms: now_ms(),
             ok,
             draining: self.host.draining(),
+            reserved: self.host.supervisor().reservation(),
             in_flight: self.host.supervisor().in_flight() as u32,
             uptime_secs: self.started.elapsed().as_secs(),
             models: status.into_iter().map(|m| ModelHealth { id: m.id, state: m.state, crashes: m.crashes }).collect(),
@@ -559,9 +580,20 @@ impl NodeService {
     pub fn watch(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let me = self.clone();
         let mut events = self.host.supervisor().subscribe();
+        let mut reserved = self.host.supervisor().reservation_changes();
         tokio::spawn(async move {
             loop {
-                match events.recv().await {
+                let ev = tokio::select! {
+                    ev = events.recv() => ev,
+                    r = reserved.changed() => {
+                        if r.is_err() {
+                            return;
+                        }
+                        me.touch();
+                        continue;
+                    }
+                };
+                match ev {
                     Ok(ev) => {
                         let mut recent = me.recent.lock().unwrap_or_else(|e| e.into_inner());
                         if recent.len() == RECENT {
@@ -603,7 +635,12 @@ impl NodeService {
                 }
                 Ok(())
             }
+            Command::Reserve { holder } => sup.reserve(&holder).await.map(|_| ()),
+            Command::Release { holder } => sup.release(&holder).map(|_| ()),
             Command::GroupUp { plan } => {
+                if let Some(r) = sup.reservation() {
+                    return Err(RemoteError::unavailable(format!("this node is reserved by {}", r.holder)));
+                }
                 let workers = self.workers.as_ref().ok_or_else(|| RemoteError::Unsupported { message: "this node takes no group jobs".into() })?;
                 for model in &plan.drop {
                     sup.unload(model).await?;
@@ -894,6 +931,17 @@ impl NodeClient {
     /// Drains (waiting for requests under way) or resumes.
     pub async fn drain(&self, node: &str, on: bool) -> Result<(), RemoteError> {
         self.done(node, Command::Drain { on }).await
+    }
+
+    /// Reserves the node's GPU for `holder` ([`Command::Reserve`]): returns once its engines are
+    /// stopped. A node before 0.4.3 fails the call.
+    pub async fn reserve(&self, node: &str, holder: &str) -> Result<(), RemoteError> {
+        self.done(node, Command::Reserve { holder: holder.into() }).await
+    }
+
+    /// Ends `holder`'s reservation.
+    pub async fn release(&self, node: &str, holder: &str) -> Result<(), RemoteError> {
+        self.done(node, Command::Release { holder: holder.into() }).await
     }
 
     pub async fn group_up(&self, node: &str, plan: GroupPlan) -> Result<(), RemoteError> {

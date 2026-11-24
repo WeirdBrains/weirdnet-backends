@@ -13,7 +13,8 @@
 //!   rewrite, text only).
 //! - [`supervisor`]: the local supervisor: load (random loopback port, per-process API key in
 //!   the environment, readiness probe), drain and unload, swap groups, idle unload, crash
-//!   restarts with backoff and crash loops, [`SupervisorEvent`]s and per-model logs; chat,
+//!   restarts with backoff and crash loops, a [`Reservation`] that holds the node's GPU for one
+//!   job (nothing is placed there until it is released), [`SupervisorEvent`]s and per-model logs; chat,
 //!   completion and embedding forwarding; adapters routed to their base ([`AdapterChange`]).
 //! - [`sse`]: OpenAI server-sent events decoded into [`Chunk`]s, and [`ToolCalls`] to join
 //!   streamed tool calls.
@@ -21,7 +22,7 @@
 //! - [`host`]: [`ModelHost`], a `weirdnet-agent` `InferHost` serving raw infer/2 from the
 //!   supervisor's models.
 //! - `node` (feature): `/weirdnet-backends/node/1` over `weirdnet-net`: signed capability
-//!   records, `Load`, `Unload`, `Drain`, `GroupUp`/`GroupDown` and health.
+//!   records, `Load`, `Unload`, `Drain`, `Reserve`/`Release`, `GroupUp`/`GroupDown` and health.
 //! - `models` (feature `node`): `/weirdnet-backends/models/1`, for the owner only: search the
 //!   Hugging Face Hub, see which files fit the node, pull (split GGUFs too) and serve without a
 //!   restart, list and remove; LoRA adapters for a served base too.
@@ -49,4 +50,6 @@ pub use engine::{Capabilities, EngineConfig, EngineKind, LoraAdapter, ModelLaunc
 pub use host::{EngineModel, ModelHost, RAW_INFER_PROTOCOL, RawInferDialer, Speed};
 pub use openai::Target;
 pub use sse::{Chunk, ChunkDecoder, SseParser, ToolCalls};
-pub use supervisor::{AdapterChange, ChunkStream, MAX_ADAPTER_SCALE, ModelState, ModelStatus, Supervisor, SupervisorEvent, SupervisorOptions};
+pub use supervisor::{
+    AdapterChange, ChunkStream, MAX_ADAPTER_SCALE, ModelState, ModelStatus, Reservation, Supervisor, SupervisorEvent, SupervisorOptions,
+};
