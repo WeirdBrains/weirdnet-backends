@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-24
+
 ### Fixed
 
 - A launched engine could lose the port it was told to another process (the supervisor picks a free port, then the engine binds it later). The supervisor now checks that the server answering on the port is its engine before calling it ready: `/v1/models` must take the launch's API key and list its id (llama-server and vLLM). If another server answers there, or the engine exits while loading because the port was taken (something else holds it, or its log says the address is in use), the launch is tried again on a new port, up to 3 times, and the failed try is not counted as a crash. MLX-LM's advertised port is the proxy's, bound before the engine starts, so only its engine's private port can be retried that way. Wrapped servers are unchanged.

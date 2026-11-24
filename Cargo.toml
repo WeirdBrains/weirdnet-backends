@@ -1,6 +1,6 @@
 [package]
 name = "weirdnet-backends"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.99"
 description = "Weirdnet model-node wrapper: llama.cpp server, vLLM and MLX-LM adapters, a local supervisor (swap groups, idle unload, crash backoff, drain), SSE decoding, raw infer/2 serving, and the /weirdnet-backends/node/1 protocol with signed capability records."
