@@ -194,6 +194,38 @@ fn crash_restarts_then_crash_loop() {
     })
 }
 
+/// The port an engine was told is taken before it binds: by a server that answers in its place
+/// (another key), or so the engine can't bind and exits (its log says so, or another process
+/// holds the port). Each time the launch goes again on a new port, and it is not a crash.
+fn a_taken_port_is_retried_on_another() {
+    common::block_on(async {
+        for (mode, engine) in
+            [("impostor", EngineKind::Llamacpp), ("impostor", EngineKind::Vllm), ("in-use", EngineKind::Llamacpp), ("held", EngineKind::Vllm)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("raced");
+            let mut cfg = match engine {
+                EngineKind::Vllm => weirdnet_backends::EngineConfig::vllm(common::mock_engine()),
+                _ => weirdnet_backends::EngineConfig::llamacpp(common::mock_engine()),
+            };
+            cfg.extra_args = vec!["--mock-port-race".into(), mode.into(), marker.display().to_string()];
+            let opts = weirdnet_backends::SupervisorOptions { log_dir: Some(dir.path().join("logs")), ..common::opts() };
+            let sup = Supervisor::new(vec![cfg], vec![launch("m", engine)], opts);
+            let mut events = sup.subscribe();
+            sup.load("m").await.unwrap_or_else(|e| panic!("{mode}: {e}"));
+            assert!(marker.exists(), "{mode}: the first launch raced");
+            let st = &sup.status()[0];
+            assert_eq!((st.state.clone(), st.crashes), (ModelState::Ready, 0), "{mode}");
+            while let Ok(e) = events.try_recv() {
+                assert!(!matches!(e, SupervisorEvent::Crashed { .. } | SupervisorEvent::CrashLoop { .. }), "{mode}: {e:?}");
+            }
+            let chunks = collect(&sup, "m", &Request::messages(vec![Message::user("hi")])).await;
+            assert_eq!(text(&chunks), "Hello from m! You said: hi", "{mode}: answered by this launch's engine");
+            sup.shutdown().await;
+        }
+    })
+}
+
 fn raw_infer2_through_the_model_host() {
     common::block_on(async {
         let mut embed = launch("embed", EngineKind::Llamacpp);
@@ -605,6 +637,7 @@ fn main() {
         #[cfg(unix)]
         ("crash_restarts_then_crash_loop", crash_restarts_then_crash_loop as fn()),
         ("raw_infer2_through_the_model_host", raw_infer2_through_the_model_host as fn()),
+        ("a_taken_port_is_retried_on_another", a_taken_port_is_retried_on_another as fn()),
         ("images_and_audio_reach_llama_server_with_a_projector", images_and_audio_reach_llama_server_with_a_projector as fn()),
     ]);
 }

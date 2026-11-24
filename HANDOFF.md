@@ -2,6 +2,14 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-24: engine port race (0.4.2)
+
+What changed (see [CHANGELOG.md](CHANGELOG.md)): the supervisor tells each engine a port it picked and freed, so another process could bind it first (seen in Ymir's tests under load). Now readiness also checks identity: after `/health`, `GET /v1/models` with the launch's key must answer 2xx and list the launch id (alias, `aliases` or a module); 401/403 or another model list means a stranger holds the port. That try's engine is stopped and the launch goes again on a new port (`PORT_TRIES` = 3). An engine that exits while loading is retried too when its port is held by someone else now or its log since the launch says the address was in use ("couldn't bind", "address already in use", errno 98/48, ...); such a try isn't a crash (no `Crashed` event, no crash count). Engine-agnostic, so no parsing of `--port 0` output (llama-server b12628 can bind port 0 and logs it, vLLM can't report it cleanly). MLX-LM: the advertised port is the proxy's, bound before the engine starts; the engine's private port gets the exit-and-retry path only (MLX-LM has no key to check). Wrapped servers: nothing picked, unchanged. Bug fix, so a patch release.
+
+Checks run: fmt; clippy `--all-features --all-targets -D warnings`; tests `--all-features` (33 unit, 11 adapter, 2 node). New: `a_taken_port_is_retried_on_another` (mock modes: a stranger answering with another key, for llama.cpp and vLLM; "couldn't bind" in the log and exit; another process holding the port), unit tests for the model-list and log checks. The mock engine serves `/v1/models` behind its key.
+
+Not tested: real llama-server and vLLM racing for a port. Checked against llama.cpp b12628 source: `/v1/models` is behind the API key (only `/health` is public) and lists the `--alias` as `id`; vLLM puts `/v1/*` behind `VLLM_API_KEY` and lists `--served-model-name`.
+
 ## 2026-11-23: released 0.4.1
 
 What changed: Released with `scripts/weirdnet_release.py` (approved by Michael, 2026-11-23). Release commit [`8681927`](https://github.com/WeirdBrains/weirdnet-backends/commit/8681927f0ef71feb5c953efa3a18a35c9aefedda), tag [`v0.4.1`](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.1), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.1) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.1). See the entry below and [CHANGELOG.md](CHANGELOG.md).
