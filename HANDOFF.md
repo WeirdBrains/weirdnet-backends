@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-24: release 0.4.4
+
+What changed: release `v0.4.4` (tag [v0.4.4](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.4), the `release: v0.4.4` commit right after this entry). It ships the models/1 upload work below (`eecf197`) on weirdnet-model 0.5.3 to [crates.io](https://crates.io/crates/weirdnet-backends/0.4.4); docs at [docs.rs](https://docs.rs/weirdnet-backends/0.4.4).
+
+Release approval: m3talsmith approved publishing 0.4.4 to crates.io once main is green (2026-11-24, 9:21 PM ET).
+
+Checks run: CI green on `eecf197`; the release script's checks from [release.toml](release.toml) (fmt, clippy `-D warnings` and tests with `--all-features`, `cargo doc -D warnings`), then `cargo publish`.
+
+Not tested: as in the entry below.
+
+What's left and next: Ymir's app moves to weirdnet-backends 0.4.4 and weirdnet-model 0.5.3 for uploads.
+
 ## 2026-11-24: model uploads, peer copies and write policy in models/1 (0.4.4)
 
 What changed (see [CHANGELOG.md](CHANGELOG.md) `Unreleased` and the README section "Uploading your own models"), the node side of the [model upload plan](https://github.com/WeirdBrains/ymir/blob/feature/model-upload-plan/docs/design/model-upload.md), on [weirdnet-model 0.5.3](https://crates.io/crates/weirdnet-model/0.5.3) from crates.io:
