@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-25: accept weirdnet-sync 0.8 (for 0.4.6)
+
+What changed: the `weirdnet-sync` requirement (the `node` feature and the dev-dependency) widens from `>=0.5, <0.8` to `>=0.5, <0.9`, and `weirdnet-agent` goes from `0.5.2` to `0.5.5`, the first [weirdnet-agent](https://crates.io/crates/weirdnet-agent/0.5.5) that accepts sync 0.8 too. No code changes were needed. Cargo.lock now holds weirdnet-sync 0.8.0, weirdnet-net 0.8.2, weirdnet-keys 0.1.2 and weirdnet-agent 0.5.5 (the yanked sync 0.7.0, net 0.8.0 and keys 0.1.1 are gone). CI also tests sync 0.5.3 and 0.7.1. Commit SHA: see the commit that adds this entry.
+
+Basis: m3talsmith decided on 2026-11-25 to widen the weirdnet-sync range in weirdnet-agent and weirdnet-backends to include 0.8, and his standing rule of 2026-11-24 covers additive Weirdnet patch releases. This is additive, so it ships as 0.4.6.
+
+Checks run: `cargo fmt --check`; `cargo clippy --all-targets --all-features -D warnings` and `cargo test --all-features` against weirdnet-sync 0.8.0, 0.7.1 and 0.5.3 (the oldest version in range that is not yanked); `cargo test` with default and no default features; `cargo doc -D warnings`.
+
+Not tested: sync 0.5.0 to 0.5.2 (yanked); no live nodes on mixed sync versions; Windows runs in CI only.
+
+What's left and next: release 0.4.6.
+
 ## 2026-11-25: released 0.4.5
 
 What changed: `v0.4.5` is out (release commit [`42e4256`](https://github.com/WeirdBrains/weirdnet-backends/commit/42e4256600426de30b3c3514030f3093b43fea1b), tag [v0.4.5](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.5), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.5) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.5)). It ships the placement hooks ([`006922b`](https://github.com/WeirdBrains/weirdnet-backends/commit/006922b)) and model origin and license in capability records (merge [`7a543ab`](https://github.com/WeirdBrains/weirdnet-backends/commit/7a543ab)), both below. The release ran from the origin and license work; a second release run for the hooks lost the atomic push to it and published nothing. This entry records the release.

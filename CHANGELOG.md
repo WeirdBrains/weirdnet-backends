@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Accepts weirdnet-sync 0.8 (the `node` feature and the tests now take `>=0.5, <0.9`) and needs weirdnet-agent 0.5.5, which accepts it too.
+
 ## [0.4.5] - 2026-11-25
 
 ### Added
