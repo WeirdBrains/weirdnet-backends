@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `ModelEntry::origin` and `license` in capability records, set per model with `NodeService::set_model_origin` (`hub`, `upload` or `train`, as in a weirdnet-model provenance record, and an SPDX license). Left out of the record when unset.
+
 ## [0.4.4] - 2026-11-24
 
 ### Added

@@ -110,6 +110,15 @@ pub struct ModelEntry {
     /// The last measured load time, else a size-based guess.
     pub load_secs_estimate: Option<f32>,
     pub speed: Speed,
+    /// Where the model came from: `hub`, `upload` or `train` (a weirdnet-model provenance
+    /// origin), or an app's own ([`NodeService::set_model_origin`]). Absent when unset, and in
+    /// records from nodes before 0.4.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// The model's license: an SPDX id, or `unknown` when the uploader said so. Absent when
+    /// unset, and in records from nodes before 0.4.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
 }
 
 /// The node's load.
@@ -381,8 +390,14 @@ pub struct ModelHealth {
     pub crashes: usize,
 }
 
-/// A model's revision and quantization.
-type ModelInfo = (Option<String>, Option<String>);
+/// What the node says about a model in its record beyond the supervisor's status.
+#[derive(Debug, Clone, Default)]
+struct ModelInfo {
+    revision: Option<String>,
+    quant: Option<String>,
+    origin: Option<String>,
+    license: Option<String>,
+}
 
 /// A model node's node/1 side: issues records and runs commands against its [`ModelHost`].
 /// Transport-neutral ([`NodeService::serve`] takes a channel); [`NodeServer`] runs it on a
@@ -486,7 +501,21 @@ impl NodeService {
 
     /// A model's revision and quantization, for the record.
     pub fn set_model_info(&self, model: &str, revision: Option<String>, quant: Option<String>) {
-        self.info.lock().unwrap_or_else(|e| e.into_inner()).insert(model.into(), (revision, quant));
+        let mut info = self.info.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = info.entry(model.into()).or_default();
+        (entry.revision, entry.quant) = (revision, quant);
+        drop(info);
+        self.touch();
+    }
+
+    /// A model's origin (`hub`, `upload`, `train` or an app's own: a weirdnet-model provenance
+    /// origin) and license (an SPDX id, or `unknown`), for the record. Leaves the revision and
+    /// quantization from [`set_model_info`](Self::set_model_info) as they are; `None` clears.
+    pub fn set_model_origin(&self, model: &str, origin: Option<String>, license: Option<String>) {
+        let mut info = self.info.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = info.entry(model.into()).or_default();
+        (entry.origin, entry.license) = (origin, license);
+        drop(info);
         self.touch();
     }
 
@@ -525,11 +554,11 @@ impl NodeService {
             .status()
             .into_iter()
             .map(|status| {
-                let (revision, quant) = info.get(&status.id).cloned().unwrap_or_default();
+                let ModelInfo { revision, quant, origin, license } = info.get(&status.id).cloned().unwrap_or_default();
                 // Without a measured load, assume about 1 GB/s from disk plus a few seconds.
                 let load_secs_estimate = status.last_load_secs.or(status.size_bytes.map(|b| b as f32 / 1e9 + 3.0));
                 let speed = self.host.speed(&status.id);
-                ModelEntry { status, revision, quant, load_secs_estimate, speed }
+                ModelEntry { status, revision, quant, load_secs_estimate, speed, origin, license }
             })
             .collect::<Vec<_>>();
         let in_flight = self.host.supervisor().in_flight() as u32;
