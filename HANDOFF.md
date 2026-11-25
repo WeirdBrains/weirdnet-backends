@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-25: released 0.4.5
+
+What changed: `v0.4.5` is out (release commit [`42e4256`](https://github.com/WeirdBrains/weirdnet-backends/commit/42e4256600426de30b3c3514030f3093b43fea1b), tag [v0.4.5](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.5), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.5) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.5)). It ships the placement hooks ([`006922b`](https://github.com/WeirdBrains/weirdnet-backends/commit/006922b)) and model origin and license in capability records (merge [`7a543ab`](https://github.com/WeirdBrains/weirdnet-backends/commit/7a543ab)), both below. The release ran from the origin and license work; a second release run for the hooks lost the atomic push to it and published nothing. This entry records the release.
+
+Release approval: m3talsmith's standing approval of additive Weirdnet patch releases once main is green (2026-11-24, 9:21 PM ET).
+
+Checks run: CI green on `7a543ab`; `cargo semver-checks` against 0.4.4 on `7a543ab` (no semver update required); the release script's checks.
+
+Not tested: as in the entries below.
+
+What's left and next: Ymir moves to 0.4.5, replaces its own uploads protocol with `on_placed` and `with_node_info`, and reads origin and license from capability records.
+
 ## 2026-11-25: model origin and license in capability records (for 0.4.5)
 
 What changed ([`a7d406a`](https://github.com/WeirdBrains/weirdnet-backends/commit/a7d406a7c6dfc072ce45bb4b42859c7addba3d28), branch `feat/model-origin`, merged to main with `--no-ff`): `ModelEntry::origin` and `ModelEntry::license` (`Option<String>`, serde default, left out of the record when unset) and `NodeService::set_model_origin(model, origin, license)`, which keeps the revision and quantization from `set_model_info` (whose signature is unchanged) and pushes a fresh record. Origins are the [weirdnet-model](https://crates.io/crates/weirdnet-model) 0.5.3 provenance ones (`hub`, `upload`, `train`), and licenses are SPDX ids or `unknown`. Asked for by [Ymir](https://github.com/WeirdBrains/ymir) so its catalog ([weirdnet-agent](https://crates.io/crates/weirdnet-agent) 0.5.4 `CatalogModel::origin`/`license`) can say where a model came from. `ModelEntry` is `#[non_exhaustive]`, so this is additive: a patch release, 0.4.5.
