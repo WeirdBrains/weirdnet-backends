@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-24
+
 ### Added
 
 - models/1 uploads: `ModelsCommand::Upload` with `Upload` and `UploadFrame` (48 KiB `CHUNK`s), `ModelsReply::UploadReady` and `Uploaded`, and `ModelsClient::upload`. The node checks names, size, free space, engine and base up front, headers as the first bytes arrive and every SHA-256 at the end, then places the files with weirdnet-model 0.5.3 `ModelStore::import` and can serve them: GGUF, safetensors and MLX models, adapters (live on their base) and vision projectors. Closed uploads resume from staged parts (`with_staging`, swept after `WritePolicy::part_ttl`); `ModelsCommand::AbandonUpload` drops them.
