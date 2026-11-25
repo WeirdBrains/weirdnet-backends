@@ -96,6 +96,13 @@ A node copies an upload from another node with `Pull::from_peer(node, upload)` (
 `ModelsCommand::Fetch`, resuming like an upload), given `ModelsService::with_peer_dialer`.
 After one upload, `ModelsClient::replicate` has the other nodes pull it from that node.
 
+`ModelsService::on_placed(hook)` hears every entry the service places: uploads, peer copies
+and Hub pulls. The hook gets a `Placed` with the stored entry as `List` shows it (provenance
+included), the `Pulled` answer with its revision, and how it arrived (`PlacedVia`), so an app
+can record the entry without a protocol of its own. `with_node_info(node)` keeps a
+`NodeService`'s capability record current (`set_model_info` with the revision and a GGUF
+file's quantization, and `set_model_origin` with the provenance's origin and license). Hooks run before the client's answer and should be quick.
+
 ```rust
 use weirdnet_backends::models::Upload;
 use weirdnet_model::{Provenance, artifact::{ORIGIN_UPLOAD, inspect}};
@@ -105,6 +112,11 @@ let found = inspect(&files)?;
 let upload = Upload::new("support-r3", &found, Provenance::new(ORIGIN_UPLOAD).with_license("apache-2.0")).serving();
 let pulled = client.upload(&model_node, upload.clone(), &files, |p| println!("{}/{}", p.done, p.total)).await?;
 let copies = client.replicate(&model_node, &other_nodes, &upload, |node, p| println!("{node}: {}", p.done)).await;
+
+// On the node:
+let svc = ModelsService::new(store, supervisor.clone(), auth)
+    .with_node_info(node_service.clone())
+    .on_placed(|p| println!("placed {} ({:?}) at {:?}", p.id(), p.via, p.revision()));
 ```
 
 ## LoRA adapters

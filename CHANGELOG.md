@@ -4,7 +4,8 @@
 
 ### Added
 
-- `ModelEntry::origin` and `license` in capability records, set per model with `NodeService::set_model_origin` (`hub`, `upload` or `train`, as in a weirdnet-model provenance record, and an SPDX license). Left out of the record when unset.
+- Placement hooks: `ModelsService::on_placed` runs a callback after each upload, peer copy (including `ModelsClient::replicate` targets) or Hub pull is placed, with a `Placed` (the `StoredEntry` with provenance, the `Pulled` answer with its revision, `PlacedVia`, and `serve_error` when the files were placed but serving them failed). `ModelsService::with_node_info` uses it to keep `NodeService::set_model_info` current. `OnPlaced`.
+- `ModelEntry::origin` and `license` in capability records, set per model with `NodeService::set_model_origin` (`hub`, `upload` or `train`, as in a weirdnet-model provenance record, and an SPDX license). `with_node_info` sets them from each placed entry's provenance (`Placed::origin_and_license`). Left out of the record when unset.
 
 ## [0.4.4] - 2026-11-24
 

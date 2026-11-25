@@ -44,7 +44,10 @@ use crate::engine::{EngineKind, LoraAdapter, ModelLaunch};
 use crate::error::bad_request;
 use crate::supervisor::{AdapterChange, ModelState, Supervisor};
 
+pub mod placed;
 pub mod upload;
+
+pub use placed::{OnPlaced, Placed, PlacedVia};
 
 pub use upload::{CHUNK, DiskReport, KeepFree, PullSource, Upload, UploadFrame, WritePolicy, refusal, refusal_reason};
 
@@ -385,6 +388,7 @@ pub struct ModelsService {
     staging: std::path::PathBuf,
     uploading: Mutex<HashSet<String>>,
     peers: Option<PeerDialer>,
+    placed: Vec<OnPlaced>,
 }
 
 /// The dialer and certificate a node pulls from its peers with.
@@ -412,6 +416,7 @@ impl ModelsService {
             write: WritePolicy::default(),
             uploading: Mutex::default(),
             peers: None,
+            placed: Vec::new(),
         }
     }
 
@@ -556,7 +561,7 @@ impl ModelsService {
                 loaded = true;
             }
         }
-        Ok(Pulled {
+        let pulled = Pulled {
             id: adapter.id,
             repo: pull.repo.clone(),
             files,
@@ -567,7 +572,9 @@ impl ModelsService {
             change,
             revision: None,
             projector_for: None,
-        })
+        };
+        self.fire_placed(&pulled, PlacedVia::Hub { repo: pull.repo.clone() }, None, None);
+        Ok(pulled)
     }
 
     /// Downloads `pull` (resuming a partial file) and serves it if asked. `progress` returns
@@ -623,7 +630,7 @@ impl ModelsService {
                 loaded = true;
             }
         }
-        Ok(Pulled {
+        let pulled = Pulled {
             id: model.id,
             repo: pull.repo.clone(),
             files,
@@ -634,7 +641,9 @@ impl ModelsService {
             change: None,
             revision: None,
             projector_for: None,
-        })
+        };
+        self.fire_placed(&pulled, PlacedVia::Hub { repo: pull.repo.clone() }, None, None);
+        Ok(pulled)
     }
 
     /// The supervisor id serving the file at `path`, if any.
@@ -1081,7 +1090,11 @@ mod tests {
         let auth: Arc<dyn Authorize> = Arc::new(|c: &Caller| if c.peer == "owner" { Ok(()) } else { Err(RemoteError::refused("owner only")) });
         // Q4_0 (4000 bytes plus 32 KiB of KV, plus 10%) fits; the 6000-byte Q8_0 doesn't.
         let budget = Budget { pool_bytes: 41_000, reserve_bytes: 0, usable_bytes: 41_000 };
-        let svc = Arc::new(ModelsService::new(store, sup.clone(), auth).with_budget(budget));
+        let placed = Arc::new(Mutex::new(Vec::new()));
+        let hook = placed.clone();
+        let svc = Arc::new(
+            ModelsService::new(store, sup.clone(), auth).with_budget(budget).on_placed(move |p: &Placed| hook.lock().unwrap().push(p.clone())),
+        );
         let owner = ModelsClient::new(dialer(svc.clone(), "owner"));
         let stranger = ModelsClient::new(dialer(svc.clone(), "stranger"));
 
@@ -1110,6 +1123,10 @@ mod tests {
         assert!(!split.served);
         let err = owner.pull("model-node", Pull::new("o/n").with_model("nope"), |_| {}).await.unwrap_err();
         assert!(matches!(err, RemoteError::BadRequest { .. }), "{err:?}");
+        let placed = placed.lock().unwrap().clone();
+        let heard: Vec<_> = placed.iter().map(|p| (p.entry.id(), p.via.clone(), p.revision(), p.served_as())).collect();
+        let hub = PlacedVia::Hub { repo: "o/n".into() };
+        assert_eq!(heard, [("m-Q4_0", hub.clone(), None, Some("m-Q4_0")), ("m-Q8_0", hub, None, None)]);
 
         let list = owner.list("model-node").await.unwrap();
         assert_eq!(list.iter().map(|e| (e.id(), e.served_as.as_deref())).collect::<Vec<_>>(), [("m-Q4_0", Some("m-Q4_0")), ("m-Q8_0", None)]);
