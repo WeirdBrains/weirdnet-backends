@@ -2,6 +2,23 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-25: placement hooks on ModelsService (0.4.5)
+
+What changed (see [CHANGELOG.md](CHANGELOG.md) `Unreleased` and the README section "Uploading your own models"), asked for by Ymir so apps no longer need their own protocol to record uploads:
+
+- `models/placed.rs`: `ModelsService::on_placed(impl Fn(&Placed) + Send + Sync + 'static)` (several hooks, run in order; `OnPlaced` is the stored `Arc<dyn Fn(&Placed) + Send + Sync>`). `Placed { entry: StoredEntry, pulled: Pulled, via: PlacedVia, serve_error: Option<RemoteError> }` with `id()`, `revision()`, `provenance()`, `served_as()` and `quant()`; `PlacedVia::{Upload, Peer { node }, Hub { repo }}`. Both are `#[non_exhaustive]`.
+- Uploads and peer copies (so each `ModelsClient::replicate` target) fire once the files are imported, after serving, and also when serving then fails (`serve_error` set; the client still gets the error). Hub model and adapter pulls fire on success. Serving a `Fetch` places nothing and fires nothing. Hooks run before the client's answer; a panicking hook is caught.
+- `ModelsService::with_node_info(Arc<NodeService>)`: a hook that calls `NodeService::set_model_info(served id or store id, revision, quant from a GGUF model's file name)` for entries with a revision; Hub pulls (no revision) leave the record alone. It uses this crate's own `NodeService`, so no new dependency, and does not depend on origin or license in weirdnet-agent's `set_model_info`.
+- `finish` in `models/upload.rs` now serves through a separate `serve_imported`, so a placement whose serving fails is still reported.
+
+Release approval: m3talsmith's standing approval (2026-11-24, 9:21 PM ET) covers additive Weirdnet patch releases once main is green; this ships as 0.4.5.
+
+Checks run: the `release.toml` checks (fmt; clippy `-D warnings` and tests with `--all-features`; `cargo doc -D warnings`); `cargo semver-checks` against 0.4.4. New tests: hooks on an upload (entry, provenance, revision, quant, served id) and on the peer copy made by `replicate`, with a panicking hook alongside; adapter and projector placements; a projector placed on an embedding model, where serving fails and `serve_error` matches the client's error; Hub model pulls (served and not); `with_node_info` putting the revision and quantization in the capability record.
+
+Not tested: hooks on a real `weirdnet-net` node and with Ymir's app; a Hub adapter pull's hook (same code path as the model pull).
+
+What's left and next: release 0.4.5; Ymir can drop `/ymir/uploads/1` in favour of `on_placed` and `with_node_info`. A projector for an embedding or wrapped llama.cpp model passes the upload's early checks and only fails when served.
+
 ## 2026-11-24: release 0.4.4
 
 What changed: release `v0.4.4` (tag [v0.4.4](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.4), the `release: v0.4.4` commit right after this entry). It ships the models/1 upload work below (`eecf197`) on weirdnet-model 0.5.3 to [crates.io](https://crates.io/crates/weirdnet-backends/0.4.4); docs at [docs.rs](https://docs.rs/weirdnet-backends/0.4.4).

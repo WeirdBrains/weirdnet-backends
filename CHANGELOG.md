@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Placement hooks: `ModelsService::on_placed` runs a callback after each upload, peer copy (including `ModelsClient::replicate` targets) or Hub pull is placed, with a `Placed` (the `StoredEntry` with provenance, the `Pulled` answer with its revision, `PlacedVia`, and `serve_error` when the files were placed but serving them failed). `ModelsService::with_node_info` uses it to keep `NodeService::set_model_info` current. `OnPlaced`.
+
 ## [0.4.4] - 2026-11-24
 
 ### Added

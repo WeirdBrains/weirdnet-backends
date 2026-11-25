@@ -29,9 +29,10 @@ use weirdnet_model::gguf::{self, GgufKind};
 use weirdnet_model::hf::split_part;
 use weirdnet_model::{Imported, ModelLayout, ModelStore, Progress};
 
-use super::{MODELS_PROTOCOL, ModelsClient, ModelsCommand, ModelsReply, ModelsRequest, ModelsService, PROGRESS_EVERY, Pull, Pulled};
+use super::{MODELS_PROTOCOL, ModelsClient, ModelsCommand, ModelsReply, ModelsRequest, ModelsService, PROGRESS_EVERY, PlacedVia, Pull, Pulled};
 use crate::engine::{EngineKind, LoraAdapter, ModelLaunch};
 use crate::error::bad_request;
+use crate::supervisor::AdapterChange;
 
 /// Bytes of file data in one [`UploadFrame::Chunk`] or [`ModelsReply::Chunk`] at most: under
 /// the 64 KiB frame limit with room for the framing.
@@ -782,7 +783,7 @@ impl ModelsService {
     }
 
     /// Checks and places a fully received upload, then serves it if asked.
-    async fn finish(&self, mut r: Receiving, repo: String, progress: impl FnMut(Progress) -> bool + Send + 'static) -> Result<Pulled, RemoteError> {
+    async fn finish(&self, mut r: Receiving, via: PlacedVia, progress: impl FnMut(Progress) -> bool + Send + 'static) -> Result<Pulled, RemoteError> {
         r.open = None;
         for (i, f) in r.upload.files.iter().enumerate() {
             if r.have[i] != f.size {
@@ -813,43 +814,13 @@ impl ModelsService {
         let _ = std::fs::remove_dir_all(&r.dir);
         let u = &r.upload;
         let revision = imported.provenance().map(|p| p.revision.clone());
-        let (mut served, mut change) = (false, None);
-        if u.serve && !u.store_only {
-            match &imported {
-                Imported::Model(m) => {
-                    let (engine, source) = match m.layout {
-                        ModelLayout::Safetensors => {
-                            (EngineKind::Vllm, self.store.model_dir(ModelLayout::Safetensors, &m.id).map_err(super::model_error)?)
-                        }
-                        ModelLayout::Mlx => (EngineKind::Mlx, self.store.model_dir(ModelLayout::Mlx, &m.id).map_err(super::model_error)?),
-                        _ => (EngineKind::Llamacpp, self.store.dir().join(&m.files[0])),
-                    };
-                    // A format this node's engine doesn't take stays stored, not served.
-                    if engine == self.engine {
-                        if u.replace && self.supervisor.launches().iter().any(|l| l.id == m.id) {
-                            self.supervisor.remove_model(&m.id).await?;
-                        }
-                        self.supervisor.add_model(ModelLaunch::new(m.id.clone(), engine, source.display().to_string()))?;
-                        served = true;
-                    }
-                }
-                Imported::Adapter(a) => {
-                    let base = u.adapter_for.clone().ok_or_else(|| refuse(refusal::NO_BASE, "an adapter needs adapter_for"))?;
-                    if u.replace && self.supervisor.launches().iter().any(|l| l.adapters.iter().any(|x| x.id == a.id)) {
-                        self.supervisor.remove_adapter_live(&base, &a.id).await?;
-                    }
-                    change = Some(self.supervisor.add_adapter_live(&base, LoraAdapter::new(a.id.clone(), a.path.display().to_string())).await?);
-                    served = true;
-                }
-                Imported::Projector(p) => {
-                    let model = u.projector_for.clone().ok_or_else(|| refuse(refusal::NO_BASE, "a projector needs projector_for"))?;
-                    change = Some(self.supervisor.set_projector_live(&model, Some(p.path.display().to_string())).await?);
-                    served = true;
-                }
-                _ => {}
-            }
-        }
-        Ok(Pulled {
+        let serving = if u.serve && !u.store_only { self.serve_imported(u, &imported).await } else { Ok((false, None)) };
+        let (served, change) = serving.as_ref().map(|x| *x).unwrap_or((false, None));
+        let repo = match &via {
+            PlacedVia::Peer { node } => node.clone(),
+            _ => String::new(),
+        };
+        let pulled = Pulled {
             id: imported.id().to_string(),
             repo,
             files: self.store_files(&imported),
@@ -860,7 +831,48 @@ impl ModelsService {
             change,
             revision,
             projector_for: u.projector_for.clone().filter(|_| matches!(imported, Imported::Projector(_))),
-        })
+        };
+        self.fire_placed(&pulled, via, Some(&imported), serving.as_ref().err());
+        serving.map(|_| pulled)
+    }
+
+    /// Hands an imported entry to the supervisor: whether it is served, and the adapter change.
+    async fn serve_imported(&self, u: &Upload, imported: &Imported) -> Result<(bool, Option<AdapterChange>), RemoteError> {
+        let (mut served, mut change) = (false, None);
+        match &imported {
+            Imported::Model(m) => {
+                let (engine, source) = match m.layout {
+                    ModelLayout::Safetensors => {
+                        (EngineKind::Vllm, self.store.model_dir(ModelLayout::Safetensors, &m.id).map_err(super::model_error)?)
+                    }
+                    ModelLayout::Mlx => (EngineKind::Mlx, self.store.model_dir(ModelLayout::Mlx, &m.id).map_err(super::model_error)?),
+                    _ => (EngineKind::Llamacpp, self.store.dir().join(&m.files[0])),
+                };
+                // A format this node's engine doesn't take stays stored, not served.
+                if engine == self.engine {
+                    if u.replace && self.supervisor.launches().iter().any(|l| l.id == m.id) {
+                        self.supervisor.remove_model(&m.id).await?;
+                    }
+                    self.supervisor.add_model(ModelLaunch::new(m.id.clone(), engine, source.display().to_string()))?;
+                    served = true;
+                }
+            }
+            Imported::Adapter(a) => {
+                let base = u.adapter_for.clone().ok_or_else(|| refuse(refusal::NO_BASE, "an adapter needs adapter_for"))?;
+                if u.replace && self.supervisor.launches().iter().any(|l| l.adapters.iter().any(|x| x.id == a.id)) {
+                    self.supervisor.remove_adapter_live(&base, &a.id).await?;
+                }
+                change = Some(self.supervisor.add_adapter_live(&base, LoraAdapter::new(a.id.clone(), a.path.display().to_string())).await?);
+                served = true;
+            }
+            Imported::Projector(p) => {
+                let model = u.projector_for.clone().ok_or_else(|| refuse(refusal::NO_BASE, "a projector needs projector_for"))?;
+                change = Some(self.supervisor.set_projector_live(&model, Some(p.path.display().to_string())).await?);
+                served = true;
+            }
+            _ => {}
+        }
+        Ok((served, change))
     }
 
     /// An imported entry's files, relative to the store.
@@ -910,7 +922,7 @@ impl ModelsService {
                 UploadFrame::Done => break,
             }
         }
-        self.drive(ch, |report| self.finish(r, String::new(), report), ModelsReply::Uploaded).await
+        self.drive(ch, |report| self.finish(r, PlacedVia::Upload, report), ModelsReply::Uploaded).await
     }
 
     /// Runs `work` (given a progress callback), forwarding progress at most every
@@ -1083,7 +1095,7 @@ impl ModelsService {
                 }
             }
         }
-        let pulled = self.finish(r, node.to_string(), progress).await?;
+        let pulled = self.finish(r, PlacedVia::Peer { node: node.to_string() }, progress).await?;
         if pull.load && pulled.served {
             self.supervisor.load(&pulled.id).await?;
             return Ok(Pulled { loaded: true, ..pulled });
@@ -1226,6 +1238,7 @@ mod tests {
 
     use super::*;
     use crate::engine::tests::{base_gguf, gguf, lora_gguf};
+    use crate::models::Placed;
     use crate::supervisor::{AdapterChange, Supervisor, SupervisorOptions};
 
     /// A llama model GGUF padded to `len` bytes (several chunks).
@@ -1249,6 +1262,10 @@ mod tests {
     }
 
     fn node(engine: EngineKind, policy: WritePolicy) -> Node {
+        node_with(engine, policy, |s| s)
+    }
+
+    fn node_with(engine: EngineKind, policy: WritePolicy, more: impl FnOnce(ModelsService) -> ModelsService) -> Node {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let sup = Supervisor::new(vec![], vec![], SupervisorOptions::default());
@@ -1257,7 +1274,7 @@ mod tests {
             .with_engine(engine)
             .with_staging(root.join("staging"))
             .with_write_policy(policy.with_keep_free(KeepFree::none()));
-        Node { svc: Arc::new(svc), sup, _tmp: tmp, root }
+        Node { svc: Arc::new(more(svc)), sup, _tmp: tmp, root }
     }
 
     fn route(d: &MemoryDialer, name: &str, svc: Arc<ModelsService>, peer: &'static str) {
@@ -1524,5 +1541,112 @@ mod tests {
         assert_eq!(refusal_reason(&refuse(refusal::QUOTA, "x")), Some("quota"));
         assert_eq!(refusal_reason(&RemoteError::refused("owner only")), None);
         assert_eq!(refusal_reason(&RemoteError::Busy), None);
+    }
+
+    fn recorder() -> (Arc<Mutex<Vec<Placed>>>, impl Fn(&Placed) + Send + Sync + 'static) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        (seen, move |p: &Placed| s.lock().unwrap().push(p.clone()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn placement_hooks_hear_uploads_and_peer_copies() {
+        let (on_a, hook_a) = recorder();
+        let a = node_with(EngineKind::Llamacpp, WritePolicy::default(), |s| s.on_placed(|_| panic!("a broken hook")).on_placed(hook_a));
+        let to_a = MemoryDialer::new();
+        route(&to_a, "a", a.svc.clone(), "node-b");
+        let (on_b, hook_b) = recorder();
+        let b = node_with(EngineKind::Llamacpp, WritePolicy::default(), |s| s.with_peer_dialer(Arc::new(to_a), None).on_placed(hook_b));
+        let owner = MemoryDialer::new();
+        route(&owner, "a", a.svc.clone(), "laptop");
+        route(&owner, "b", b.svc.clone(), "laptop");
+        let owner = ModelsClient::new(Arc::new(owner));
+
+        let src = tempfile::tempdir().unwrap();
+        let file = local(src.path(), "tune-Q4_0.gguf", &model_gguf(CHUNK + 5));
+        let found = inspect(std::slice::from_ref(&file)).unwrap();
+        let up = Upload::new("tune", &found, Provenance::new(ORIGIN_TRAIN).with_license("mit")).serving();
+        let pulled = owner.upload("a", up.clone(), &[file], |_| {}).await.unwrap();
+
+        let seen = on_a.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one placement, despite the panicking hook");
+        let p = &seen[0];
+        assert_eq!((p.id(), p.via.clone(), p.revision()), ("tune", PlacedVia::Upload, Some(found.revision.as_str())));
+        assert_eq!(p.pulled, pulled);
+        assert_eq!((p.served_as(), p.quant().as_deref(), p.serve_error.clone()), (Some("tune"), Some("Q4_0"), None));
+        let rec = p.provenance().unwrap();
+        assert_eq!((rec.origin.as_str(), rec.license.as_deref(), rec.uploaded_by.as_deref()), (ORIGIN_TRAIN, Some("mit"), Some("laptop")));
+        assert_eq!(p.entry.model.as_ref().unwrap().files, ["tune/tune-Q4_0.gguf"]);
+
+        owner.replicate("a", &["b".to_string()], &up, |_, _| {}).await[0].1.as_ref().unwrap();
+        let seen = on_b.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!((seen[0].via.clone(), seen[0].revision()), (PlacedVia::Peer { node: "a".into() }, Some(found.revision.as_str())));
+        assert_eq!(seen[0].provenance().unwrap().license.as_deref(), Some("mit"));
+        assert_eq!(on_a.lock().unwrap().len(), 1, "serving a fetch places nothing");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hooks_hear_adapters_projectors_and_placements_that_fail_to_serve() {
+        let (seen, hook) = recorder();
+        let n = node_with(EngineKind::Llamacpp, WritePolicy::default(), |s| s.on_placed(hook));
+        let base = local(&n.root, "base.gguf", &base_gguf("llama"));
+        n.sup.add_model(ModelLaunch::new("base", EngineKind::Llamacpp, base.display().to_string())).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let c = client(&n, "laptop");
+
+        let lora = local(src.path(), "t-LoRA.gguf", &lora_gguf("llama"));
+        let found = inspect(std::slice::from_ref(&lora)).unwrap();
+        c.upload("node", Upload::new("t", &found, Provenance::new(ORIGIN_UPLOAD)).with_adapter_for("base").serving(), &[lora], |_| {}).await.unwrap();
+        let mm = local(src.path(), "mmproj.gguf", &gguf(&[("general.architecture", "clip".into())]));
+        let found = inspect(std::slice::from_ref(&mm)).unwrap();
+        c.upload("node", Upload::new("eyes", &found, Provenance::new(ORIGIN_UPLOAD)).with_projector_for("base").serving(), &[mm], |_| {})
+            .await
+            .unwrap();
+        // An embedding model takes no projector: the import works, serving fails.
+        let mut emb = ModelLaunch::new("emb", EngineKind::Llamacpp, base.display().to_string());
+        emb.embedding = true;
+        n.sup.add_model(emb).unwrap();
+        let mm = local(src.path(), "mmproj2.gguf", &gguf(&[("general.architecture", "clip".into())]));
+        let found = inspect(std::slice::from_ref(&mm)).unwrap();
+        let up = Upload::new("eyes2", &found, Provenance::new(ORIGIN_UPLOAD)).with_projector_for("emb").serving();
+        let err = c.upload("node", up, &[mm], |_| {}).await.unwrap_err();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        let adapter = seen[0].entry.adapter.as_ref().unwrap();
+        assert_eq!((adapter.id.as_str(), seen[0].entry.base.as_deref(), seen[0].quant()), ("t", Some("base"), None));
+        assert!(seen[0].entry.model.is_none());
+        assert_eq!((seen[1].entry.projector.as_ref().unwrap().id.as_str(), seen[1].entry.base.as_deref()), ("eyes", Some("base")));
+        assert_eq!(seen[1].pulled.projector_for.as_deref(), Some("base"));
+        assert_eq!((seen[2].id(), seen[2].pulled.served, seen[2].serve_error.as_ref()), ("eyes2", false, Some(&err)));
+        assert!(seen[2].entry.projector.is_some(), "placed, though not served");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn node_info_follows_placements() {
+        use weirdnet_net::Keypair;
+
+        use crate::host::ModelHost;
+        use crate::node::NodeService;
+
+        let sup = Supervisor::new(vec![], vec![], SupervisorOptions::default());
+        let auth: Arc<dyn Authorize> = Arc::new(|_: &Caller| Ok(()));
+        let info = Arc::new(NodeService::new(Arc::new(ModelHost::new(sup.clone(), auth.clone())), Keypair::generate_ed25519(), None, auth));
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = ModelsService::new(ModelStore::new(tmp.path().join("models")), sup, Arc::new(|_: &Caller| Ok(())))
+            .with_staging(tmp.path().join("staging"))
+            .with_write_policy(WritePolicy::default().with_keep_free(KeepFree::none()))
+            .with_node_info(info.clone());
+        let d = MemoryDialer::new();
+        route(&d, "node", Arc::new(svc), "laptop");
+        let c = ModelsClient::new(Arc::new(d));
+
+        let file = local(tmp.path(), "src/m-Q8_0.gguf", &model_gguf(100));
+        let found = inspect(std::slice::from_ref(&file)).unwrap();
+        c.upload("node", Upload::new("m", &found, Provenance::new(ORIGIN_UPLOAD)).serving(), &[file], |_| {}).await.unwrap();
+        let cap = info.capability();
+        let entry = cap.models.iter().find(|m| m.status.id == "m").unwrap();
+        assert_eq!((entry.revision.as_deref(), entry.quant.as_deref()), (Some(found.revision.as_str()), Some("Q8_0")));
     }
 }
