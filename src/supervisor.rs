@@ -194,6 +194,8 @@ struct Running {
     adapters: Vec<LoraAdapter>,
     /// vLLM started with LoRA on and run-time updates allowed ([`ModelLaunch::runtime_lora`]).
     runtime_lora: bool,
+    /// The projector the engine started with.
+    mmproj: Option<String>,
     api_key: Option<String>,
     pid: Option<u32>,
     stop: Option<oneshot::Sender<()>>,
@@ -432,6 +434,32 @@ impl Supervisor {
         Ok(removed)
     }
 
+    /// Sets (or with `None` clears) llama.cpp model `id`'s multimodal projector
+    /// ([`ModelLaunch::mmproj`]), from the next load on: its capabilities change at once, and
+    /// [`AdapterChange::NextLoad`] says the running engine started with another projector
+    /// (llama-server reads it only at start; loading the model restarts it).
+    pub async fn set_projector_live(&self, id: &str, mmproj: Option<String>) -> Result<AdapterChange, RemoteError> {
+        let _op = self.inner.ops.lock().await;
+        let change = {
+            let mut slots = self.slots();
+            let slot = slots.get_mut(id).ok_or_else(|| unknown_model(id))?;
+            if slot.launch.engine != EngineKind::Llamacpp || slot.launch.wrap.is_some() || slot.launch.embedding {
+                return Err(bad_request(format!("{id}: only a llama.cpp chat model this node starts takes a projector")));
+            }
+            if let Some(p) = &mmproj
+                && p.contains(',')
+            {
+                return Err(bad_request(format!("{id}: llama.cpp can't take a path with a comma ({p})")));
+            }
+            slot.launch.mmproj = mmproj.clone();
+            match &slot.running {
+                Some(r) if r.mmproj != mmproj => AdapterChange::NextLoad,
+                _ => AdapterChange::Live,
+            }
+        };
+        Ok(change)
+    }
+
     /// Adds a model the node may load from now on, without a restart (for example one just
     /// downloaded). It starts unloaded. Refused when the id is taken; [`Supervisor::remove_model`]
     /// first to replace one. Emits [`SupervisorEvent::Added`].
@@ -601,7 +629,8 @@ impl Supervisor {
             let mut slots = self.slots();
             let slot = slots.get_mut(id).ok_or_else(|| unknown_model(id))?;
             let has_wanted = wanted.as_ref().is_none_or(|w| slot.running.is_some() && slot.serves(w));
-            if slot.state == ModelState::Ready && has_wanted {
+            let projector_current = slot.launch.wrap.is_some() || slot.running.as_ref().is_none_or(|r| r.mmproj == slot.launch.mmproj);
+            if slot.state == ModelState::Ready && has_wanted && projector_current {
                 return Ok(());
             }
             if force {
@@ -814,6 +843,7 @@ impl Supervisor {
             base,
             adapters: Vec::new(),
             runtime_lora: false,
+            mmproj: None,
             api_key,
             pid: None,
             stop: None,
@@ -920,6 +950,7 @@ impl Supervisor {
                 base: format!("http://127.0.0.1:{port}"),
                 adapters: launch.adapters.clone(),
                 runtime_lora: launch.runtime_lora(),
+                mmproj: launch.mmproj.clone(),
                 api_key: Some(api_key.clone()),
                 pid,
                 stop: Some(stop_tx),

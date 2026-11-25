@@ -2,6 +2,26 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-24: model uploads, peer copies and write policy in models/1 (0.4.4)
+
+What changed (see [CHANGELOG.md](CHANGELOG.md) `Unreleased` and the README section "Uploading your own models"), the node side of the [model upload plan](https://github.com/WeirdBrains/ymir/blob/feature/model-upload-plan/docs/design/model-upload.md), on [weirdnet-model 0.5.3](https://crates.io/crates/weirdnet-model/0.5.3) from crates.io:
+
+- `models/upload.rs`: `ModelsCommand::Upload` (`Upload` → `UploadReady` → `UploadFrame::Chunk` of at most 48 KiB → `Done` → `Uploaded`), resumable from parts staged outside the store (`with_staging`, default `<store>.uploads`; swept after `WritePolicy::part_ttl`, 7 days), `AbandonUpload`. Checks before bytes move (name, size, quota, free space, engine, base), on early bytes (GGUF and safetensors headers, at doubling thresholds; adapters against their base's architecture), and on `Done` (every SHA-256), then `ModelStore::import_files` and serving: models by layout with `add_model` when the node runs that engine, adapters with `add_adapter_live`, projectors with the new `Supervisor::set_projector_live`. The node always records the caller as `uploaded_by`.
+- `ModelsCommand::Fetch`, `PullSource::Peer` / `Pull::from_peer` (`with_peer_dialer`) and `ModelsClient::replicate` for node-to-node copies, resuming like uploads; the provenance travels with the files.
+- `WritePolicy` with its own `Authorize`, `max_upload`, `quota` and `KeepFree` (default the larger of 10% and 20 GiB); `Remove` follows it too. Refusals are `RemoteError::Refused` with a `reason: details` message (`refusal`, `refusal_reason`), so weirdnet-agent needed no change. `ModelsCommand::Disk` / `DiskReport`.
+- `List`: provenance on every entry, safetensors and MLX models, projectors (`StoredEntry::projector`, `base` set to the model using it). `Pulled::revision` and `projector_for`.
+- `ModelLaunch::mmproj` (`with_mmproj`): llama.cpp gets `--mmproj`, `capabilities()` reports vision, and a served model restarts on its next load when its projector changes.
+
+Decisions: m3talsmith chose that any linked device may upload, so the default `WritePolicy` lets in any caller the service's `Authorize` admits (any linked or rostered device under `RosterAuth`); no any-of-roles helper was added to `RosterAuth` (weirdnet-sync device roles are already free-form app strings, and `with_auth` can check one). A second offer of the same files while one is in flight gets `Busy` rather than joining the first. The node does not set the capability record's revision itself: the app passes `Pulled::revision` to `NodeService::set_model_info`.
+
+Release approval: m3talsmith approved publishing 0.4.4 to crates.io once main is green (2026-11-24, 9:21 PM ET), after weirdnet-model 0.5.3 ([v0.5.3](https://github.com/WeirdBrains/weirdnet-model/releases/tag/v0.5.3), published 2026-11-24).
+
+Checks run: the `release.toml` checks (fmt; clippy `-D warnings` and tests with `--all-features`; `cargo doc -D warnings`); `cargo semver-checks` against 0.4.3. New tests over `MemoryDialer`: upload, resume after a dropped stream, serve and provenance in `List`; every refusal reason the node can reach (including a wrong hash and a write `Authorize`); early wrong-architecture refusal of an adapter; adapter and projector uploads served live; a safetensors model served on vLLM; a copy between two services with `replicate`; stale and abandoned parts; `--mmproj` and vision in capabilities.
+
+Not tested: real engines with uploaded files (a real llama-server with `--mmproj`, vLLM with an uploaded safetensors folder, MLX-LM); uploads over a real `weirdnet-net` link and multi-GB files; disk-full during an upload; `no-space` through the network path (tested on the service).
+
+What's left and next: release 0.4.4; Ymir's app wires the upload UI, `set_model_info` with `Pulled::revision`, and its write policy.
+
 ## 2026-11-24: released 0.4.3
 
 What changed: Released with `scripts/weirdnet_release.py` (the reserve command was approved by Michael, 2026-11-24). Release commit [`cbd2a19`](https://github.com/WeirdBrains/weirdnet-backends/commit/cbd2a19), tag [`v0.4.3`](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.3), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.3) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.3). See the entry below and [CHANGELOG.md](CHANGELOG.md). Next: Ymir P3a uses it.

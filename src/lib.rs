@@ -25,7 +25,9 @@
 //!   records, `Load`, `Unload`, `Drain`, `Reserve`/`Release`, `GroupUp`/`GroupDown` and health.
 //! - `models` (feature `node`): `/weirdnet-backends/models/1`, for the owner only: search the
 //!   Hugging Face Hub, see which files fit the node, pull (split GGUFs too) and serve without a
-//!   restart, list and remove; LoRA adapters for a served base too.
+//!   restart, list and remove; LoRA adapters for a served base too. Uploads of model files made
+//!   elsewhere (resumable, checked, with provenance), copies between nodes and a disk report,
+//!   with writes under a [`models::WritePolicy`].
 //!
 //! Platforms: the supervisor runs on Unix and Windows. On Unix an engine gets its own process
 //! group, stops with SIGTERM then SIGKILL after a grace period, and on Linux dies with its

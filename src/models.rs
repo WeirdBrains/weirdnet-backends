@@ -13,6 +13,11 @@
 //! The Hugging Face token never travels: the node uses its own ([`ModelStore::from_env`]), and
 //! nothing in this protocol carries one.
 //!
+//! Models made elsewhere are uploaded ([`ModelsCommand::Upload`], see [`upload`] for the
+//! stream), copied node to node ([`PullSource::Peer`] over [`ModelsCommand::Fetch`]), and
+//! writes follow the service's [`WritePolicy`]. [`ModelsCommand::List`] carries each entry's
+//! provenance; [`ModelsCommand::Disk`] reports free space, limits and usage.
+//!
 //! Each stream carries one [`ModelsRequest`] (CBOR, with the caller's certificate) and its
 //! answers ([`ModelsReply`]): one answer, or for [`ModelsCommand::Pull`] a stream of
 //! [`ModelsReply::Progress`] then [`ModelsReply::Pulled`]. Closing the stream cancels a pull;
@@ -27,16 +32,21 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use weirdnet_agent::remote::{Authorize, Caller, Channel, Dialer, RemoteError, to_cbor};
 use weirdnet_agent::serve::{channel, stream_limits};
+use weirdnet_model::artifact::{ArtifactFile, Provenance};
 use weirdnet_model::fit::{self, Fit, FitOptions};
 use weirdnet_model::gguf::GgufInfo;
 use weirdnet_model::hf::{AdapterFormat, RepoAdapter, RepoModel, Search, SearchHit};
 use weirdnet_model::hw::Budget;
-use weirdnet_model::{Consent, ModelStore, Progress, StoredAdapter, StoredModel, download_adapter, download_parts};
+use weirdnet_model::{Consent, ModelLayout, ModelStore, Progress, StoredAdapter, StoredModel, StoredProjector, download_adapter, download_parts};
 use weirdnet_net::node::{Message, Node};
 
 use crate::engine::{EngineKind, LoraAdapter, ModelLaunch};
 use crate::error::bad_request;
 use crate::supervisor::{AdapterChange, ModelState, Supervisor};
+
+pub mod upload;
+
+pub use upload::{CHUNK, DiskReport, KeepFree, PullSource, Upload, UploadFrame, WritePolicy, refusal, refusal_reason};
 
 /// The protocol id.
 pub const MODELS_PROTOCOL: &str = "/weirdnet-backends/models/1";
@@ -65,11 +75,23 @@ pub struct Pull {
     /// With `serve` it is added to the base ([`Supervisor::add_adapter`]).
     #[serde(default)]
     pub adapter_for: Option<String>,
+    /// Where the files come from (default the Hub, [`Pull::repo`]).
+    #[serde(default)]
+    pub source: PullSource,
+    /// For a projector pulled from a peer: the served llama.cpp model it goes on.
+    #[serde(default)]
+    pub projector_for: Option<String>,
 }
 
 impl Pull {
     pub fn new(repo: impl Into<String>) -> Self {
         Self { repo: repo.into(), ..Default::default() }
+    }
+
+    /// Pull staged upload or uploaded entry `upload` from node `node` ([`PullSource::Peer`]).
+    /// [`Pull::model`] renames it here.
+    pub fn from_peer(node: impl Into<String>, upload: impl Into<String>) -> Self {
+        Self { source: PullSource::Peer { node: node.into(), upload: upload.into() }, ..Default::default() }
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -142,6 +164,23 @@ pub enum ModelsCommand {
         id: String,
         scale: Option<f32>,
     },
+    /// Upload local files ([`Upload`]); the stream continues with [`UploadFrame`]s. Nodes
+    /// before 0.4.4 refuse it.
+    Upload(Box<Upload>),
+    /// Read a finished staged upload (by key) or an uploaded entry (by id): the node answers
+    /// [`ModelsReply::FetchReady`], then [`ModelsReply::Chunk`]s from file `file` at `offset` to
+    /// the end, then [`ModelsReply::FetchDone`]. A `file` past the last lists only.
+    Fetch {
+        upload_or_id: String,
+        file: u32,
+        offset: u64,
+    },
+    /// Free space, limits and usage ([`DiskReport`]).
+    Disk,
+    /// Drop a staged upload's parts by its key ([`Upload::key`]).
+    AbandonUpload {
+        upload: String,
+    },
 }
 
 // The service refuses scales that aren't finite, so equality is total for the commands it runs.
@@ -192,9 +231,16 @@ pub struct Pulled {
     /// For an adapter: the base model it was pulled for.
     #[serde(default)]
     pub adapter_for: Option<String>,
-    /// For an adapter added to its base now: when it serves.
+    /// For an adapter added to its base now (or a projector set on its model): when it serves.
     #[serde(default)]
     pub change: Option<AdapterChange>,
+    /// The content revision of an uploaded or peer-pulled entry (its provenance's), for the
+    /// capability record (`NodeService::set_model_info`) and the answer cache.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// For a projector: the model it was set on.
+    #[serde(default)]
+    pub projector_for: Option<String>,
 }
 
 /// A stored model or LoRA adapter and, when the supervisor serves it, its state.
@@ -207,27 +253,44 @@ pub struct StoredEntry {
     /// An adapter on disk (`None` for a model).
     #[serde(default)]
     pub adapter: Option<StoredAdapter>,
+    /// A projector on disk.
+    #[serde(default)]
+    pub projector: Option<StoredProjector>,
     /// The supervisor's id for it, when served.
     pub served_as: Option<String>,
     pub state: Option<ModelState>,
-    /// For a served adapter: the base model it runs on.
+    /// For a served adapter: the base model it runs on (for a projector in use: its model).
     #[serde(default)]
     pub base: Option<String>,
 }
 
 impl StoredEntry {
-    /// The stored model's or adapter's id.
+    fn new(model: Option<StoredModel>, adapter: Option<StoredAdapter>, projector: Option<StoredProjector>) -> Self {
+        Self { model, adapter, projector, served_as: None, state: None, base: None }
+    }
+
+    /// The stored model's, adapter's or projector's id.
     pub fn id(&self) -> &str {
-        match (&self.model, &self.adapter) {
-            (Some(m), _) => &m.id,
-            (_, Some(a)) => &a.id,
+        match (&self.model, &self.adapter, &self.projector) {
+            (Some(m), _, _) => &m.id,
+            (_, Some(a), _) => &a.id,
+            (_, _, Some(p)) => &p.id,
             _ => "",
         }
     }
 
     /// Bytes on disk.
     pub fn size(&self) -> u64 {
-        self.model.as_ref().map(|m| m.size).or(self.adapter.as_ref().map(|a| a.size)).unwrap_or(0)
+        self.model.as_ref().map(|m| m.size).or(self.adapter.as_ref().map(|a| a.size)).or(self.projector.as_ref().map(|p| p.size)).unwrap_or(0)
+    }
+
+    /// Where it came from, for uploaded (and trained) entries.
+    pub fn provenance(&self) -> Option<&Provenance> {
+        self.model
+            .as_ref()
+            .and_then(|m| m.provenance.as_ref())
+            .or(self.adapter.as_ref().and_then(|a| a.provenance.as_ref()))
+            .or(self.projector.as_ref().and_then(|p| p.provenance.as_ref()))
     }
 }
 
@@ -264,9 +327,39 @@ pub enum ModelsReply {
         scale: Option<f32>,
     },
     Failed(RemoteError),
+    /// [`ModelsCommand::Upload`] admitted: the staging key, the bytes the node already holds of
+    /// each file (send from there), and its free bytes.
+    UploadReady {
+        upload: String,
+        have: Vec<u64>,
+        free: u64,
+    },
+    /// The upload is placed (and served when asked).
+    Uploaded(Pulled),
+    /// [`ModelsCommand::Fetch`]: what will be sent.
+    FetchReady {
+        id: String,
+        files: Vec<ArtifactFile>,
+        provenance: Option<Box<Provenance>>,
+    },
+    /// Bytes of a fetched file.
+    Chunk {
+        file: u32,
+        offset: u64,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// Every fetched byte is sent.
+    FetchDone,
+    Disk(DiskReport),
+    /// [`ModelsCommand::AbandonUpload`] done.
+    Abandoned {
+        upload: String,
+        removed: bool,
+    },
 }
 
-fn model_error(e: weirdnet_model::Error) -> RemoteError {
+pub(crate) fn model_error(e: weirdnet_model::Error) -> RemoteError {
     match e {
         weirdnet_model::Error::BadRepo(_) | weirdnet_model::Error::Consent => bad_request(e.to_string()),
         weirdnet_model::Error::Http(_) => RemoteError::unavailable(e.to_string()),
@@ -288,13 +381,38 @@ pub struct ModelsService {
     budget: Option<Budget>,
     engine: EngineKind,
     pulling: Mutex<HashSet<String>>,
+    write: WritePolicy,
+    staging: std::path::PathBuf,
+    uploading: Mutex<HashSet<String>>,
+    peers: Option<PeerDialer>,
+}
+
+/// The dialer and certificate a node pulls from its peers with.
+type PeerDialer = (Arc<dyn Dialer>, Option<Vec<u8>>);
+
+/// Next to the store directory, named after it with `.uploads` added.
+fn default_staging(store: &ModelStore) -> std::path::PathBuf {
+    let dir = store.dir();
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "models".into());
+    dir.with_file_name(format!("{name}.uploads"))
 }
 
 impl ModelsService {
     /// `store` is where files go (and its Hub and token); new models are served by `supervisor`;
     /// `auth` admits the owner only.
     pub fn new(store: ModelStore, supervisor: Supervisor, auth: Arc<dyn Authorize>) -> Self {
-        Self { store, supervisor, auth, budget: None, engine: EngineKind::Llamacpp, pulling: Mutex::default() }
+        Self {
+            staging: default_staging(&store),
+            store,
+            supervisor,
+            auth,
+            budget: None,
+            engine: EngineKind::Llamacpp,
+            pulling: Mutex::default(),
+            write: WritePolicy::default(),
+            uploading: Mutex::default(),
+            peers: None,
+        }
     }
 
     /// The memory budget fits are measured against (`weirdnet_model::hw::budget`).
@@ -438,12 +556,26 @@ impl ModelsService {
                 loaded = true;
             }
         }
-        Ok(Pulled { id: adapter.id, repo: pull.repo.clone(), files, size: adapter.size, served, loaded, adapter_for: Some(base.into()), change })
+        Ok(Pulled {
+            id: adapter.id,
+            repo: pull.repo.clone(),
+            files,
+            size: adapter.size,
+            served,
+            loaded,
+            adapter_for: Some(base.into()),
+            change,
+            revision: None,
+            projector_for: None,
+        })
     }
 
     /// Downloads `pull` (resuming a partial file) and serves it if asked. `progress` returns
     /// `false` to cancel. One pull per model at a time.
     pub async fn pull(&self, pull: &Pull, progress: impl FnMut(Progress) -> bool + Send + 'static) -> Result<Pulled, RemoteError> {
+        if let PullSource::Peer { node, upload } = &pull.source {
+            return self.pull_peer(pull, node, upload, progress).await;
+        }
         if let Some(base) = &pull.adapter_for {
             return self.pull_adapter(pull, base, progress).await;
         }
@@ -491,7 +623,18 @@ impl ModelsService {
                 loaded = true;
             }
         }
-        Ok(Pulled { id: model.id, repo: pull.repo.clone(), files, size: model.size, served, loaded, adapter_for: None, change: None })
+        Ok(Pulled {
+            id: model.id,
+            repo: pull.repo.clone(),
+            files,
+            size: model.size,
+            served,
+            loaded,
+            adapter_for: None,
+            change: None,
+            revision: None,
+            projector_for: None,
+        })
     }
 
     /// The supervisor id serving the file at `path`, if any.
@@ -500,12 +643,17 @@ impl ModelsService {
         self.supervisor.launches().into_iter().find(|l| l.wrap.is_none() && l.source == path).map(|l| l.id)
     }
 
-    /// The models and then the adapters on disk, with the supervisor's state for the served ones.
+    /// The models (GGUF, then safetensors and MLX directories), the adapters and then the
+    /// projectors on disk, with their provenance and the supervisor's state for the served ones.
     pub fn list(&self) -> Vec<StoredEntry> {
-        let models = self.store.list().into_iter().map(|model| {
-            let served_as = self.served_as(&self.store.dir().join(&model.files[0]));
+        let models = self.store.list().into_iter().chain(self.store.dir_models()).map(|model| {
+            let path = match model.layout {
+                ModelLayout::Gguf => self.store.dir().join(&model.files[0]),
+                layout => self.store.model_dir(layout, &model.id).unwrap_or_default(),
+            };
+            let served_as = self.served_as(&path);
             let state = served_as.as_deref().and_then(|id| self.supervisor.state(id));
-            StoredEntry { model: Some(model), adapter: None, served_as, state, base: None }
+            StoredEntry { served_as, state, ..StoredEntry::new(Some(model), None, None) }
         });
         let launches = self.supervisor.launches();
         let adapters = self.store.adapters().into_iter().map(|a| {
@@ -513,9 +661,14 @@ impl ModelsService {
             let served = launches.iter().find_map(|l| l.adapters.iter().find(|x| x.path == path).map(|x| (x.id.clone(), l.id.clone())));
             let (served_as, base) = served.unzip();
             let state = served_as.as_deref().and_then(|id| self.supervisor.state(id));
-            StoredEntry { model: None, adapter: Some(a), served_as, state, base }
+            StoredEntry { served_as, state, base, ..StoredEntry::new(None, Some(a), None) }
         });
-        models.chain(adapters).collect()
+        let projectors = self.store.projectors().into_iter().map(|p| {
+            let path = p.path.display().to_string();
+            let base = launches.iter().find(|l| l.mmproj.as_deref() == Some(path.as_str())).map(|l| l.id.clone());
+            StoredEntry { base, ..StoredEntry::new(None, None, Some(p)) }
+        });
+        models.chain(adapters).chain(projectors).collect()
     }
 
     /// Stops serving `id` (a stored model's id, or the supervisor id serving it) and deletes its
@@ -532,6 +685,12 @@ impl ModelsService {
             return Err(RemoteError::Busy);
         }
         let store = self.store.clone();
+        if let Some(projector) = entry.projector.clone() {
+            if let Some(model) = &entry.base {
+                self.supervisor.set_projector_live(model, None).await?;
+            }
+            return blocking(move || store.remove_projector(&projector)).await;
+        }
         if let Some(adapter) = entry.adapter.clone() {
             if let (Some(served), Some(base)) = (&entry.served_as, &entry.base) {
                 self.supervisor.remove_adapter_live(base, served).await?;
@@ -596,7 +755,12 @@ impl ModelsService {
                 self.set_adapter_scale(&id, scale)?;
                 ModelsReply::AdapterScaled { id, scale }
             }
-            ModelsCommand::Pull(_) => unreachable!("handled by serve"),
+            ModelsCommand::Disk => ModelsReply::Disk(self.disk()?),
+            ModelsCommand::AbandonUpload { upload } => {
+                let removed = self.abandon_upload(&upload)?;
+                ModelsReply::Abandoned { upload, removed }
+            }
+            ModelsCommand::Pull(_) | ModelsCommand::Upload(_) | ModelsCommand::Fetch { .. } => unreachable!("handled by serve"),
         })
     }
 
@@ -612,6 +776,15 @@ impl ModelsService {
         }
         let pull = match msg.command {
             ModelsCommand::Pull(p) => p,
+            ModelsCommand::Upload(u) => return self.serve_upload(&mut ch, &caller, *u).await,
+            ModelsCommand::Fetch { upload_or_id, file, offset } => return self.serve_fetch(&mut ch, &caller, &upload_or_id, file, offset).await,
+            write @ (ModelsCommand::Remove { .. } | ModelsCommand::AbandonUpload { .. }) => {
+                let answer = match self.authorize_write(&caller) {
+                    Ok(()) => self.run(write).await.unwrap_or_else(ModelsReply::Failed),
+                    Err(e) => ModelsReply::Failed(e),
+                };
+                return ch.send_cbor(&answer).await;
+            }
             other => {
                 let answer = self.run(other).await.unwrap_or_else(ModelsReply::Failed);
                 return ch.send_cbor(&answer).await;
@@ -721,7 +894,7 @@ impl ModelsClient {
         }
     }
 
-    fn unexpected(what: &str, got: ModelsReply) -> RemoteError {
+    pub(crate) fn unexpected(what: &str, got: ModelsReply) -> RemoteError {
         RemoteError::protocol(format!("expected {what}, got {got:?}"))
     }
 

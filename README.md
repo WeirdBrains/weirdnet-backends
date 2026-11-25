@@ -65,6 +65,48 @@ let fits = client.files(&model_node, "unsloth/Qwen3-8B-GGUF", Some(8192), Some(2
 let pulled = client.pull(&model_node, Pull::new("unsloth/Qwen3-8B-GGUF").serving(true), |p| println!("{}/{}", p.done, p.total)).await?;
 ```
 
+## Uploading your own models (models/1)
+
+Model files made elsewhere (a fine-tune, a merge, a quantization) go to a node with
+`ModelsCommand::Upload`. The client reads them with
+[`weirdnet-model`](https://crates.io/crates/weirdnet-model) `artifact::inspect` (GGUF models,
+split models, LoRA adapters and vision projectors; Hugging Face safetensors and MLX model
+folders; PEFT adapters), which hashes every file and refuses pickles, code and symlinks. The
+node checks names, size, free space, its engine and (for adapters) the base before any bytes
+move, checks headers as the first bytes arrive, and checks every SHA-256 at the end before
+placing the files with `ModelStore::import`. Uploads go in 48 KiB chunks and resume: a closed
+stream leaves the parts staged next to the store (kept 7 days by default), and the next upload of
+the same files sends only the rest. Each stored entry keeps a `provenance.json` (origin, license,
+base, dataset, trainer, who uploaded it and when), which `List` returns.
+
+`serving()` hands a model to the supervisor (GGUF on llama.cpp, safetensors on vLLM, MLX on
+MLX-LM, when the node runs that engine), an adapter to its base (`with_adapter_for`, live where
+the engine allows) and a projector to its llama.cpp model (`with_projector_for`, which gives it
+image input). `Pulled::revision` is the files' content revision for the node's capability record.
+
+Writes (upload, remove, peer copies) follow the service's `WritePolicy`: by default any caller
+the service's `Authorize` admits, such as any linked device under `RosterAuth`; `with_auth` adds
+a separate check (for example a device role). It also sets a largest upload, a total quota for
+uploads and how much disk stays free (`KeepFree`, by default the larger of 10% and 20 GiB).
+Refusals carry a stable reason (`refusal_reason`: `exists`, `too-big`, `no-space`, `quota`,
+`wrong-engine`, `wrong-arch`, `no-base`, `bad-name`, `bad-format`, `not-adapter`, `not-allowed`,
+`checksum`, `not-found`). `Disk` reports free space, the limits and what uploads use.
+
+A node copies an upload from another node with `Pull::from_peer(node, upload)` (over
+`ModelsCommand::Fetch`, resuming like an upload), given `ModelsService::with_peer_dialer`.
+After one upload, `ModelsClient::replicate` has the other nodes pull it from that node.
+
+```rust
+use weirdnet_backends::models::Upload;
+use weirdnet_model::{Provenance, artifact::{ORIGIN_UPLOAD, inspect}};
+
+let files = vec![PathBuf::from("support-r3-Q4_K_M.gguf")];
+let found = inspect(&files)?;
+let upload = Upload::new("support-r3", &found, Provenance::new(ORIGIN_UPLOAD).with_license("apache-2.0")).serving();
+let pulled = client.upload(&model_node, upload.clone(), &files, |p| println!("{}/{}", p.done, p.total)).await?;
+let copies = client.replicate(&model_node, &other_nodes, &upload, |node, p| println!("{node}: {}", p.done)).await;
+```
+
 ## LoRA adapters
 
 A `ModelLaunch` can carry LoRA adapters (`LoraAdapter::new(id, path)`, optionally

@@ -142,6 +142,9 @@ impl EngineConfig {
                 if model.embedding {
                     cmd.arg("--embedding");
                 }
+                if let Some(mmproj) = &model.mmproj {
+                    cmd.args(["--mmproj", mmproj]);
+                }
                 // Adapters load at scale 0; each request names its own (`"lora"` in the body).
                 // `--lora` rather than `--lora-scaled FNAME:SCALE`, which splits on `:` and so
                 // breaks on Windows paths; the scale is sent per request anyway.
@@ -258,6 +261,10 @@ pub struct ModelLaunch {
     /// at run time without it. llama.cpp ignores it: llama-server loads adapter files only at start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lora_slots: Option<u32>,
+    /// llama.cpp only: a multimodal projector GGUF (`--mmproj`), so the model takes images
+    /// (and audio, when the projector has it). See [`crate::Supervisor::set_projector_live`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmproj: Option<String>,
 }
 
 /// A stock OpenAI-compatible server the node forwards to but doesn't own.
@@ -325,7 +332,14 @@ impl ModelLaunch {
             wrap: None,
             adapters: Vec::new(),
             lora_slots: None,
+            mmproj: None,
         }
+    }
+
+    /// See [`ModelLaunch::mmproj`].
+    pub fn with_mmproj(mut self, path: impl Into<String>) -> Self {
+        self.mmproj = Some(path.into());
+        self
     }
 
     /// See [`ModelLaunch::lora_slots`].
@@ -431,9 +445,9 @@ impl ModelLaunch {
     }
 
     /// What this model takes. Embedding models only embed (and can't run on MLX-LM at all). A
-    /// llama.cpp model takes images and audio when it has a multimodal projector (`--mmproj` in
-    /// `extra_args`); the projector decides which, and llama-server refuses what it lacks. vLLM
-    /// and MLX-LM models are text only here.
+    /// llama.cpp model takes images and audio when it has a multimodal projector
+    /// ([`ModelLaunch::mmproj`], or `--mmproj` in `extra_args`); the projector decides which, and
+    /// llama-server refuses what it lacks. vLLM and MLX-LM models are text only here.
     pub fn capabilities(&self) -> Capabilities {
         let own = if self.embedding {
             Capabilities::embeddings()
@@ -445,7 +459,7 @@ impl ModelLaunch {
     }
 
     fn has_projector(&self) -> bool {
-        self.extra_args.iter().any(|a| matches!(a.split('=').next(), Some("--mmproj" | "-mm" | "--mmproj-url" | "-mmu")))
+        self.mmproj.is_some() || self.extra_args.iter().any(|a| matches!(a.split('=').next(), Some("--mmproj" | "-mm" | "--mmproj-url" | "-mmu")))
     }
 }
 
@@ -487,6 +501,18 @@ pub(crate) mod tests {
         assert!(a.windows(2).any(|w| w == ["--alias", "qwen3-8b"]));
         assert!(a.windows(2).any(|w| w == ["--parallel", "2"]));
         assert!(!a.iter().any(|x| x == "k"), "the key stays out of argv");
+    }
+
+    #[test]
+    fn a_projector_goes_on_the_command_and_into_capabilities() {
+        let m = ModelLaunch::new("v", EngineKind::Llamacpp, "/m/v.gguf");
+        assert!(!m.capabilities().vision);
+        let m = m.with_mmproj("/m/mmproj.gguf");
+        let a = args(&EngineConfig::llamacpp("/bin/llama-server").command(&m, 4321, "k"));
+        assert!(a.windows(2).any(|w| w == ["--mmproj", "/m/mmproj.gguf"]));
+        assert!(m.capabilities().vision);
+        let back: ModelLaunch = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(back.mmproj.as_deref(), Some("/m/mmproj.gguf"));
     }
 
     /// A GGUF header with string, u32 and f32 values (enough for adapter checks).

@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- models/1 uploads: `ModelsCommand::Upload` with `Upload` and `UploadFrame` (48 KiB `CHUNK`s), `ModelsReply::UploadReady` and `Uploaded`, and `ModelsClient::upload`. The node checks names, size, free space, engine and base up front, headers as the first bytes arrive and every SHA-256 at the end, then places the files with weirdnet-model 0.5.3 `ModelStore::import` and can serve them: GGUF, safetensors and MLX models, adapters (live on their base) and vision projectors. Closed uploads resume from staged parts (`with_staging`, swept after `WritePolicy::part_ttl`); `ModelsCommand::AbandonUpload` drops them.
+- Copies between nodes: `ModelsCommand::Fetch` with `FetchReady`, `Chunk` and `FetchDone`, `PullSource::Peer` and `Pull::from_peer` (`ModelsService::with_peer_dialer`), and `ModelsClient::replicate`.
+- `WritePolicy` (a separate write `Authorize`, `max_upload`, `quota`, `KeepFree`) for uploads, removes and peer copies; by default any caller the service admits may write. Stable refusal reasons in `refusal` with `refusal_reason`.
+- `ModelsCommand::Disk` and `DiskReport`, `ModelsClient::disk`.
+- `StoredEntry::projector` and `provenance()`; `List` includes safetensors and MLX models and projectors. `Pulled::revision` and `projector_for`; `Pull::source` and `projector_for`.
+- `ModelLaunch::mmproj` (`with_mmproj`): llama.cpp starts with `--mmproj`, and `capabilities()` reports image input. `Supervisor::set_projector_live`.
+
+### Changed
+
+- Needs weirdnet-model 0.5.3.
+- `Remove` follows the `WritePolicy`. A served model is reloaded when its projector changes. Nodes before 0.4.4 refuse the new commands.
+
 ## [0.4.3] - 2026-11-24
 
 ### Added
