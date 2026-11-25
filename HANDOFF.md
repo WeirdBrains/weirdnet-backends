@@ -2,6 +2,20 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-25: released 0.4.6 (weirdnet-sync 0.8)
+
+What changed: released with `scripts/weirdnet_release.py --patch` from [`fca59b6`](https://github.com/WeirdBrains/weirdnet-backends/commit/fca59b6ef455b7c402b723a11d9d3f048b106557) (CI green, Linux and Windows). Release commit [`e1e5e06`](https://github.com/WeirdBrains/weirdnet-backends/commit/e1e5e0689ffe268e3d344753d5c1407e147c4cbe) (CI green), tag [`v0.4.6`](https://github.com/WeirdBrains/weirdnet-backends/tree/v0.4.6), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.6) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.6).
+
+Release basis: m3talsmith's 2026-11-25 decision to accept weirdnet-sync 0.8 here, under his standing rule of 2026-11-24 for additive Weirdnet patch releases. `cargo semver-checks --all-features` against 0.4.5: no semver update required.
+
+Checks run: CI (including the sync 0.5.3 and 0.7.1 steps), the release script's checks and `cargo publish` verification. A scratch app using [weirdnet-openai](https://crates.io/crates/weirdnet-openai) 0.2.3, [weirdnet-semcache](https://crates.io/crates/weirdnet-semcache) 0.2.1, [weirdnet-alerts](https://crates.io/crates/weirdnet-alerts) 0.2.2 (`backends`), [weirdnet-model](https://crates.io/crates/weirdnet-model) 0.5.3 (`agent`), [weirdnet-mcp](https://crates.io/crates/weirdnet-mcp) 0.6.1 (`agent`), agent 0.5.5 and this release resolves to one weirdnet-sync 0.8.0 and builds.
+
+Note for apps that stay on sync 0.7: a fresh resolve gives this crate 0.8.0 next to the app's 0.7.x (Cargo picks the newest version in a range across 0.x lines). Unify with `cargo update -p weirdnet-sync@0.8.0 --precise 0.7.1`; checked in the same scratch app.
+
+Not tested: no live nodes on mixed sync versions.
+
+What's left and next: nothing for this change.
+
 ## 2026-11-25: accept weirdnet-sync 0.8 (for 0.4.6)
 
 What changed: the `weirdnet-sync` requirement (the `node` feature and the dev-dependency) widens from `>=0.5, <0.8` to `>=0.5, <0.9`, and `weirdnet-agent` goes from `0.5.2` to `0.5.5`, the first [weirdnet-agent](https://crates.io/crates/weirdnet-agent/0.5.5) that accepts sync 0.8 too. No code changes were needed. Cargo.lock now holds weirdnet-sync 0.8.0, weirdnet-net 0.8.2, weirdnet-keys 0.1.2 and weirdnet-agent 0.5.5 (the yanked sync 0.7.0, net 0.8.0 and keys 0.1.1 are gone). CI also tests sync 0.5.3 and 0.7.1. Commit SHA: see the commit that adds this entry.
