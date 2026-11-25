@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-25: model origin and license in capability records (for 0.4.5)
+
+What changed ([`a7d406a`](https://github.com/WeirdBrains/weirdnet-backends/commit/a7d406a7c6dfc072ce45bb4b42859c7addba3d28), branch `feat/model-origin`, merged to main with `--no-ff`): `ModelEntry::origin` and `ModelEntry::license` (`Option<String>`, serde default, left out of the record when unset) and `NodeService::set_model_origin(model, origin, license)`, which keeps the revision and quantization from `set_model_info` (whose signature is unchanged) and pushes a fresh record. Origins are the [weirdnet-model](https://crates.io/crates/weirdnet-model) 0.5.3 provenance ones (`hub`, `upload`, `train`), and licenses are SPDX ids or `unknown`. Asked for by [Ymir](https://github.com/WeirdBrains/ymir) so its catalog ([weirdnet-agent](https://crates.io/crates/weirdnet-agent) 0.5.4 `CatalogModel::origin`/`license`) can say where a model came from. `ModelEntry` is `#[non_exhaustive]`, so this is additive: a patch release, 0.4.5.
+
+Checks run: `cargo fmt --check`, `cargo build`, `cargo clippy --all-targets` with and without `--all-features` (`-D warnings`), `cargo test --all-features` (42 unit, 12 adapters, 2 node; the node/1 round trip now checks that records without an origin look as before, that `set_model_origin` reaches the signed record with the revision kept, that a reader shaped like a 0.4.4 record still reads it, and that `set_model_info` keeps the origin), `cargo doc --no-deps --all-features` with `-D warnings`, and `cargo semver-checks` against 0.4.4 (no semver update required).
+
+Not tested: no live model node; the models/1 upload path does not call `set_model_origin` by itself (an app reads `StoredEntry::provenance()` and sets it).
+
+Release basis: m3talsmith's standing rule of 2026-11-24 allows additive Weirdnet patch releases without asking; minor bumps still need his OK.
+
+What's left and next: release 0.4.5 once CI on main is green; Ymir calls `set_model_origin` from each stored entry's provenance and copies the fields into its catalog entries.
+
 ## 2026-11-24: release 0.4.4
 
 What changed: release `v0.4.4` (tag [v0.4.4](https://github.com/WeirdBrains/weirdnet-backends/releases/tag/v0.4.4), the `release: v0.4.4` commit right after this entry). It ships the models/1 upload work below (`eecf197`) on weirdnet-model 0.5.3 to [crates.io](https://crates.io/crates/weirdnet-backends/0.4.4); docs at [docs.rs](https://docs.rs/weirdnet-backends/0.4.4).
