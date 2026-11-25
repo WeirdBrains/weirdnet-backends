@@ -67,6 +67,18 @@ impl GroupWorkers for Workers {
     }
 }
 
+/// A capability record as a node before 0.4.5 reads it: no origin or license.
+#[derive(Deserialize)]
+struct OldCapability {
+    models: Vec<OldEntry>,
+}
+
+#[derive(Deserialize)]
+struct OldEntry {
+    status: weirdnet_backends::ModelStatus,
+    revision: Option<String>,
+}
+
 /// The next record satisfying `want`.
 async fn until(sub: &mut Subscription, want: impl Fn(&Capability) -> bool) -> Capability {
     let wait = async {
@@ -121,6 +133,23 @@ fn node1_round_trip() {
         assert_eq!(state(&cap, "chat"), ModelState::Unloaded);
         let entry = cap.models.iter().find(|m| m.status.id == "chat").unwrap();
         assert_eq!((entry.revision.as_deref(), entry.quant.as_deref()), (Some("abc123"), Some("Q4_K_M")));
+        assert_eq!((entry.origin.as_deref(), entry.license.as_deref()), (None, None));
+        let plain = weirdnet_agent::remote::to_cbor(&service.capability()).unwrap();
+        assert!(!plain.windows(6).any(|w| w == b"origin") && !plain.windows(7).any(|w| w == b"license"), "records look as before");
+
+        // Origin and license: pushed as a new record, revision and quantization kept.
+        service.set_model_origin("chat", Some("upload".into()), Some("Apache-2.0".into()));
+        let cap = client.record(&peer).await.unwrap();
+        let entry = cap.models.iter().find(|m| m.status.id == "chat").unwrap();
+        assert_eq!(
+            (entry.origin.as_deref(), entry.license.as_deref(), entry.revision.as_deref(), entry.quant.as_deref()),
+            (Some("upload"), Some("Apache-2.0"), Some("abc123"), Some("Q4_K_M"))
+        );
+        // An older reader (no origin or license fields) still reads the record.
+        let old: OldCapability = weirdnet_agent::remote::from_cbor(&weirdnet_agent::remote::to_cbor(&cap).unwrap()).unwrap();
+        assert_eq!(old.models.iter().find(|m| m.status.id == "chat").and_then(|m| m.revision.as_deref()), Some("abc123"));
+        service.set_model_info("chat", Some("abc123".into()), Some("Q4_K_M".into()));
+        assert_eq!(service.capability().models[0].origin.as_deref(), Some("upload"), "set_model_info keeps the origin");
         assert_eq!(cap.engines, vec![EngineKind::Llamacpp]);
         assert_eq!(cap.load.slots, 2);
         let mut sub = client.subscribe(&peer).await.unwrap();

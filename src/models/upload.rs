@@ -1644,9 +1644,12 @@ mod tests {
 
         let file = local(tmp.path(), "src/m-Q8_0.gguf", &model_gguf(100));
         let found = inspect(std::slice::from_ref(&file)).unwrap();
-        c.upload("node", Upload::new("m", &found, Provenance::new(ORIGIN_UPLOAD)).serving(), &[file], |_| {}).await.unwrap();
+        c.upload("node", Upload::new("m", &found, Provenance::new(ORIGIN_UPLOAD).with_license("Apache-2.0")).serving(), &[file], |_| {})
+            .await
+            .unwrap();
         let cap = info.capability();
         let entry = cap.models.iter().find(|m| m.status.id == "m").unwrap();
         assert_eq!((entry.revision.as_deref(), entry.quant.as_deref()), (Some(found.revision.as_str()), Some("Q8_0")));
+        assert_eq!((entry.origin.as_deref(), entry.license.as_deref()), (Some("upload"), Some("Apache-2.0")));
     }
 }

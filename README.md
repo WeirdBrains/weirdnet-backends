@@ -101,7 +101,7 @@ and Hub pulls. The hook gets a `Placed` with the stored entry as `List` shows it
 included), the `Pulled` answer with its revision, and how it arrived (`PlacedVia`), so an app
 can record the entry without a protocol of its own. `with_node_info(node)` keeps a
 `NodeService`'s capability record current (`set_model_info` with the revision and a GGUF
-file's quantization). Hooks run before the client's answer and should be quick.
+file's quantization, and `set_model_origin` with the provenance's origin and license). Hooks run before the client's answer and should be quick.
 
 ```rust
 use weirdnet_backends::models::Upload;
@@ -202,7 +202,8 @@ How inference nodes drive model nodes over [`weirdnet-net`](https://crates.io/cr
 - **Capability records**, pushed to every subscriber: hardware and memory budget
   ([`weirdnet-model`](https://crates.io/crates/weirdnet-model) `hw`), engines, every
   configured model (state, revision, quantization, context and slot limits, load-time
-  estimate, measured prefill/decode speed and time to first token), load (queued, active,
+  estimate, measured prefill/decode speed and time to first token, and, when set with
+  `NodeService::set_model_origin`, its origin (`hub`, `upload` or `train`) and license), load (queued, active,
   slots, in flight), warm prefix hashes, swap groups, draining, its reservation, whether the node takes
   group jobs and its private links (`NodeService::set_links`, `link::local_links`: address,
   class, interface, nominal and declared speed; public and CGNAT addresses are never

@@ -72,6 +72,19 @@ impl Placed {
         self.entry.served_as.as_deref().or(self.pulled.served.then_some(self.pulled.id.as_str()))
     }
 
+    /// Its origin (`hub`, `upload`, `train` or an app's own) and license, for the capability
+    /// record: the provenance's, else `upload` or `hub` by how it arrived (a peer copy without
+    /// provenance has none).
+    pub fn origin_and_license(&self) -> (Option<String>, Option<String>) {
+        let p = self.provenance();
+        let origin = p.map(|p| p.origin.clone()).filter(|o| !o.is_empty()).or_else(|| match self.via {
+            PlacedVia::Upload => Some(weirdnet_model::artifact::ORIGIN_UPLOAD.into()),
+            PlacedVia::Hub { .. } => Some(weirdnet_model::artifact::ORIGIN_HUB.into()),
+            _ => None,
+        });
+        (origin, p.and_then(|p| p.license.clone()))
+    }
+
     /// The quantization in a GGUF model's file name (`Q4_K_M`), if any.
     pub fn quant(&self) -> Option<String> {
         let model = self.entry.model.as_ref().filter(|m| m.layout == ModelLayout::Gguf)?;
@@ -94,12 +107,18 @@ impl ModelsService {
     /// Keeps `node`'s capability record current: each placed entry with a revision (uploads and
     /// peer copies) goes to [`NodeService::set_model_info`] under the id it is served as (its
     /// store id when it is not served), with the quantization from a GGUF model's file name.
-    /// Hub pulls carry no revision and leave the record alone.
+    /// Hub pulls carry no revision and leave those alone. Each placed entry's origin (its
+    /// provenance's, else `upload` or `hub` by how it arrived) and license go to
+    /// [`NodeService::set_model_origin`].
     pub fn with_node_info(self, node: Arc<NodeService>) -> Self {
         self.on_placed(move |p| {
             if let Some(revision) = p.revision() {
                 let id = p.served_as().unwrap_or(p.id()).to_string();
                 node.set_model_info(&id, Some(revision.to_string()), p.quant());
+            }
+            let (origin, license) = p.origin_and_license();
+            if origin.is_some() || license.is_some() {
+                node.set_model_origin(p.served_as().unwrap_or(p.id()), origin, license);
             }
         })
     }
