@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-11-26
+
 ### Added
 
 - `WritePolicy::uploads` and `with_uploads(false)` refuse uploads alone with `not-allowed`; pulls and removals keep working (default on).
