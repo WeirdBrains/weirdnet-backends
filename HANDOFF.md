@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-26: released 0.4.9 (measured limits and transcription)
+
+What changed: `scripts/weirdnet_release.py cut --patch --skip-crates` from [`d3ceb15`](https://github.com/WeirdBrains/weirdnet-backends/commit/d3ceb154dabab2df0cd453a92c6078d1e9e62745) (CI green, Linux and Windows). Release commit [`c820a8c`](https://github.com/WeirdBrains/weirdnet-backends/commit/c820a8cf2b59414565e4007e52351b09ed58c506) (CI green), tag [`v0.4.9`](https://github.com/WeirdBrains/weirdnet-backends/tree/v0.4.9), then `scripts/weirdnet_release.py crates --tag v0.4.9`: on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.9), docs on [docs.rs](https://docs.rs/weirdnet-backends/0.4.9). The site is updated on [net.weirdbrains.com](https://net.weirdbrains.com/crates/backends).
+
+Release basis: m3talsmith's standing approval for the video-upload work and additive Weirdnet patch releases. `cargo semver-checks` against 0.4.8 (default and all features): no semver update required.
+
+Checks run: the release script's checks, CI on the release commit and `cargo publish` verification; the rest is in the entry below.
+
+Not tested: as below.
+
+What's left and next: Ymir Milestone 2 wiring (transcription route and measured limits).
+
 ## 2026-11-26: measured limits at load and transcription (for 0.4.9)
 
 What changed: [Ymir](https://github.com/WeirdBrains/ymir) video Milestone 2 support (`docs/design/video.md`), on [weirdnet-agent](https://crates.io/crates/weirdnet-agent/0.5.8) 0.5.8 and [weirdnet-model](https://crates.io/crates/weirdnet-model/0.5.4) 0.5.4 (now with its `agent` feature).
