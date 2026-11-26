@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-26: released 0.4.8 (media and request limits)
+
+What changed: release commit [`b7a6b65`](https://github.com/WeirdBrains/weirdnet-backends/commit/b7a6b654041f1cdb32d511c4117b8367eb95995a) (CI green), tag [`v0.4.8`](https://github.com/WeirdBrains/weirdnet-backends/tree/v0.4.8), then `scripts/weirdnet_release.py crates --tag v0.4.8`: on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.8), docs on [docs.rs](https://docs.rs/weirdnet-backends/0.4.8). A scratch app with weirdnet-agent 0.5.7 (`pool`, `serve`, `jobs`), weirdnet-backends 0.4.8 (`node`), weirdnet-openai 0.2.4 and weirdnet-sync 0.8.5 builds and runs on weirdnet-net 0.8.2 and 0.8.3 with one copy of each weirdnet crate. The site is updated on [net.weirdbrains.com](https://net.weirdbrains.com).
+
+Checks run: the release script's checks, CI on the release commit and `cargo publish` verification; the rest is in the entry below.
+
+Not tested: as below.
+
+What's left and next: nothing for this release.
+
 ## 2026-11-26: per-model media and request limits (for 0.4.8)
 
 What changed: [`4f4188a`](https://github.com/WeirdBrains/weirdnet-backends/commit/4f4188a227bf3ee9af6be8f3e1ab2a152db2b4e5) adds `Capabilities::limits` (a [weirdnet-agent](https://crates.io/crates/weirdnet-agent) 0.5.7 `MediaLimits`) with `Capabilities::with_limits` and `Capabilities::apply_to(CatalogModel)`; `ModelLaunch::limits` and `ModelLaunch::with_limits` for limits the operator sets (carried into `ModelLaunch::capabilities`); `ModelStatus::limits()` and `ModelStatus::apply_to(CatalogModel)` (inputs, limits and the configured context window). `Capabilities::intersect` keeps the stricter limits, and a limit only one side knows. Unknown limits are left out of records, so capability records and launches look as before and older nodes read new ones. `weirdnet-agent` floor raised to 0.5.7.
