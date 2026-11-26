@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-26: released 0.4.7 (upload switch, StoredEntry constructors)
+
+What changed: released with `scripts/weirdnet_release.py --patch` from [`0c64ca5`](https://github.com/WeirdBrains/weirdnet-backends/commit/0c64ca5f6b40a7a40b73faee4724920dc7eb011b) (CI green, Linux and Windows). Release commit [`6c4eacd`](https://github.com/WeirdBrains/weirdnet-backends/commit/6c4eacdecfbc359b6ab826a03beb8845cb54eedd) (CI green), tag [`v0.4.7`](https://github.com/WeirdBrains/weirdnet-backends/tree/v0.4.7), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.7) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.7).
+
+Checks run: the release script's checks and `cargo publish` verification. The `weirdnet-sync` requirement is already `>=0.5, <0.9` and `weirdnet-agent = "0.5.5"` takes 0.5.6. A scratch app with weirdnet-backends 0.4.7 (`node`), [weirdnet-agent](https://crates.io/crates/weirdnet-agent/0.5.6) 0.5.6 (`pool`, `serve`, `jobs`), weirdnet-sync 0.8.2 and weirdnet-net `=0.8.2` builds, with one weirdnet-sync (0.8.2) in the tree.
+
+Not tested: no live nodes; macOS.
+
+What's left and next: nothing for this change.
+
 ## 2026-11-26: upload switch and StoredEntry constructors (for 0.4.7)
 
 What changed: two additive requests from the [Ymir](https://github.com/WeirdBrains/ymir) upload work.
