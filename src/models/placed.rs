@@ -146,9 +146,9 @@ impl ModelsService {
             _ => false,
         });
         found.or_else(|| match imported? {
-            Imported::Model(m) => Some(StoredEntry::new(Some(m.clone()), None, None)),
-            Imported::Adapter(a) => Some(StoredEntry::new(None, Some(a.clone()), None)),
-            Imported::Projector(p) => Some(StoredEntry::new(None, None, Some(p.clone()))),
+            Imported::Model(m) => Some(StoredEntry::from_model(m.clone())),
+            Imported::Adapter(a) => Some(StoredEntry::from_adapter(a.clone())),
+            Imported::Projector(p) => Some(StoredEntry::from_projector(p.clone())),
             _ => None,
         })
     }

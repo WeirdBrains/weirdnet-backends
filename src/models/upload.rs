@@ -65,7 +65,8 @@ pub mod refusal {
     pub const BAD_FORMAT: &str = "bad-format";
     /// Offered as an adapter, but the file is not a LoRA adapter.
     pub const NOT_ADAPTER: &str = "not-adapter";
-    /// The write policy's authorizer refused the caller.
+    /// The write policy's authorizer refused the caller, or uploads are off on the node
+    /// ([`WritePolicy::uploads`](super::WritePolicy::uploads)).
     pub const NOT_ALLOWED: &str = "not-allowed";
     /// A file's bytes don't match its SHA-256 (the parts are dropped; send it again).
     pub const CHECKSUM: &str = "checksum";
@@ -229,14 +230,18 @@ impl KeepFree {
 
 /// Rules for writes ([`ModelsCommand::Upload`], [`ModelsCommand::Fetch`] and
 /// [`ModelsCommand::Remove`]). The default lets in every caller the service admits (the owner's
-/// linked devices, decided by m3talsmith on 2026-11-24), keeps [`KeepFree::default`] free, sets
-/// no size limit or quota, and drops abandoned parts after 7 days.
+/// linked devices, decided by m3talsmith on 2026-11-24), takes uploads, keeps
+/// [`KeepFree::default`] free, sets no size limit or quota, and drops abandoned parts after 7 days.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct WritePolicy {
     /// A second authorizer for writes, after the service's own (for example
     /// `RosterAuth::require_roles` with a write role). `None`: the service's own decides.
     pub auth: Option<Arc<dyn Authorize>>,
+    /// Whether the node takes [`ModelsCommand::Upload`]s (default `true`). When `false`, uploads
+    /// are refused with [`refusal::NOT_ALLOWED`] while pulls (including
+    /// [`PullSource::Peer`]) and removals keep working.
+    pub uploads: bool,
     /// Bytes per upload at most.
     pub max_upload: Option<u64>,
     /// Bytes of everything uploaded (provenance origin `upload`) on the node at most.
@@ -248,7 +253,14 @@ pub struct WritePolicy {
 
 impl Default for WritePolicy {
     fn default() -> Self {
-        Self { auth: None, max_upload: None, quota: None, keep_free: KeepFree::default(), part_ttl: Duration::from_secs(7 * 24 * 3600) }
+        Self {
+            auth: None,
+            uploads: true,
+            max_upload: None,
+            quota: None,
+            keep_free: KeepFree::default(),
+            part_ttl: Duration::from_secs(7 * 24 * 3600),
+        }
     }
 }
 
@@ -256,6 +268,7 @@ impl std::fmt::Debug for WritePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WritePolicy")
             .field("auth", &self.auth.as_ref().map(|_| "<authorizer>"))
+            .field("uploads", &self.uploads)
             .field("max_upload", &self.max_upload)
             .field("quota", &self.quota)
             .field("keep_free", &self.keep_free)
@@ -267,6 +280,12 @@ impl std::fmt::Debug for WritePolicy {
 impl WritePolicy {
     pub fn with_auth(mut self, auth: Arc<dyn Authorize>) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    /// Turns uploads on or off ([`WritePolicy::uploads`]); pulls and removals are unaffected.
+    pub fn with_uploads(mut self, on: bool) -> Self {
+        self.uploads = on;
         self
     }
 
@@ -893,6 +912,9 @@ impl ModelsService {
         if let Err(e) = self.authorize_write(caller) {
             return ch.send_cbor(&ModelsReply::Failed(e)).await;
         }
+        if !self.write.uploads {
+            return ch.send_cbor(&ModelsReply::Failed(refuse(refusal::NOT_ALLOWED, "uploads are off on this node"))).await;
+        }
         // The node records who sent it; the client cannot say.
         upload.provenance.uploaded_by = Some(caller.peer.clone());
         upload.provenance.uploaded_ms.get_or_insert_with(now_ms);
@@ -1516,6 +1538,65 @@ mod tests {
         assert_eq!(refusal_reason(&err), Some(refusal::NOT_FOUND));
         let err = owner.pull("a", Pull::from_peer("b", "m-r1"), |_| {}).await.unwrap_err();
         assert!(matches!(err, RemoteError::Unavailable { .. }), "a has no peer dialer: {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uploads_can_be_turned_off_alone() {
+        assert!(WritePolicy::default().uploads, "uploads are on by default");
+        let a = node(EngineKind::Llamacpp, WritePolicy::default());
+        let to_a = MemoryDialer::new();
+        route(&to_a, "a", a.svc.clone(), "node-b");
+        let b = node_with(EngineKind::Llamacpp, WritePolicy::default().with_uploads(false), |s| s.with_peer_dialer(Arc::new(to_a), None));
+        assert!(!b.svc.write_policy().uploads);
+        let owner = MemoryDialer::new();
+        route(&owner, "a", a.svc.clone(), "laptop");
+        route(&owner, "b", b.svc.clone(), "laptop");
+        let owner = ModelsClient::new(Arc::new(owner));
+
+        let src = tempfile::tempdir().unwrap();
+        let file = local(src.path(), "m.gguf", &model_gguf(2 * CHUNK + 7));
+        let found = inspect(std::slice::from_ref(&file)).unwrap();
+        let up = Upload::new("m-r1", &found, Provenance::new(ORIGIN_UPLOAD)).serving();
+        // The default policy still takes uploads.
+        owner.upload("a", up.clone(), std::slice::from_ref(&file), |_| {}).await.unwrap();
+
+        // Uploads are refused as not-allowed, not too-big, and nothing is staged.
+        assert_eq!(reason(owner.upload("b", up.clone(), std::slice::from_ref(&file), |_| {}).await), refusal::NOT_ALLOWED);
+        assert_eq!(owner.disk("b").await.unwrap().staged, 0);
+
+        // Pulls from another node and removals still work.
+        let pulled = owner.pull("b", Pull::from_peer("a", "m-r1"), |_| {}).await.unwrap();
+        assert_eq!((pulled.id.as_str(), pulled.size), ("m-r1", found.size()));
+        assert!(b.svc.list().iter().any(|e| e.id() == "m-r1"));
+        assert_eq!(owner.remove("b", "m-r1").await.unwrap(), found.size());
+        assert!(b.svc.list().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entries_are_built_and_listed_without_serde() {
+        use crate::models::StoredEntry;
+        let n = node(EngineKind::Llamacpp, WritePolicy::default());
+        let src = tempfile::tempdir().unwrap();
+        let file = local(src.path(), "m.gguf", &model_gguf(2000));
+        let found = inspect(std::slice::from_ref(&file)).unwrap();
+        client(&n, "laptop").upload("node", Upload::new("m", &found, Provenance::new(ORIGIN_UPLOAD)).serving(), &[file], |_| {}).await.unwrap();
+
+        // Listing a store without the service: the same entries, without the served state.
+        let store = n.svc.store();
+        let listed = StoredEntry::list(store);
+        let served = n.svc.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].id(), listed[0].size(), listed[0].served_as.as_deref()), ("m", found.size(), None));
+        assert_eq!(served[0].served_as.as_deref(), Some("m"));
+        assert_eq!(listed[0].provenance(), served[0].provenance());
+        assert_eq!(StoredEntry { served_as: None, state: None, ..served[0].clone() }, listed[0]);
+
+        // Built by hand.
+        let model = store.list().remove(0);
+        let entry = StoredEntry::from_model(model.clone()).with_served("m", None).with_base("b");
+        assert_eq!((entry.id(), entry.served_as.as_deref(), entry.base.as_deref()), ("m", Some("m"), Some("b")));
+        assert_eq!(StoredEntry::from(model.clone()), StoredEntry::from_model(model));
+        assert!(StoredEntry::list(&ModelStore::new(n.root.join("empty"))).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

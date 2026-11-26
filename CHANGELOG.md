@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- `WritePolicy::uploads` and `with_uploads(false)` refuse uploads alone with `not-allowed`; pulls and removals keep working (default on).
+- `StoredEntry::list(&ModelStore)` lists a store without a running service; `StoredEntry::from_model`, `from_adapter`, `from_projector` (and `From`), `with_served` and `with_base` build entries without serde.
+
 ## [0.4.6] - 2026-11-25
 
 ### Changed

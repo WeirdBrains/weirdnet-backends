@@ -272,6 +272,46 @@ impl StoredEntry {
         Self { model, adapter, projector, served_as: None, state: None, base: None }
     }
 
+    /// An entry for a stored model, not served (also `StoredEntry::from(model)`).
+    pub fn from_model(model: StoredModel) -> Self {
+        Self::new(Some(model), None, None)
+    }
+
+    /// An entry for a stored adapter, not served (also `StoredEntry::from(adapter)`).
+    pub fn from_adapter(adapter: StoredAdapter) -> Self {
+        Self::new(None, Some(adapter), None)
+    }
+
+    /// An entry for a stored projector, not in use (also `StoredEntry::from(projector)`).
+    pub fn from_projector(projector: StoredProjector) -> Self {
+        Self::new(None, None, Some(projector))
+    }
+
+    /// Sets the supervisor's id for it and that model's state ([`StoredEntry::served_as`],
+    /// [`StoredEntry::state`]).
+    pub fn with_served(mut self, served_as: impl Into<String>, state: Option<ModelState>) -> Self {
+        self.served_as = Some(served_as.into());
+        self.state = state;
+        self
+    }
+
+    /// Sets the base model it runs on, or for a projector the model using it
+    /// ([`StoredEntry::base`]).
+    pub fn with_base(mut self, base: impl Into<String>) -> Self {
+        self.base = Some(base.into());
+        self
+    }
+
+    /// Everything in `store` as entries, not served: the models (GGUF, then safetensors and MLX
+    /// directories), then the adapters, then the projectors, in the order
+    /// [`ModelsService::list`] uses. For listing a store without a running service.
+    pub fn list(store: &ModelStore) -> Vec<StoredEntry> {
+        let models = store.list().into_iter().chain(store.dir_models()).map(Self::from_model);
+        let adapters = store.adapters().into_iter().map(Self::from_adapter);
+        let projectors = store.projectors().into_iter().map(Self::from_projector);
+        models.chain(adapters).chain(projectors).collect()
+    }
+
     /// The stored model's, adapter's or projector's id.
     pub fn id(&self) -> &str {
         match (&self.model, &self.adapter, &self.projector) {
@@ -294,6 +334,24 @@ impl StoredEntry {
             .and_then(|m| m.provenance.as_ref())
             .or(self.adapter.as_ref().and_then(|a| a.provenance.as_ref()))
             .or(self.projector.as_ref().and_then(|p| p.provenance.as_ref()))
+    }
+}
+
+impl From<StoredModel> for StoredEntry {
+    fn from(model: StoredModel) -> Self {
+        Self::from_model(model)
+    }
+}
+
+impl From<StoredAdapter> for StoredEntry {
+    fn from(adapter: StoredAdapter) -> Self {
+        Self::from_adapter(adapter)
+    }
+}
+
+impl From<StoredProjector> for StoredEntry {
+    fn from(projector: StoredProjector) -> Self {
+        Self::from_projector(projector)
     }
 }
 
@@ -655,29 +713,30 @@ impl ModelsService {
     /// The models (GGUF, then safetensors and MLX directories), the adapters and then the
     /// projectors on disk, with their provenance and the supervisor's state for the served ones.
     pub fn list(&self) -> Vec<StoredEntry> {
-        let models = self.store.list().into_iter().chain(self.store.dir_models()).map(|model| {
-            let path = match model.layout {
-                ModelLayout::Gguf => self.store.dir().join(&model.files[0]),
-                layout => self.store.model_dir(layout, &model.id).unwrap_or_default(),
-            };
-            let served_as = self.served_as(&path);
-            let state = served_as.as_deref().and_then(|id| self.supervisor.state(id));
-            StoredEntry { served_as, state, ..StoredEntry::new(Some(model), None, None) }
-        });
         let launches = self.supervisor.launches();
-        let adapters = self.store.adapters().into_iter().map(|a| {
-            let path = a.path.display().to_string();
-            let served = launches.iter().find_map(|l| l.adapters.iter().find(|x| x.path == path).map(|x| (x.id.clone(), l.id.clone())));
-            let (served_as, base) = served.unzip();
-            let state = served_as.as_deref().and_then(|id| self.supervisor.state(id));
-            StoredEntry { served_as, state, base, ..StoredEntry::new(None, Some(a), None) }
-        });
-        let projectors = self.store.projectors().into_iter().map(|p| {
-            let path = p.path.display().to_string();
-            let base = launches.iter().find(|l| l.mmproj.as_deref() == Some(path.as_str())).map(|l| l.id.clone());
-            StoredEntry { base, ..StoredEntry::new(None, None, Some(p)) }
-        });
-        models.chain(adapters).chain(projectors).collect()
+        let state = |id: &Option<String>| id.as_deref().and_then(|id| self.supervisor.state(id));
+        StoredEntry::list(&self.store)
+            .into_iter()
+            .map(|mut e| {
+                if let Some(model) = &e.model {
+                    let path = match model.layout {
+                        ModelLayout::Gguf => self.store.dir().join(&model.files[0]),
+                        layout => self.store.model_dir(layout, &model.id).unwrap_or_default(),
+                    };
+                    e.served_as = self.served_as(&path);
+                    e.state = state(&e.served_as);
+                } else if let Some(a) = &e.adapter {
+                    let path = a.path.display().to_string();
+                    let served = launches.iter().find_map(|l| l.adapters.iter().find(|x| x.path == path).map(|x| (x.id.clone(), l.id.clone())));
+                    (e.served_as, e.base) = served.unzip();
+                    e.state = state(&e.served_as);
+                } else if let Some(p) = &e.projector {
+                    let path = p.path.display().to_string();
+                    e.base = launches.iter().find(|l| l.mmproj.as_deref() == Some(path.as_str())).map(|l| l.id.clone());
+                }
+                e
+            })
+            .collect()
     }
 
     /// Stops serving `id` (a stored model's id, or the supervisor id serving it) and deletes its

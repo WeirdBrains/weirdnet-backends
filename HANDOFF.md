@@ -2,6 +2,19 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-26: upload switch and StoredEntry constructors (for 0.4.7)
+
+What changed: two additive requests from the [Ymir](https://github.com/WeirdBrains/ymir) upload work.
+- `WritePolicy::uploads` (default `true`) with `WritePolicy::with_uploads(bool)`: when off, `ModelsCommand::Upload` is refused with `refusal::NOT_ALLOWED` ("uploads are off on this node") before anything is staged, while pulls (Hub and `Pull::from_peer`), `Remove` and `AbandonUpload` keep working. Before, only `auth` (all writes) or `max_upload = Some(0)` (reads as `too-big`) could stop uploads.
+- `StoredEntry::from_model`, `from_adapter`, `from_projector`, `From<StoredModel | StoredAdapter | StoredProjector>`, `with_served(served_as, state)`, `with_base(base)` and `StoredEntry::list(&ModelStore)`, which lists a store as entries (not served) in the order `ModelsService::list` uses. `ModelsService::list` now builds on it. Callers no longer need serde to build entries.
+Commit SHA: see the commit that adds this entry.
+
+Checks run: `cargo fmt --check`; `cargo clippy --all-targets --all-features -D warnings`; `cargo test` (default) and `cargo test --all-features` (47 unit tests with the new `uploads_can_be_turned_off_alone` and `entries_are_built_and_listed_without_serde`); `RUSTDOCFLAGS=-D warnings cargo doc --no-deps --all-features`; `cargo semver-checks --all-features` against 0.4.6.
+
+Not tested: no live nodes; macOS (CI covers Linux and Windows).
+
+What's left and next: release 0.4.7.
+
 ## 2026-11-25: released 0.4.6 (weirdnet-sync 0.8)
 
 What changed: released with `scripts/weirdnet_release.py --patch` from [`fca59b6`](https://github.com/WeirdBrains/weirdnet-backends/commit/fca59b6ef455b7c402b723a11d9d3f048b106557) (CI green, Linux and Windows). Release commit [`e1e5e06`](https://github.com/WeirdBrains/weirdnet-backends/commit/e1e5e0689ffe268e3d344753d5c1407e147c4cbe) (CI green), tag [`v0.4.6`](https://github.com/WeirdBrains/weirdnet-backends/tree/v0.4.6), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.6) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.6).

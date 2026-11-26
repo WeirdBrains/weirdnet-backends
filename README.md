@@ -78,6 +78,9 @@ placing the files with `ModelStore::import`. Uploads go in 48 KiB chunks and res
 stream leaves the parts staged next to the store (kept 7 days by default), and the next upload of
 the same files sends only the rest. Each stored entry keeps a `provenance.json` (origin, license,
 base, dataset, trainer, who uploaded it and when), which `List` returns.
+`StoredEntry::list(&store)` lists a `ModelStore` the same way without a running service (not
+served), and `StoredEntry::from_model`, `from_adapter` and `from_projector` (or `From`), with
+`with_served` and `with_base`, build entries without serde.
 
 `serving()` hands a model to the supervisor (GGUF on llama.cpp, safetensors on vLLM, MLX on
 MLX-LM, when the node runs that engine), an adapter to its base (`with_adapter_for`, live where
@@ -86,7 +89,8 @@ image input). `Pulled::revision` is the files' content revision for the node's c
 
 Writes (upload, remove, peer copies) follow the service's `WritePolicy`: by default any caller
 the service's `Authorize` admits, such as any linked device under `RosterAuth`; `with_auth` adds
-a separate check (for example a device role). It also sets a largest upload, a total quota for
+a separate check (for example a device role). `with_uploads(false)` refuses uploads alone
+(`not-allowed`) while pulls, peer copies and removals keep working. It also sets a largest upload, a total quota for
 uploads and how much disk stays free (`KeepFree`, by default the larger of 10% and 20 GiB).
 Refusals carry a stable reason (`refusal_reason`: `exists`, `too-big`, `no-space`, `quota`,
 `wrong-engine`, `wrong-arch`, `no-base`, `bad-name`, `bad-format`, `not-adapter`, `not-allowed`,
