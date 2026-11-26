@@ -165,6 +165,28 @@ pub struct ModelStatus {
     pub base: Option<String>,
 }
 
+impl ModelStatus {
+    /// Its media and request limits ([`Capabilities::limits`]); unknown when the record has no
+    /// capabilities (nodes before 0.1.3) or the node knows none.
+    pub fn limits(&self) -> weirdnet_agent::MediaLimits {
+        self.capabilities.map(|c| c.limits).unwrap_or_default()
+    }
+
+    /// `entry` with this row's inputs, limits and context window (the configured
+    /// `--ctx-size`, when set) filled in from the record; `entry`'s own values stay where the
+    /// record has none.
+    pub fn apply_to(&self, entry: weirdnet_agent::remote::catalog::CatalogModel) -> weirdnet_agent::remote::catalog::CatalogModel {
+        let entry = match self.capabilities {
+            Some(c) => c.apply_to(entry),
+            None => entry,
+        };
+        match self.context {
+            Some(ctx) => entry.with_context(ctx),
+            None => entry,
+        }
+    }
+}
+
 /// When an adapter added with [`Supervisor::add_adapter`] or [`Supervisor::add_adapter_live`]
 /// can serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1501,6 +1523,33 @@ fn trim(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_status_limits_propagate_and_old_rows_read() {
+        use weirdnet_agent::remote::catalog::{CatalogModel, ModelState as CatalogState, Purpose};
+        use weirdnet_agent::{MediaLimits, Modalities};
+        // A row as a 0.4.7 node sends it: no limits anywhere.
+        let old = r#"{"id":"g","engine":"llamacpp","state":{"state":"ready"},"in_flight":0,"swap_group":null,"embedding":false,"pid":null,
+            "last_load_secs":null,"size_bytes":null,"wrapped":false,"crashes":0,"context":8192,"slots":null,
+            "capabilities":{"chat":true,"embeddings":false,"vision":true,"audio":false},"base":null}"#;
+        let row: ModelStatus = serde_json::from_str(old).unwrap();
+        assert!(row.limits().is_unknown());
+        let e = row.apply_to(CatalogModel::new("g", Purpose::Chat, CatalogState::Warm));
+        assert_eq!((e.inputs, e.context), (Modalities::VISION, Some(8192)));
+        assert!(e.limits.is_unknown());
+        assert!(!serde_json::to_string(&row).unwrap().contains("limits"));
+
+        let limits = MediaLimits::new().with_max_images(3).with_image_tokens(576).with_max_request_bytes(8 << 20);
+        let launch = ModelLaunch::new("g", EngineKind::Llamacpp, "/m/g.gguf").with_mmproj("/p/mm.gguf").with_limits(limits);
+        let mut row = row;
+        row.capabilities = Some(launch.capabilities());
+        let back: ModelStatus = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(back.limits(), limits);
+        let e = back.apply_to(CatalogModel::new("g", Purpose::Chat, CatalogState::Warm));
+        assert_eq!((e.limits, e.inputs), (limits, Modalities::new(true, true)));
+        let none = ModelStatus { capabilities: None, ..back };
+        assert!(none.limits().is_unknown());
+    }
 
     #[test]
     fn the_engine_is_recognised_by_its_model_list() {

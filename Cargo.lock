@@ -3760,7 +3760,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4320,9 +4320,9 @@ dependencies = [
 
 [[package]]
 name = "weirdnet-agent"
-version = "0.5.5"
+version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de873b1ca27ff3789437adb62b5fc29bb759b057a7614a51864ffc6bd58e5242"
+checksum = "5369631584d4d6b9fe3d4003a8aff5b9ebe956a691c40295d4a62b52733d7967"
 dependencies = [
  "async-trait",
  "cbor4ii",

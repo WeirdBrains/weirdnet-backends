@@ -15,6 +15,12 @@ the engines and serves them to inference nodes; what to load is always the calle
   models that can't serve them. `ModelLaunch::capabilities` derives it: embedding models only
   embed; llama.cpp models with a multimodal projector (`--mmproj`) take images and audio;
   vLLM and MLX-LM models are text only.
+  `Capabilities::limits` carries the model's media and request limits (a
+  [weirdnet-agent](https://crates.io/crates/weirdnet-agent) `MediaLimits`: images per request,
+  image token cost and edge, audio length and token rate, request bytes), each absent when
+  unknown: the operator sets them with `ModelLaunch::with_limits`, `intersect` keeps the
+  stricter ones, and `Capabilities::apply_to` / `ModelStatus::apply_to` fill a catalog/1 entry's
+  inputs, limits and context window.
 - `Supervisor`: load and unload with draining, **swap groups** (loading one model of a group
   unloads the others), **idle unload**, crash restarts with exponential backoff and crash-loop
   detection, `SupervisorEvent`s, per-model logs; chat, completion and embedding forwarding.

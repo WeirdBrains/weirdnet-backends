@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use weirdnet_agent::Modalities;
+use weirdnet_agent::remote::catalog::CatalogModel;
+use weirdnet_agent::{MediaLimits, Modalities};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,14 +33,18 @@ impl EngineKind {
     /// The most this engine can serve. A model may serve less (see [`ModelLaunch::capabilities`]).
     pub fn capabilities(self) -> Capabilities {
         match self {
-            EngineKind::Llamacpp | EngineKind::Vllm => Capabilities { chat: true, embeddings: true, vision: true, audio: true },
+            EngineKind::Llamacpp | EngineKind::Vllm => {
+                Capabilities { chat: true, embeddings: true, vision: true, audio: true, ..Capabilities::default() }
+            }
             EngineKind::Mlx => Capabilities::text(),
         }
     }
 }
 
 /// What a model takes, so routing can keep requests off models that can't serve them: images
-/// or audio off text-only models, embeddings off chat-only engines such as MLX-LM.
+/// or audio off text-only models, embeddings off chat-only engines such as MLX-LM. With its
+/// media and request [`limits`](Capabilities::limits) when known, so clients can size images,
+/// audio and whole requests (catalog/1 [`CatalogModel::limits`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Capabilities {
@@ -51,6 +56,12 @@ pub struct Capabilities {
     pub vision: bool,
     /// Audio content parts.
     pub audio: bool,
+    /// Media and request limits (images per request, image token cost and edge, audio length and
+    /// token rate, request bytes), each absent when unknown, never defaulted: measured when the
+    /// model loads or set by the operator ([`ModelLaunch::limits`]). Left out of records when none
+    /// is known; absent in records from nodes before 0.4.8.
+    #[serde(default, skip_serializing_if = "MediaLimits::is_unknown")]
+    pub limits: MediaLimits,
 }
 
 impl Capabilities {
@@ -74,6 +85,18 @@ impl Capabilities {
         self
     }
 
+    /// See [`Capabilities::limits`].
+    pub fn with_limits(mut self, limits: MediaLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// A catalog/1 entry with these inputs and limits: `entry` with [`CatalogModel::inputs`]
+    /// and [`CatalogModel::limits`] set from these (the rest of `entry` is kept).
+    pub fn apply_to(&self, entry: CatalogModel) -> CatalogModel {
+        entry.with_inputs(self.inputs()).with_limits(self.limits)
+    }
+
     /// The inputs beyond text, as `weirdnet-agent` [`Modalities`] (what catalog entries carry).
     pub fn inputs(&self) -> Modalities {
         Modalities::new(self.vision, self.audio)
@@ -84,13 +107,15 @@ impl Capabilities {
         self.inputs().lacking(needed)
     }
 
-    /// What both allow.
+    /// What both allow, with the stricter limits ([`MediaLimits::tightest`]: a limit only one
+    /// side knows is kept).
     pub fn intersect(self, other: Self) -> Self {
         Self {
             chat: self.chat && other.chat,
             embeddings: self.embeddings && other.embeddings,
             vision: self.vision && other.vision,
             audio: self.audio && other.audio,
+            limits: self.limits.tightest(other.limits),
         }
     }
 }
@@ -265,6 +290,11 @@ pub struct ModelLaunch {
     /// (and audio, when the projector has it). See [`crate::Supervisor::set_projector_live`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mmproj: Option<String>,
+    /// Media and request limits the operator sets for this model on this hardware (such as
+    /// `image_tokens` or `max_images` a node can't measure); they become
+    /// [`Capabilities::limits`]. Unknown by default, and never defaulted in code.
+    #[serde(default, skip_serializing_if = "MediaLimits::is_unknown")]
+    pub limits: MediaLimits,
 }
 
 /// A stock OpenAI-compatible server the node forwards to but doesn't own.
@@ -333,7 +363,14 @@ impl ModelLaunch {
             adapters: Vec::new(),
             lora_slots: None,
             mmproj: None,
+            limits: MediaLimits::UNKNOWN,
         }
+    }
+
+    /// See [`ModelLaunch::limits`].
+    pub fn with_limits(mut self, limits: MediaLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// See [`ModelLaunch::mmproj`].
@@ -447,7 +484,8 @@ impl ModelLaunch {
     /// What this model takes. Embedding models only embed (and can't run on MLX-LM at all). A
     /// llama.cpp model takes images and audio when it has a multimodal projector
     /// ([`ModelLaunch::mmproj`], or `--mmproj` in `extra_args`); the projector decides which, and
-    /// llama-server refuses what it lacks. vLLM and MLX-LM models are text only here.
+    /// llama-server refuses what it lacks. vLLM and MLX-LM models are text only here. The
+    /// [`limits`](ModelLaunch::limits) are carried over as set.
     pub fn capabilities(&self) -> Capabilities {
         let own = if self.embedding {
             Capabilities::embeddings()
@@ -455,7 +493,7 @@ impl ModelLaunch {
             let media = self.engine == EngineKind::Llamacpp && self.has_projector();
             Capabilities::text().with_vision(media).with_audio(media)
         };
-        own.intersect(self.engine.capabilities())
+        own.with_limits(self.limits).intersect(self.engine.capabilities())
     }
 
     fn has_projector(&self) -> bool {
@@ -710,5 +748,47 @@ pub(crate) mod tests {
         let v = ModelLaunch::new("v", EngineKind::Vllm, "Qwen/Qwen3-8B");
         assert_eq!(v.capabilities(), Capabilities::text());
         assert!(!EngineKind::Mlx.capabilities().embeddings && EngineKind::Llamacpp.capabilities().vision);
+    }
+
+    fn limits() -> MediaLimits {
+        MediaLimits::new().with_max_images(4).with_image_tokens(256).with_image_edge(896).with_audio_max_seconds(30).with_max_request_bytes(16 << 20)
+    }
+
+    #[test]
+    fn limits_reach_capabilities_and_catalog_entries() {
+        assert!(Capabilities::text().limits.is_unknown());
+        let l = ModelLaunch::new("g", EngineKind::Llamacpp, "/m/g.gguf").with_mmproj("/p/mm.gguf").with_limits(limits());
+        let c = l.capabilities();
+        assert_eq!(c.limits, limits(), "the operator's limits survive the engine's (which knows none)");
+        assert!(c.vision && c.audio);
+        let both = c.intersect(Capabilities::text().with_vision(true).with_limits(MediaLimits::new().with_max_images(2)));
+        assert_eq!((both.limits.max_images, both.limits.image_tokens), (Some(2), Some(256)), "stricter wins, one-sided kept");
+        use weirdnet_agent::remote::catalog::{ModelState as CatalogState, Purpose};
+        let entry = c.apply_to(CatalogModel::new("g", Purpose::Chat, CatalogState::Warm).with_replicas(1));
+        assert_eq!((entry.inputs, entry.limits, entry.replicas), (Modalities::new(true, true), limits(), 1));
+        // Through the wire and back.
+        let wire: CatalogModel = serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(wire.limits, limits());
+    }
+
+    #[test]
+    fn records_without_limits_read_as_before() {
+        let old = r#"{"chat":true,"embeddings":false,"vision":true,"audio":false}"#;
+        let c: Capabilities = serde_json::from_str(old).unwrap();
+        assert_eq!(c, Capabilities::text().with_vision(true));
+        assert!(c.limits.is_unknown());
+        assert_eq!(serde_json::to_string(&c).unwrap(), old, "no limits: the record looks as before");
+        let with: Capabilities = serde_json::from_str(&serde_json::to_string(&c.with_limits(limits())).unwrap()).unwrap();
+        assert_eq!(with.limits, limits());
+        let cbor = weirdnet_agent::remote::to_cbor(&c.with_limits(limits())).unwrap();
+        assert_eq!(weirdnet_agent::remote::from_cbor::<Capabilities>(&cbor).unwrap(), c.with_limits(limits()));
+        assert_eq!(weirdnet_agent::remote::from_cbor::<Capabilities>(&weirdnet_agent::remote::to_cbor(&c).unwrap()).unwrap(), c);
+        let launch = ModelLaunch::new("g", EngineKind::Llamacpp, "/m/g.gguf");
+        let json = serde_json::to_string(&launch).unwrap();
+        assert!(!json.contains("limits"));
+        let back: ModelLaunch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, launch);
+        let with = launch.with_limits(limits());
+        assert_eq!(serde_json::from_str::<ModelLaunch>(&serde_json::to_string(&with).unwrap()).unwrap(), with);
     }
 }
