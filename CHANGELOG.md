@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-11-26
+
 ### Added
 
 - Per-model media and request limits: `Capabilities::limits`, `ModelLaunch::limits` and `with_limits`, `ModelStatus::limits`, and `apply_to` on `Capabilities` and `ModelStatus` to fill catalog/1 entries. Needs weirdnet-agent 0.5.7.
