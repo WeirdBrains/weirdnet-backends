@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Limits measured at load: the supervisor reads a llama.cpp model's GGUF and projector headers (weirdnet-model 0.5.4 `limits::measure`, with `--image-max-tokens` over a size-dependent projector's cap) and the engine's context per sequence (llama-server `/props`, vLLM `/v1/models`); the operator's `ModelLaunch::limits` win field by field and unknown figures stay absent. `Supervisor::measured_limits`, `Supervisor::set_limits_store` (records kept next to the model files in a `ModelStore` and read back after a restart), `ModelStatus::context_tokens` (preferred by `ModelStatus::apply_to` over the configured context).
+- Transcription: `ModelLaunch::transcribe` and `with_transcribe`, `Capabilities::transcribe`, `with_transcribe` and `purpose`, `ModelLaunch::purpose`, `ModelStatus::purpose` and `catalog_model` (catalog/1 `Purpose::Transcribe`); `Supervisor::transcribe` (llama.cpp: chat with a base64 `input_audio` part; vLLM: `/v1/audio/transcriptions`); `ModelHost` serves infer/2 `Transcribe` (`InferHost::open_transcribe`) with `EngineModel` as the `TranscribeBackend`. Needs weirdnet-agent 0.5.8 and weirdnet-model 0.5.4 (`agent` feature).
+
 ## [0.4.8] - 2026-11-26
 
 ### Added

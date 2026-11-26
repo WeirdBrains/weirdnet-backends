@@ -2402,6 +2402,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
 
 [[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
+
+[[package]]
 name = "minijinja"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3167,6 +3177,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "serde",
@@ -4047,6 +4058,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4320,9 +4337,9 @@ dependencies = [
 
 [[package]]
 name = "weirdnet-agent"
-version = "0.5.7"
+version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5369631584d4d6b9fe3d4003a8aff5b9ebe956a691c40295d4a62b52733d7967"
+checksum = "5d083cbbfbc7460a49c3db2a0c0af638b98d3ab5bddecd02d13afdb7f043d615"
 dependencies = [
  "async-trait",
  "cbor4ii",
@@ -4342,6 +4359,7 @@ version = "0.4.8"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "futures",
  "getrandom 0.3.4",
  "libc",
@@ -4388,10 +4406,11 @@ dependencies = [
 
 [[package]]
 name = "weirdnet-model"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4750fdc0b5125596bfab08f0460c2cbab50b0a28e6f62a7d391e3365e89b9002"
+checksum = "42b843a8e21a5f89cd596bc72c9af4c923b1cbe2e7b32424999177e231f9605e"
 dependencies = [
+ "async-trait",
  "dirs",
  "fs4",
  "minijinja",
@@ -4402,6 +4421,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ureq",
+ "weirdnet-agent",
 ]
 
 [[package]]

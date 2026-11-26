@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use weirdnet_agent::remote::catalog::CatalogModel;
+use weirdnet_agent::remote::catalog::{CatalogModel, Purpose};
 use weirdnet_agent::{MediaLimits, Modalities};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -34,7 +34,7 @@ impl EngineKind {
     pub fn capabilities(self) -> Capabilities {
         match self {
             EngineKind::Llamacpp | EngineKind::Vllm => {
-                Capabilities { chat: true, embeddings: true, vision: true, audio: true, ..Capabilities::default() }
+                Capabilities { chat: true, embeddings: true, vision: true, audio: true, transcribe: true, ..Capabilities::default() }
             }
             EngineKind::Mlx => Capabilities::text(),
         }
@@ -62,6 +62,13 @@ pub struct Capabilities {
     /// is known; absent in records from nodes before 0.4.8.
     #[serde(default, skip_serializing_if = "MediaLimits::is_unknown")]
     pub limits: MediaLimits,
+    /// Speech to text (infer/2 `Transcribe`): the model has the transcription role
+    /// ([`ModelLaunch::transcribe`]) and its engine can serve it (llama.cpp with an audio
+    /// projector, vLLM's `/v1/audio/transcriptions`). Its catalog/1 purpose is
+    /// [`Purpose::Transcribe`]. Left out of
+    /// records when false; absent (false) in records from nodes before 0.4.9.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcribe: bool,
 }
 
 impl Capabilities {
@@ -91,10 +98,30 @@ impl Capabilities {
         self
     }
 
+    /// See [`Capabilities::transcribe`].
+    pub fn with_transcribe(mut self, on: bool) -> Self {
+        self.transcribe = on;
+        self
+    }
+
     /// A catalog/1 entry with these inputs and limits: `entry` with [`CatalogModel::inputs`]
     /// and [`CatalogModel::limits`] set from these (the rest of `entry` is kept).
     pub fn apply_to(&self, entry: CatalogModel) -> CatalogModel {
         entry.with_inputs(self.inputs()).with_limits(self.limits)
+    }
+
+    /// The catalog/1 purpose of a model with these capabilities: [`Purpose::Embedding`] for an
+    /// embedding model (`embedding`, as [`ModelLaunch::embedding`] or [`ModelStatus::embedding`](crate::ModelStatus::embedding)),
+    /// else [`Purpose::Transcribe`] when it [transcribes](Capabilities::transcribe), else
+    /// [`Purpose::Chat`].
+    pub fn purpose(&self, embedding: bool) -> Purpose {
+        if embedding {
+            Purpose::Embedding
+        } else if self.transcribe {
+            Purpose::Transcribe
+        } else {
+            Purpose::Chat
+        }
     }
 
     /// The inputs beyond text, as `weirdnet-agent` [`Modalities`] (what catalog entries carry).
@@ -116,6 +143,7 @@ impl Capabilities {
             vision: self.vision && other.vision,
             audio: self.audio && other.audio,
             limits: self.limits.tightest(other.limits),
+            transcribe: self.transcribe && other.transcribe,
         }
     }
 }
@@ -295,6 +323,12 @@ pub struct ModelLaunch {
     /// [`Capabilities::limits`]. Unknown by default, and never defaulted in code.
     #[serde(default, skip_serializing_if = "MediaLimits::is_unknown")]
     pub limits: MediaLimits,
+    /// The transcription role: a speech-to-text model (Voxtral through llama.cpp with its audio
+    /// projector, Whisper through vLLM), served over infer/2 `Transcribe` and published with
+    /// [`Purpose::Transcribe`]. See
+    /// [`ModelLaunch::capabilities`] for when the engine can serve it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcribe: bool,
 }
 
 /// A stock OpenAI-compatible server the node forwards to but doesn't own.
@@ -364,7 +398,20 @@ impl ModelLaunch {
             lora_slots: None,
             mmproj: None,
             limits: MediaLimits::UNKNOWN,
+            transcribe: false,
         }
+    }
+
+    /// See [`ModelLaunch::transcribe`].
+    pub fn with_transcribe(mut self, on: bool) -> Self {
+        self.transcribe = on;
+        self
+    }
+
+    /// Its catalog/1 purpose: [`Purpose::Embedding`] for an embedding model, [`Purpose::Transcribe`]
+    /// when it transcribes here ([`Capabilities::transcribe`]), else [`Purpose::Chat`].
+    pub fn purpose(&self) -> Purpose {
+        self.capabilities().purpose(self.embedding)
     }
 
     /// See [`ModelLaunch::limits`].
@@ -485,13 +532,17 @@ impl ModelLaunch {
     /// llama.cpp model takes images and audio when it has a multimodal projector
     /// ([`ModelLaunch::mmproj`], or `--mmproj` in `extra_args`); the projector decides which, and
     /// llama-server refuses what it lacks. vLLM and MLX-LM models are text only here. The
-    /// [`limits`](ModelLaunch::limits) are carried over as set.
+    /// [`limits`](ModelLaunch::limits) are carried over as set. A model with the
+    /// [`transcribe`](ModelLaunch::transcribe) role transcribes on llama.cpp with a projector
+    /// (an audio one: llama-server refuses audio otherwise) and on vLLM; never as an embedding
+    /// model or on MLX-LM.
     pub fn capabilities(&self) -> Capabilities {
         let own = if self.embedding {
             Capabilities::embeddings()
         } else {
             let media = self.engine == EngineKind::Llamacpp && self.has_projector();
-            Capabilities::text().with_vision(media).with_audio(media)
+            let transcribe = self.transcribe && (media || self.engine == EngineKind::Vllm);
+            Capabilities::text().with_vision(media).with_audio(media).with_transcribe(transcribe)
         };
         own.with_limits(self.limits).intersect(self.engine.capabilities())
     }
@@ -577,6 +628,10 @@ pub(crate) mod tests {
                 serde_json::Value::Number(n) => {
                     out.extend(6u32.to_le_bytes());
                     out.extend((n.as_f64().unwrap() as f32).to_le_bytes());
+                }
+                serde_json::Value::Bool(b) => {
+                    out.extend(7u32.to_le_bytes());
+                    out.push(*b as u8);
                 }
                 _ => unreachable!(),
             }
@@ -769,6 +824,42 @@ pub(crate) mod tests {
         // Through the wire and back.
         let wire: CatalogModel = serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
         assert_eq!(wire.limits, limits());
+    }
+
+    #[test]
+    fn transcription_role_and_purpose() {
+        use weirdnet_agent::remote::catalog::Purpose;
+        let vox = ModelLaunch::new("vox", EngineKind::Llamacpp, "/m/v.gguf").with_mmproj("/m/mm.gguf").with_transcribe(true);
+        assert!(vox.capabilities().transcribe && vox.capabilities().audio);
+        assert_eq!(vox.purpose(), Purpose::Transcribe);
+        let no_projector = ModelLaunch::new("v", EngineKind::Llamacpp, "/m/v.gguf").with_transcribe(true);
+        assert!(!no_projector.capabilities().transcribe, "llama-server takes no audio without a projector");
+        assert_eq!(no_projector.purpose(), Purpose::Chat);
+        let mut via_args = no_projector.clone();
+        via_args.extra_args = vec!["-mm".into(), "/m/mm.gguf".into()];
+        assert!(via_args.capabilities().transcribe);
+        let whisper = ModelLaunch::new("w", EngineKind::Vllm, "openai/whisper-large-v3").with_transcribe(true);
+        assert!(whisper.capabilities().transcribe && !whisper.capabilities().audio);
+        assert!(!ModelLaunch::new("m", EngineKind::Mlx, "/m").with_transcribe(true).capabilities().transcribe);
+        let mut emb = vox.clone();
+        emb.embedding = true;
+        assert_eq!((emb.capabilities().transcribe, emb.purpose()), (false, Purpose::Embedding));
+        assert_eq!(ModelLaunch::new("c", EngineKind::Llamacpp, "/m/c.gguf").purpose(), Purpose::Chat);
+        let both = vox.capabilities().intersect(Capabilities::text().with_audio(true));
+        assert!(!both.transcribe, "both sides must transcribe");
+
+        // On the wire: left out when false, so old records and old readers are unchanged.
+        let json = serde_json::to_string(&Capabilities::text()).unwrap();
+        assert!(!json.contains("transcribe"));
+        let back: Capabilities = serde_json::from_str(&serde_json::to_string(&vox.capabilities()).unwrap()).unwrap();
+        assert!(back.transcribe);
+        let cbor = weirdnet_agent::remote::to_cbor(&vox.capabilities()).unwrap();
+        assert!(weirdnet_agent::remote::from_cbor::<Capabilities>(&cbor).unwrap().transcribe);
+        assert!(!serde_json::to_string(&no_projector.clone().with_transcribe(false)).unwrap().contains("transcribe"));
+        let old: ModelLaunch = serde_json::from_str(&serde_json::to_string(&ModelLaunch::new("o", EngineKind::Llamacpp, "/o")).unwrap()).unwrap();
+        assert!(!old.transcribe);
+        let l: ModelLaunch = serde_json::from_value(serde_json::to_value(&whisper).unwrap()).unwrap();
+        assert!(l.transcribe);
     }
 
     #[test]

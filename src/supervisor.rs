@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use weirdnet_agent::remote::RemoteError;
-use weirdnet_agent::remote::infer::v2::{Request, Sampling};
+use weirdnet_agent::remote::infer::v2::{Request, Sampling, TranscribeRequest, Transcript, Usage};
+use weirdnet_model::ModelStore;
+use weirdnet_model::limits::LimitsRecord;
 
 use crate::engine::{Capabilities, EngineConfig, EngineKind, LoraAdapter, ModelLaunch};
 
@@ -163,6 +165,12 @@ pub struct ModelStatus {
     /// and capabilities). `None` for models.
     #[serde(default)]
     pub base: Option<String>,
+    /// The context per sequence the engine reported when the model last loaded (llama-server's
+    /// `/props` `n_ctx` per slot, vLLM's `max_model_len`): what one request can use, which with
+    /// several slots is less than the configured [`context`](Self::context). `None` until measured,
+    /// when the engine doesn't say, and in records from nodes before 0.4.9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
 }
 
 impl ModelStatus {
@@ -172,18 +180,30 @@ impl ModelStatus {
         self.capabilities.map(|c| c.limits).unwrap_or_default()
     }
 
-    /// `entry` with this row's inputs, limits and context window (the configured
-    /// `--ctx-size`, when set) filled in from the record; `entry`'s own values stay where the
-    /// record has none.
+    /// `entry` with this row's inputs, limits and context window filled in from the record:
+    /// the measured context per sequence ([`context_tokens`](Self::context_tokens)), else the
+    /// configured `--ctx-size` when set; `entry`'s own values stay where the record has none.
     pub fn apply_to(&self, entry: weirdnet_agent::remote::catalog::CatalogModel) -> weirdnet_agent::remote::catalog::CatalogModel {
         let entry = match self.capabilities {
             Some(c) => c.apply_to(entry),
             None => entry,
         };
-        match self.context {
+        match self.context_tokens.or(self.context) {
             Some(ctx) => entry.with_context(ctx),
             None => entry,
         }
+    }
+
+    /// Its catalog/1 purpose ([`Capabilities::purpose`]): embedding, transcription
+    /// ([`Capabilities::transcribe`]) or chat.
+    pub fn purpose(&self) -> weirdnet_agent::remote::catalog::Purpose {
+        self.capabilities.unwrap_or_default().purpose(self.embedding)
+    }
+
+    /// A catalog/1 entry for this row in `state`: its id, [`purpose`](Self::purpose), and what
+    /// [`apply_to`](Self::apply_to) fills in.
+    pub fn catalog_model(&self, state: weirdnet_agent::remote::catalog::ModelState) -> weirdnet_agent::remote::catalog::CatalogModel {
+        self.apply_to(weirdnet_agent::remote::catalog::CatalogModel::new(self.id.clone(), self.purpose(), state))
     }
 }
 
@@ -241,6 +261,8 @@ struct Slot {
     crashes: Vec<Instant>,
     crash_loop: bool,
     restart_at: Option<Instant>,
+    /// What the last load measured (or the store kept from an earlier one).
+    measured: Option<LimitsRecord>,
 }
 
 impl Running {
@@ -272,7 +294,18 @@ impl Slot {
             crashes: Vec::new(),
             crash_loop: false,
             restart_at: None,
+            measured: None,
         }
+    }
+
+    /// What the model takes, with the operator's limits over the measured ones
+    /// ([`MediaLimits::or`](weirdnet_agent::MediaLimits::or)).
+    fn capabilities(&self) -> Capabilities {
+        let mut c = self.launch.capabilities();
+        if let Some(r) = &self.measured {
+            c.limits = c.limits.or(r.limits.to_media());
+        }
+        c
     }
 }
 
@@ -287,6 +320,8 @@ struct Inner {
     epoch: Instant,
     /// The node's reservation, if any.
     reserved: watch::Sender<Option<Reservation>>,
+    /// Where measured limits are kept ([`Supervisor::set_limits_store`]).
+    limits_store: Mutex<Option<ModelStore>>,
 }
 
 /// The per-node supervisor. Cheap to clone.
@@ -311,6 +346,7 @@ impl Supervisor {
                 events,
                 epoch: Instant::now(),
                 reserved: watch::Sender::new(None),
+                limits_store: Mutex::new(None),
             }),
         }
     }
@@ -473,6 +509,10 @@ impl Supervisor {
             {
                 return Err(bad_request(format!("{id}: llama.cpp can't take a path with a comma ({p})")));
             }
+            if slot.launch.mmproj != mmproj {
+                // What the old projector measured no longer holds; the next load measures again.
+                slot.measured = None;
+            }
             slot.launch.mmproj = mmproj.clone();
             match &slot.running {
                 Some(r) if r.mmproj != mmproj => AdapterChange::NextLoad,
@@ -502,6 +542,7 @@ impl Supervisor {
             }
             slots.insert(id.clone(), Slot::new(launch));
         }
+        self.seed_limits(&id);
         for model in ids {
             self.emit(SupervisorEvent::Added { model });
         }
@@ -586,8 +627,9 @@ impl Supervisor {
             crashes: s.crashes.len(),
             context: s.launch.context,
             slots: s.launch.slots,
-            capabilities: Some(s.launch.capabilities()),
+            capabilities: Some(s.capabilities()),
             base: None,
+            context_tokens: s.measured.as_ref().and_then(|r| r.limits.context_tokens),
         }
     }
 
@@ -607,10 +649,103 @@ impl Supervisor {
         }
     }
 
-    /// What `id` takes ([`ModelLaunch::capabilities`]); an adapter takes what its base does.
+    /// What `id` takes ([`ModelLaunch::capabilities`]), with its limits: the operator's
+    /// ([`ModelLaunch::limits`]) over those measured at load ([`Supervisor::measured_limits`]); an
+    /// adapter takes what its base does.
     pub fn capabilities(&self, id: &str) -> Option<Capabilities> {
         let route = self.route(id).ok()?;
-        self.slots().get(&route.base).map(|s| s.launch.capabilities())
+        self.slots().get(&route.base).map(Slot::capabilities)
+    }
+
+    /// What `id` (or an adapter's base) measured when it last loaded, as `weirdnet-model`'s
+    /// [`LimitsRecord`]: for a llama.cpp model whose source is a GGUF file, what its header and
+    /// its projector's say ([`weirdnet_model::limits::measure`]; llama.cpp `--image-max-tokens`,
+    /// when passed, over the header's per-image cap for size-dependent projectors), and for every
+    /// engine that reports it the context per sequence it runs with (llama-server `/props`, vLLM
+    /// `/v1/models`). Every figure that can't be read is absent, never defaulted. `None` before
+    /// the first load (unless the [store](Supervisor::set_limits_store) kept a record) or when
+    /// nothing could be measured. The capabilities carry these under the operator's
+    /// ([`Supervisor::capabilities`]); the context goes into [`ModelStatus::context_tokens`].
+    pub fn measured_limits(&self, id: &str) -> Option<LimitsRecord> {
+        let route = self.route(id).ok()?;
+        self.slots().get(&route.base).and_then(|s| s.measured.clone())
+    }
+
+    /// Keeps measured limits in `store` (`weirdnet-model`'s [`ModelStore::record_limits`],
+    /// next to the model's files) for llama.cpp models served from it, and reads them back now
+    /// for models not measured yet, so an unloaded model reports its image and audio figures
+    /// after a restart. A record read back has no context (that belongs to the run that measured
+    /// it), and one taken with another projector is ignored. `None` stops keeping them.
+    /// Blocking: reads the store.
+    pub fn set_limits_store(&self, store: Option<ModelStore>) {
+        *self.inner.limits_store.lock().unwrap_or_else(|e| e.into_inner()) = store;
+        let ids: Vec<String> = self.slots().iter().filter(|(_, s)| s.measured.is_none()).map(|(id, _)| id.clone()).collect();
+        for id in ids {
+            self.seed_limits(&id);
+        }
+    }
+
+    fn limits_store(&self) -> Option<ModelStore> {
+        self.inner.limits_store.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn engine_args(&self, engine: EngineKind) -> Vec<String> {
+        self.inner.engines.get(&engine).map(|e| e.extra_args.clone()).unwrap_or_default()
+    }
+
+    /// `id`'s record from the store, when it has none yet. Blocking.
+    fn seed_limits(&self, id: &str) {
+        let Some(store) = self.limits_store() else { return };
+        let Some(launch) = self.slots().get(id).filter(|s| s.measured.is_none()).map(|s| s.launch.clone()) else { return };
+        let Some(record) = crate::measure::kept(&store, &launch, &self.engine_args(launch.engine)) else { return };
+        if let Some(s) = self.slots().get_mut(id)
+            && s.measured.is_none()
+            && s.launch == launch
+        {
+            s.measured = Some(record);
+        }
+    }
+
+    /// The context per sequence the engine at `base` reports for `launch`: llama-server's
+    /// `/props` (`default_generation_settings.n_ctx`, per slot), vLLM's `/v1/models`
+    /// (`max_model_len`). `None` when it doesn't answer or doesn't say.
+    async fn served_context(&self, launch: &ModelLaunch, base: &str, key: Option<&str>) -> Option<u32> {
+        let get = |path: &str| {
+            let mut req = self.inner.http.get(format!("{base}{path}")).timeout(Duration::from_secs(5));
+            if let Some(k) = key {
+                req = req.bearer_auth(k);
+            }
+            req
+        };
+        let read = |v: Option<u64>| v.filter(|n| *n > 0).and_then(|n| u32::try_from(n).ok());
+        match launch.engine {
+            EngineKind::Llamacpp => {
+                let v: Value = get("/props").send().await.ok().filter(|r| r.status().is_success())?.json().await.ok()?;
+                read(v["default_generation_settings"]["n_ctx"].as_u64())
+            }
+            EngineKind::Vllm => {
+                let v: Value = get("/v1/models").send().await.ok().filter(|r| r.status().is_success())?.json().await.ok()?;
+                let row = v["data"].as_array()?.iter().find(|m| m["id"].as_str() == Some(launch.id.as_str()))?;
+                read(row["max_model_len"].as_u64())
+            }
+            _ => None,
+        }
+    }
+
+    /// Measures `launch`, just loaded at `base`, and keeps the record in the store when set.
+    async fn measure_loaded(&self, launch: &ModelLaunch, base: &str, key: Option<&str>) -> Option<LimitsRecord> {
+        let context = self.served_context(launch, base, key).await;
+        let (launch, args, store) = (launch.clone(), self.engine_args(launch.engine), self.limits_store());
+        tokio::task::spawn_blocking(move || {
+            let record = crate::measure::measure(&launch, &args, context)?;
+            if let Some(store) = store {
+                crate::measure::keep(&store, &launch, &record);
+            }
+            Some(record)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Starts `id` and waits until it is ready (see [`Supervisor::load_with`]).
@@ -852,10 +987,14 @@ impl Supervisor {
         } else {
             (base, wrap.api_key.clone(), None)
         };
+        let measured = if ok { self.measure_loaded(launch, &wrap.base(), wrap.api_key.as_deref()).await } else { None };
         let (tx, rx) = watch::channel(None);
         let mut slots = self.slots();
         let slot = slots.get_mut(&launch.id).expect("checked by load");
         slot.generation += 1;
+        if measured.is_some() {
+            slot.measured = measured;
+        }
         if !ok {
             slot.state = ModelState::Failed(format!("wrapped server {base} is not answering /health"));
             return Err(unavailable(format!("{}: wrapped server {base} is not answering /health", launch.id)));
@@ -1050,9 +1189,13 @@ impl Supervisor {
             }
             let _ = tokio::time::timeout(Duration::from_millis(200), exited.changed()).await;
         }
+        let measured = self.measure_loaded(launch, &format!("http://127.0.0.1:{port}"), Some(&api_key)).await;
         let mut slots = self.slots();
         let slot = slots.get_mut(&launch.id).expect("slot exists");
         if slot.generation == generation && slot.state == ModelState::Loading {
+            if measured.is_some() {
+                slot.measured = measured;
+            }
             slot.state = ModelState::Ready;
             tracing::info!(model = %launch.id, secs = started.elapsed().as_secs_f32(), "engine ready");
             Ok(())
@@ -1260,7 +1403,10 @@ impl Supervisor {
     }
 
     async fn post(&self, url: String, key: Option<&str>, body: &Value) -> Result<reqwest::Response, RemoteError> {
-        let mut req = self.inner.http.post(url).json(body);
+        self.send(self.inner.http.post(url).json(body), key).await
+    }
+
+    async fn send(&self, mut req: reqwest::RequestBuilder, key: Option<&str>) -> Result<reqwest::Response, RemoteError> {
         if let Some(k) = key {
             req = req.bearer_auth(k);
         }
@@ -1277,6 +1423,73 @@ impl Supervisor {
             });
         }
         Ok(resp)
+    }
+
+    /// Transcribes `request.audio` with `id`, which must be ready and transcribe here
+    /// ([`Capabilities::transcribe`]; otherwise `Unsupported`, so a pool tries elsewhere). Returns
+    /// the transcript and the engine's token counts when it gives them.
+    ///
+    /// - llama.cpp (a model with an audio projector, such as Voxtral): a greedy
+    ///   `/v1/chat/completions` request with the clip as a base64 `input_audio` part and an
+    ///   instruction to answer with the transcript only, naming the language and the prompt when
+    ///   given. No segments (the model can't time its text); the duration is read from a PCM WAV
+    ///   clip's header. llama-server takes WAV and MP3.
+    /// - vLLM (Whisper and other transcription models): `/v1/audio/transcriptions`, with the
+    ///   language and prompt, `verbose_json` (segments, language, duration) when timestamps are
+    ///   asked for.
+    pub async fn transcribe(&self, id: &str, request: &TranscribeRequest) -> Result<(Transcript, Option<Usage>), RemoteError> {
+        let engine = self.engine_of(id)?;
+        if !self.capabilities(id).is_some_and(|c| c.transcribe) {
+            return Err(RemoteError::Unsupported { message: format!("model `{id}` does not transcribe on this node") });
+        }
+        request.check()?;
+        match engine {
+            EngineKind::Llamacpp => {
+                let mut stream = self.chat(id, &crate::transcribe::chat_request(request)).await?;
+                let mut text = String::new();
+                while let Some(chunk) = stream.next().await {
+                    match chunk? {
+                        Chunk::Text(t) => text.push_str(&t),
+                        Chunk::Done { usage, .. } => {
+                            let mut t = Transcript::new(text.trim());
+                            if let Some(lang) = request.language.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+                                t = t.with_language(lang);
+                            }
+                            if let Some(ms) = crate::transcribe::wav_duration_ms(&request.audio) {
+                                t = t.with_duration_ms(ms);
+                            }
+                            return Ok((t, usage));
+                        }
+                        _ => {}
+                    }
+                }
+                Err(engine_error("engine stream ended early"))
+            }
+            EngineKind::Vllm => {
+                let (base, key, _guard) = self.target(id)?;
+                let format = request.format.trim().to_ascii_lowercase();
+                let file = reqwest::multipart::Part::bytes(request.audio.clone()).file_name(format!("audio.{format}"));
+                let mut form = reqwest::multipart::Form::new()
+                    .part("file", file)
+                    .text("model", id.to_string())
+                    .text("temperature", "0")
+                    .text("response_format", if request.timestamps { "verbose_json" } else { "json" });
+                if request.timestamps {
+                    form = form.text("timestamp_granularities[]", "segment");
+                }
+                if let Some(l) = request.language.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+                    form = form.text("language", l.to_string());
+                }
+                if let Some(p) = request.prompt.as_deref().filter(|p| !p.trim().is_empty()) {
+                    form = form.text("prompt", p.to_string());
+                }
+                let resp = self.send(self.inner.http.post(format!("{base}/v1/audio/transcriptions")).multipart(form), key.as_deref()).await?;
+                let v: Value = resp.json().await.map_err(|e| engine_error(format!("bad transcription response: {e}")))?;
+                let t = crate::transcribe::from_openai(&v).ok_or_else(|| engine_error("transcription response has no text"))?;
+                Ok((t, crate::transcribe::usage(&v)))
+            }
+            other => Err(RemoteError::Unsupported { message: format!("{id} runs on {}, which serves no transcription", other.name()) }),
+        }
     }
 
     /// Streams a chat answer from `id`, which must be ready. Dropping the stream aborts the engine
@@ -1549,6 +1762,20 @@ mod tests {
         assert_eq!((e.limits, e.inputs), (limits, Modalities::new(true, true)));
         let none = ModelStatus { capabilities: None, ..back };
         assert!(none.limits().is_unknown());
+
+        // The measured context per sequence wins over the configured one; old rows have none.
+        assert_eq!(row.context_tokens, None);
+        let measured = ModelStatus { context_tokens: Some(4096), ..none.clone() };
+        assert_eq!(measured.apply_to(CatalogModel::new("g", Purpose::Chat, CatalogState::Warm)).context, Some(4096));
+        let back: ModelStatus = serde_json::from_str(&serde_json::to_string(&measured).unwrap()).unwrap();
+        assert_eq!(back.context_tokens, Some(4096));
+        // Purpose: from the embedding flag and the capabilities (old rows: chat or embedding).
+        assert_eq!(none.purpose(), Purpose::Chat);
+        assert_eq!(ModelStatus { embedding: true, ..none.clone() }.purpose(), Purpose::Embedding);
+        let t = ModelStatus { capabilities: Some(Capabilities::text().with_audio(true).with_transcribe(true)), ..none };
+        assert_eq!(t.purpose(), Purpose::Transcribe);
+        let e = t.catalog_model(CatalogState::Loadable);
+        assert_eq!((e.id.as_str(), e.purpose, e.state, e.inputs), ("g", Purpose::Transcribe, CatalogState::Loadable, Modalities::new(false, true)));
     }
 
     #[test]

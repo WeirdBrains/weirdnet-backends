@@ -22,7 +22,15 @@
 //! `default_model`, `/health` is 200 at once while completions fail with 500 until loaded, and
 //! there is no `/v1/embeddings`.
 //!
-//! `/v1/models` lists the alias and modules, behind the key, like llama-server (b12628) and vLLM.
+//! `/v1/models` lists the alias and modules, behind the key, like llama-server (b12628) and vLLM;
+//! as vLLM (`--served-model-name`) with `--max-model-len N` the alias row has `max_model_len`.
+//! As llama-server, `/props` says the context per slot (`default_generation_settings.n_ctx`:
+//! `--ctx-size` over `--parallel`) when started with `--ctx-size`, and nothing otherwise.
+//!
+//! Transcription: a chat request whose text starts "Transcribe this audio" with an `input_audio`
+//! part (projector loaded) answers "heard N bytes of FORMAT" (plus " in LANG" when the
+//! instruction names one). As vLLM, `/v1/audio/transcriptions` (multipart) answers "heard N bytes"
+//! for the `file` part, with the language and, for `verbose_json`, a duration and two segments.
 //!
 //! Port races: with `--mock-port-race MODE FILE`, the first launch (while FILE doesn't exist)
 //! creates FILE and misbehaves: `impostor` serves as a stranger would (another key, healthy at
@@ -53,6 +61,12 @@ struct Mock {
     modules: std::sync::Mutex<Vec<String>>,
     /// vLLM run-time LoRA updates allowed.
     runtime_lora: bool,
+    /// Started as vLLM (`--served-model-name`).
+    vllm: bool,
+    /// `--ctx-size`, `--parallel`, `--max-model-len`.
+    ctx: Option<u64>,
+    parallel: u64,
+    max_model_len: Option<u64>,
 }
 
 /// Runs the mock engine (the test binary re-executes itself with engine flags).
@@ -131,12 +145,21 @@ async fn serve() {
         loras,
         modules: std::sync::Mutex::new(modules),
         runtime_lora,
+        vllm: flag("--served-model-name").is_some(),
+        ctx: flag("--ctx-size").and_then(|v| v.parse().ok()),
+        parallel: flag("--parallel").and_then(|v| v.parse().ok()).unwrap_or(1),
+        max_model_len: flag("--max-model-len").and_then(|v| v.parse().ok()),
     });
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions));
+    if st.vllm {
+        app = app.route("/v1/audio/transcriptions", post(transcriptions));
+    } else if !mlx {
+        app = app.route("/props", get(props));
+    }
     if runtime_lora {
         app = app.route("/v1/load_lora_adapter", post(load_lora)).route("/v1/unload_lora_adapter", post(unload_lora));
     }
@@ -159,9 +182,75 @@ async fn models(State(st): State<Arc<Mock>>, headers: HeaderMap) -> Response {
     if st.key.as_ref().is_some_and(|k| headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {k}"))) {
         return (StatusCode::UNAUTHORIZED, axum::Json(json!({"error": {"message": "Invalid API Key"}}))).into_response();
     }
-    let mut data = vec![json!({"id": st.alias, "object": "model"})];
+    let mut own = json!({"id": st.alias, "object": "model"});
+    if let Some(n) = st.max_model_len {
+        own["max_model_len"] = n.into();
+    }
+    let mut data = vec![own];
     data.extend(st.modules.lock().unwrap().iter().map(|m| json!({"id": m, "object": "model"})));
     axum::Json(json!({"object": "list", "data": data})).into_response()
+}
+
+async fn props(State(st): State<Arc<Mock>>, headers: HeaderMap) -> Response {
+    if !authorized(&st, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let settings = match st.ctx {
+        Some(c) => json!({"n_ctx": c / st.parallel.max(1)}),
+        None => json!({}),
+    };
+    axum::Json(json!({"default_generation_settings": settings, "total_slots": st.parallel})).into_response()
+}
+
+/// The named parts of a multipart body: name, file name, bytes.
+fn multipart(headers: &HeaderMap, body: &[u8]) -> Vec<(String, Option<String>, Vec<u8>)> {
+    let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let Some(boundary) = ct.split("boundary=").nth(1) else { return Vec::new() };
+    let delim = format!("--{}", boundary.trim_matches('"'));
+    let mut out = Vec::new();
+    let find = |hay: &[u8], needle: &[u8], from: usize| hay[from..].windows(needle.len()).position(|w| w == needle).map(|p| p + from);
+    let mut at = match find(body, delim.as_bytes(), 0) {
+        Some(p) => p + delim.len(),
+        None => return out,
+    };
+    while let Some(head_end) = find(body, b"\r\n\r\n", at) {
+        let head = String::from_utf8_lossy(&body[at..head_end]).to_string();
+        let Some(next) = find(body, delim.as_bytes(), head_end) else { break };
+        let data = body[head_end + 4..next - 2].to_vec();
+        let attr = |k: &str| head.split(&format!("{k}=\"")).nth(1).and_then(|r| r.split('"').next()).map(str::to_string);
+        if let Some(name) = attr("name") {
+            out.push((name, attr("filename"), data));
+        }
+        at = next + delim.len();
+    }
+    out
+}
+
+async fn transcriptions(State(st): State<Arc<Mock>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    if !authorized(&st, &headers) {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({"error": {"message": "Invalid API Key"}}))).into_response();
+    }
+    let parts = multipart(&headers, &body);
+    let field = |n: &str| parts.iter().find(|p| p.0 == n).map(|p| String::from_utf8_lossy(&p.2).to_string());
+    if field("model").as_deref() != Some(st.alias.as_str()) {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": {"message": "unknown model"}}))).into_response();
+    }
+    let Some((_, file, audio)) = parts.iter().find(|p| p.0 == "file") else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": {"message": "no file"}}))).into_response();
+    };
+    let mut text = format!("heard {} bytes", audio.len());
+    if let Some(p) = field("prompt") {
+        text.push_str(&format!(" about {p}"));
+    }
+    let mut v = json!({"text": text});
+    if let Some(l) = field("language") {
+        v["language"] = l.into();
+    }
+    if field("response_format").as_deref() == Some("verbose_json") {
+        v["duration"] = 2.0.into();
+        v["segments"] = json!([{"start": 0.0, "end": 1.0, "text": " heard"}, {"start": 1.0, "end": 2.0, "text": format!(" {}", file.clone().unwrap_or_default())}]);
+    }
+    axum::Json(v).into_response()
 }
 
 fn check(st: &Mock, headers: &HeaderMap, body: &Value) -> Option<Response> {
@@ -280,10 +369,18 @@ async fn chat(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body):
         Some(Value::String(s)) => s.clone(),
         _ => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
     };
-    if images > 0 {
+    if audio > 0 && said.starts_with("Transcribe this audio") {
+        let a = parts.iter().find(|p| p["type"] == "input_audio").unwrap();
+        let n = a["input_audio"]["data"].as_str().map_or(0, |d| d.len() / 4 * 3 - d.matches('=').count());
+        let mut heard = format!("heard {n} bytes of {}", a["input_audio"]["format"].as_str().unwrap_or("?"));
+        if let Some(lang) = said.split("The spoken language is ").nth(1).and_then(|r| r.split(';').next()) {
+            heard.push_str(&format!(" in {lang}"));
+        }
+        said = heard;
+    } else if images > 0 {
         said.push_str(&format!(" [{images} image(s)]"));
     }
-    if audio > 0 {
+    if audio > 0 && !said.starts_with("heard ") {
         said.push_str(&format!(" [{audio} audio]"));
     }
     let chunk = |delta: Value, finish: Option<&str>| json!({"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
@@ -313,7 +410,13 @@ async fn chat(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body):
                 name = format!("{name}+{stem}x{}", l["scale"]);
             }
         }
-        let answer = if continuing { "world".to_string() } else { format!("Hello from {name}! You said: {said}") };
+        let answer = if continuing {
+            "world".to_string()
+        } else if said.starts_with("heard ") {
+            format!(" {said} ")
+        } else {
+            format!("Hello from {name}! You said: {said}")
+        };
         for w in answer.split_inclusive(' ') {
             events.push(chunk(json!({"content": w}), None));
             n += 1;

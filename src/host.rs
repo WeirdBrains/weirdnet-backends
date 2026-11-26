@@ -8,7 +8,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use futures::StreamExt;
 use weirdnet_agent::remote::infer::InferHost;
-use weirdnet_agent::remote::infer::v2::{self, EmbedBackend, Finish, InferBackend, Input, Output, Request};
+use weirdnet_agent::remote::infer::v2::{
+    self, EmbedBackend, Finish, InferBackend, Input, Output, Request, TranscribeBackend, TranscribeRequest, Transcript, Usage,
+};
 use weirdnet_agent::remote::{Authorize, Caller, Channel, Dialer, RemoteError};
 use weirdnet_agent::{CancelToken, Modalities, ModelBackend};
 
@@ -118,6 +120,34 @@ impl ModelHost {
         }
     }
 
+    /// The model for a transcription request: a named one must transcribe here
+    /// ([`Capabilities::transcribe`](crate::Capabilities::transcribe)); with none named, the
+    /// ready one first by id, else (loading on demand) the first by id.
+    fn pick_transcriber(&self, model: Option<&str>) -> Result<(String, bool), RemoteError> {
+        let transcribes = |id: &str| self.supervisor.capabilities(id).is_some_and(|c| c.transcribe);
+        let id = match model {
+            Some(id) => {
+                if self.supervisor.state(id).is_none() {
+                    return Err(crate::error::unknown_model(id));
+                }
+                if !transcribes(id) {
+                    return Err(RemoteError::Unsupported { message: format!("model `{id}` does not transcribe on this node") });
+                }
+                id.to_string()
+            }
+            None => {
+                let ids: Vec<String> = self.supervisor.launches().into_iter().map(|l| l.id).filter(|id| transcribes(id)).collect();
+                let ready = ids.iter().find(|id| self.supervisor.state(id) == Some(ModelState::Ready));
+                match ready.or(ids.first().filter(|_| self.load_on_demand)) {
+                    Some(id) => id.clone(),
+                    None if ids.is_empty() => return Err(unavailable("no transcription model on this node")),
+                    None => return Err(unavailable(format!("no transcription model is loaded on this node ({})", ids.join(", ")))),
+                }
+            }
+        };
+        self.pick(Some(&id), false, Modalities::TEXT)
+    }
+
     fn backend(&self, id: String, load: bool) -> EngineModel {
         EngineModel { supervisor: self.supervisor.clone(), id, load, speed: self.speed.clone() }
     }
@@ -144,6 +174,16 @@ impl InferHost for ModelHost {
 
     fn open_embed(&self, _caller: &Caller, model: Option<&str>) -> Result<Arc<dyn EmbedBackend>, RemoteError> {
         let (id, load) = self.pick(model, false, Modalities::TEXT)?;
+        Ok(Arc::new(self.backend(id, load)))
+    }
+
+    /// A speech-to-text model on this node ([`Capabilities::transcribe`](crate::Capabilities::transcribe)):
+    /// the named one, or with none named the loaded one (first by id; with load on demand, the
+    /// first by id even when not loaded). A named model that doesn't transcribe here is
+    /// `Unsupported` (a pool tries elsewhere); none at all is unavailable. Served by
+    /// [`Supervisor::transcribe`](crate::Supervisor::transcribe).
+    fn open_transcribe(&self, _caller: &Caller, model: Option<&str>) -> Result<Arc<dyn TranscribeBackend>, RemoteError> {
+        let (id, load) = self.pick_transcriber(model)?;
         Ok(Arc::new(self.backend(id, load)))
     }
 }
@@ -250,6 +290,26 @@ impl EmbedBackend for EngineModel {
             r = call => r?,
         };
         Ok((vectors.pop().ok_or_else(|| engine_error("no embedding"))?, Some(tokens)))
+    }
+}
+
+#[async_trait]
+impl TranscribeBackend for EngineModel {
+    fn name(&self) -> String {
+        self.id.clone()
+    }
+
+    async fn transcribe(&self, request: &TranscribeRequest, cancel: &CancelToken) -> Result<Transcript, RemoteError> {
+        Ok(self.transcribe_counted(request, cancel).await?.0)
+    }
+
+    /// The transcript and the engine's token counts ([`Supervisor::transcribe`](crate::Supervisor::transcribe)).
+    async fn transcribe_counted(&self, request: &TranscribeRequest, cancel: &CancelToken) -> Result<(Transcript, Option<Usage>), RemoteError> {
+        self.ready().await?;
+        tokio::select! {
+            _ = cancel.cancelled() => Err(RemoteError::Cancelled),
+            r = self.supervisor.transcribe(&self.id, request) => r,
+        }
     }
 }
 

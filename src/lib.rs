@@ -20,7 +20,7 @@
 //!   streamed tool calls.
 //! - [`openai`]: engine request bodies from `weirdnet-agent` infer/2 requests.
 //! - [`host`]: [`ModelHost`], a `weirdnet-agent` `InferHost` serving raw infer/2 from the
-//!   supervisor's models.
+//!   supervisor's models, transcription (infer/2 `Transcribe`) included.
 //! - `node` (feature): `/weirdnet-backends/node/1` over `weirdnet-net`: signed capability
 //!   records, `Load`, `Unload`, `Drain`, `Reserve`/`Release`, `GroupUp`/`GroupDown` and health.
 //! - `models` (feature `node`): `/weirdnet-backends/models/1`, for the owner only: search the
@@ -39,6 +39,7 @@ pub mod error;
 pub mod host;
 #[cfg(feature = "node")]
 pub mod link;
+mod measure;
 pub mod mlx;
 #[cfg(feature = "node")]
 pub mod models;
@@ -47,6 +48,7 @@ pub mod node;
 pub mod openai;
 pub mod sse;
 pub mod supervisor;
+mod transcribe;
 
 pub use engine::{Capabilities, EngineConfig, EngineKind, LoraAdapter, ModelLaunch, Wrap, find_in_path};
 pub use host::{EngineModel, ModelHost, RAW_INFER_PROTOCOL, RawInferDialer, Speed};

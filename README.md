@@ -21,6 +21,24 @@ the engines and serves them to inference nodes; what to load is always the calle
   unknown: the operator sets them with `ModelLaunch::with_limits`, `intersect` keeps the
   stricter ones, and `Capabilities::apply_to` / `ModelStatus::apply_to` fill a catalog/1 entry's
   inputs, limits and context window.
+  **Measured at load** (since 0.4.9): when a model loads, the supervisor reads what its GGUF
+  and projector headers say images and audio cost
+  ([weirdnet-model](https://crates.io/crates/weirdnet-model) `limits::measure`; llama.cpp
+  `--image-max-tokens`, when passed, caps a size-dependent projector's per-image cost) and asks
+  the engine for the context per sequence it runs with (llama-server `/props`, vLLM
+  `/v1/models`). The operator's limits win over measured ones, field by field; a figure nobody
+  knows stays absent. `Supervisor::measured_limits` has the record, `ModelStatus::context_tokens`
+  the context per sequence (which `apply_to` prefers over the configured `--ctx-size`), and
+  `Supervisor::set_limits_store` keeps records next to the model files in a `ModelStore`, so an
+  unloaded model still reports its image and audio figures after a restart.
+- **Transcription** (since 0.4.9): `ModelLaunch::with_transcribe(true)` gives a model the
+  transcription role; `Capabilities::transcribe` says the node can serve it (llama.cpp with an
+  audio projector, such as Voxtral; vLLM, such as Whisper; never MLX-LM or an embedding model),
+  and `ModelLaunch::purpose`, `ModelStatus::purpose` and `ModelStatus::catalog_model` publish it
+  with catalog/1 `Purpose::Transcribe`. `ModelHost` serves infer/2 `Transcribe`
+  (`InferHost::open_transcribe`): `Supervisor::transcribe` sends llama.cpp a greedy chat request
+  with the clip as a base64 `input_audio` part, and vLLM a `/v1/audio/transcriptions` request
+  (segments with timestamps when asked).
 - `Supervisor`: load and unload with draining, **swap groups** (loading one model of a group
   unloads the others), **idle unload**, crash restarts with exponential backoff and crash-loop
   detection, `SupervisorEvent`s, per-model logs; chat, completion and embedding forwarding.

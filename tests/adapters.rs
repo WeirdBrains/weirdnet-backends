@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use weirdnet_agent::remote::catalog::{ModelState as CatalogState, Purpose};
 use weirdnet_agent::remote::infer::Admission;
-use weirdnet_agent::remote::infer::v2::{EmbedRequest, Prefix, Request, Sampling};
+use weirdnet_agent::remote::infer::v2::{EmbedRequest, Prefix, Request, Sampling, TranscribeRequest};
 use weirdnet_agent::remote::pool::{NoEvents, Pool};
 use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
-use weirdnet_agent::{CancelToken, ContentPart, Message, ToolSpec};
+use weirdnet_agent::{CancelToken, ContentPart, MediaLimits, Message, ToolSpec};
 use weirdnet_backends::{
     AdapterChange, Capabilities, Chunk, EngineKind, LoraAdapter, ModelHost, ModelLaunch, ModelState, RAW_INFER_PROTOCOL, RawInferDialer, Supervisor,
     SupervisorEvent, Wrap,
@@ -659,8 +660,202 @@ fn a_reservation_stops_every_engine_and_starts_none() {
     })
 }
 
+/// A PCM WAV clip of `millis` of silence at 16 kHz mono 16-bit.
+fn wav(millis: u32) -> Vec<u8> {
+    let data = 32 * millis;
+    let mut out = b"RIFF".to_vec();
+    out.extend((36 + data).to_le_bytes());
+    out.extend(b"WAVEfmt ");
+    out.extend(16u32.to_le_bytes());
+    out.extend([1, 0, 1, 0]);
+    out.extend(16_000u32.to_le_bytes());
+    out.extend(32_000u32.to_le_bytes());
+    out.extend([2, 0, 16, 0]);
+    out.extend(b"data");
+    out.extend(data.to_le_bytes());
+    out.extend(std::iter::repeat_n(0u8, data as usize));
+    out
+}
+
+/// A llama.cpp model file and a Qwen2.5-VL-style projector (size-dependent image cost) in `dir`.
+fn model_and_projector(dir: &std::path::Path) -> (String, String) {
+    let model = dir.join("vl.gguf");
+    let llama = [
+        ("llama.block_count", 2),
+        ("llama.attention.head_count", 4),
+        ("llama.attention.head_count_kv", 4),
+        ("llama.embedding_length", 256),
+        ("llama.context_length", 32768),
+    ];
+    std::fs::write(&model, gguf("llama", &[], &llama)).unwrap();
+    let proj = dir.join("mmproj-vl.gguf");
+    let clip = gguf(
+        "clip",
+        &[("general.type", "mmproj"), ("clip.projector_type", "qwen2.5vl_merger")],
+        &[("clip.has_vision_encoder", 1), ("clip.vision.image_size", 560), ("clip.vision.patch_size", 14)],
+    );
+    std::fs::write(&proj, clip).unwrap();
+    (model.to_string_lossy().into_owned(), proj.to_string_lossy().into_owned())
+}
+
+/// Limits measured at load: the projector's header, the engine's context per sequence and the
+/// operator's settings over both, in the status rows and catalog entries; unknown figures stay
+/// absent; a store keeps the record across a restart (without the context).
+fn measured_limits_reach_status_and_catalog() {
+    common::block_on(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let (model, proj) = model_and_projector(tmp.path());
+        let mut vl = ModelLaunch::new("vl", EngineKind::Llamacpp, model.clone())
+            .with_mmproj(proj.clone())
+            .with_limits(MediaLimits::new().with_max_images(4).with_image_tokens(1000));
+        vl.context = Some(8192);
+        vl.slots = Some(2);
+        let mut text = launch("text", EngineKind::Llamacpp);
+        text.context = Some(2048);
+        let bare = launch("bare", EngineKind::Llamacpp);
+        let mut big = launch("big", EngineKind::Vllm);
+        big.extra_args = vec!["--max-model-len".into(), "16384".into()];
+        let sup = supervisor(vec![vl, text, bare, big]);
+        sup.set_limits_store(Some(weirdnet_model::ModelStore::new(tmp.path())));
+        assert!(sup.measured_limits("vl").is_none(), "nothing measured or kept yet");
+        assert_eq!(sup.capabilities("vl").unwrap().limits, MediaLimits::new().with_max_images(4).with_image_tokens(1000), "the operator's alone");
+        for id in ["vl", "text", "bare", "big"] {
+            sup.load(id).await.unwrap();
+        }
+        let status = sup.status();
+        let row = |id: &str| status.iter().find(|m| m.id == id).unwrap().clone();
+
+        let vl = row("vl");
+        assert_eq!((vl.context, vl.context_tokens), (Some(8192), Some(4096)), "8192 over two slots");
+        let l = vl.limits();
+        assert_eq!((l.max_images, l.image_tokens, l.image_patch), (Some(4), Some(1000), Some(28)), "operator over measured, measured kept");
+        assert_eq!((l.image_edge, l.audio_max_seconds, l.audio_tokens_per_minute, l.max_request_bytes), (None, None, None, None), "never invented");
+        let entry = vl.catalog_model(CatalogState::Warm);
+        assert_eq!((entry.purpose, entry.context, entry.limits), (Purpose::Chat, Some(4096), l));
+        let rec = sup.measured_limits("vl").unwrap();
+        assert_eq!((rec.limits.context_tokens, rec.trained_context, rec.limits.image_tokens), (Some(4096), Some(32768), Some(4096)));
+        assert_eq!(rec.projector.as_deref(), Some("mmproj-vl.gguf"));
+
+        // No files to read: the context alone, and no media figures.
+        let text = row("text");
+        assert_eq!((text.context_tokens, text.limits()), (Some(2048), MediaLimits::new()));
+        assert_eq!(text.catalog_model(CatalogState::Warm).context, Some(2048));
+        // The engine says nothing: absent everywhere.
+        let bare = row("bare");
+        assert_eq!((bare.context_tokens, bare.context), (None, None));
+        assert!(sup.measured_limits("bare").is_none());
+        assert_eq!(bare.catalog_model(CatalogState::Warm).context, None);
+        // vLLM's max_model_len.
+        assert_eq!(row("big").context_tokens, Some(16384));
+        // Old readers: the new field is left out when unknown.
+        assert!(!serde_json::to_string(&bare).unwrap().contains("context_tokens"));
+        sup.shutdown().await;
+
+        // A fresh supervisor on the same store: the kept record (without the context) before any load.
+        let mut again = ModelLaunch::new("vl", EngineKind::Llamacpp, model.clone()).with_mmproj(proj.clone());
+        again.context = Some(8192);
+        let sup = supervisor(vec![again]);
+        sup.set_limits_store(Some(weirdnet_model::ModelStore::new(tmp.path())));
+        let kept = sup.measured_limits("vl").unwrap();
+        assert_eq!((kept.limits.context_tokens, kept.limits.image_patch), (None, Some(28)));
+        let row = sup.status().into_iter().next().unwrap();
+        assert_eq!((row.context_tokens, row.limits().image_tokens), (None, Some(4096)));
+        assert_eq!(row.catalog_model(CatalogState::Loadable).context, Some(8192), "the configured context until measured");
+        // Another projector: the measurement no longer holds.
+        sup.set_projector_live("vl", None).await.unwrap();
+        assert!(sup.measured_limits("vl").is_none());
+        assert!(sup.capabilities("vl").unwrap().limits.is_unknown());
+        sup.shutdown().await;
+    })
+}
+
+/// Transcription end to end: pool -> infer/2 `Transcribe` -> `ModelHost` -> llama.cpp (an audio
+/// projector, chat with `input_audio`) or vLLM (`/v1/audio/transcriptions`).
+fn transcription_through_the_model_host() {
+    common::block_on(async {
+        let voxtral = launch("voxtral", EngineKind::Llamacpp).with_mmproj("/models/mmproj-voxtral.gguf").with_transcribe(true);
+        let whisper = launch("whisper", EngineKind::Vllm).with_transcribe(true);
+        let deaf = launch("deaf", EngineKind::Llamacpp).with_transcribe(true);
+        let mut embed = launch("embed", EngineKind::Llamacpp);
+        embed.embedding = true;
+        let mlx = launch("mlx", EngineKind::Mlx).with_transcribe(true);
+        let sup = supervisor(vec![voxtral, whisper, deaf, embed, launch("chat", EngineKind::Llamacpp), mlx]);
+
+        let purposes: Vec<(String, Purpose, bool)> =
+            sup.status().into_iter().map(|r| (r.id.clone(), r.purpose(), r.capabilities.unwrap().transcribe)).collect();
+        let want = [
+            ("chat", Purpose::Chat, false),
+            ("deaf", Purpose::Chat, false),
+            ("embed", Purpose::Embedding, false),
+            ("mlx", Purpose::Chat, false),
+            ("voxtral", Purpose::Transcribe, true),
+            ("whisper", Purpose::Transcribe, true),
+        ];
+        assert_eq!(purposes, want.map(|(i, p, t)| (i.to_string(), p, t)).to_vec(), "no projector, MLX-LM: no transcription");
+        assert_eq!(sup.status().iter().find(|r| r.id == "voxtral").unwrap().catalog_model(CatalogState::Loadable).purpose, Purpose::Transcribe);
+
+        let auth: Arc<dyn Authorize> = Arc::new(|_: &Caller| Ok(()));
+        let host = Arc::new(ModelHost::new(sup.clone(), auth.clone()).with_default("chat"));
+        let pool = Pool::new(Arc::new(serve("model-node", host, Admission::new(2))), vec!["model-node".to_string()]);
+        let cancel = CancelToken::new();
+        let clip = wav(1500);
+
+        // Nothing loaded: unavailable, named or not.
+        let e = pool.transcribe(TranscribeRequest::new(clip.clone(), "wav"), &cancel).await.unwrap_err();
+        assert!(e.to_string().contains("transcription model"), "{e:?}");
+
+        sup.load("voxtral").await.unwrap();
+        let t = pool.transcribe(TranscribeRequest::new(clip.clone(), "WAV").with_language("fr"), &cancel).await.unwrap();
+        assert_eq!(t.model, "voxtral", "the loaded transcriber when none is named");
+        assert_eq!(t.transcript.text, format!("heard {} bytes of wav in fr", clip.len()));
+        assert_eq!((t.transcript.language.as_deref(), t.transcript.duration_ms), (Some("fr"), Some(1500)));
+        assert!(t.transcript.segments.is_empty(), "llama.cpp can't time its text");
+        assert_eq!(t.usage.unwrap().prompt_tokens, 5);
+
+        sup.load("whisper").await.unwrap();
+        let r = TranscribeRequest::new(vec![7; 10], "mp3").with_model("whisper").with_language("en").with_prompt("Bragi").with_timestamps(true);
+        let t = pool.transcribe(r, &cancel).await.unwrap();
+        assert_eq!(t.transcript.text, "heard 10 bytes about Bragi");
+        assert_eq!((t.transcript.language.as_deref(), t.transcript.duration_ms), (Some("en"), Some(2000)));
+        let seg: Vec<(u64, u64, &str)> = t.transcript.segments.iter().map(|s| (s.start_ms, s.end_ms, s.text.as_str())).collect();
+        assert_eq!(seg, vec![(0, 1000, "heard"), (1000, 2000, "audio.mp3")]);
+        let plain = pool.transcribe(TranscribeRequest::new(vec![1, 2], "wav").with_model("whisper"), &cancel).await.unwrap();
+        assert_eq!((plain.transcript.text.as_str(), plain.transcript.segments.len(), plain.transcript.duration_ms), ("heard 2 bytes", 0, None));
+
+        // A model that doesn't transcribe here, or isn't here.
+        sup.load("chat").await.unwrap();
+        for id in ["chat", "deaf", "embed", "mlx"] {
+            let e = pool.transcribe(TranscribeRequest::new(clip.clone(), "wav").with_model(id), &cancel).await.unwrap_err();
+            assert!(e.to_string().contains("does not transcribe"), "{id}: {e:?}");
+            let e = sup.transcribe(id, &TranscribeRequest::new(clip.clone(), "wav")).await.unwrap_err();
+            assert!(matches!(&e, RemoteError::Unsupported { message } if message.contains("does not transcribe")), "{id}: {e:?}");
+        }
+        let e = pool.transcribe(TranscribeRequest::new(clip.clone(), "wav").with_model("nobody"), &cancel).await.unwrap_err();
+        assert!(e.to_string().contains("nobody"), "{e:?}");
+
+        // Load on demand: a cold transcriber is started.
+        sup.unload("voxtral").await.unwrap();
+        sup.unload("whisper").await.unwrap();
+        let lazy = Arc::new(ModelHost::new(sup.clone(), auth.clone()).with_load_on_demand(true));
+        let pool = Pool::new(Arc::new(serve("lazy-node", lazy, Admission::new(2))), vec!["lazy-node".to_string()]);
+        let t = pool.transcribe(TranscribeRequest::new(clip.clone(), "wav"), &cancel).await.unwrap();
+        assert_eq!(t.model, "voxtral");
+        assert_eq!(sup.state("voxtral"), Some(ModelState::Ready));
+
+        // A node without a transcriber.
+        let none = supervisor(vec![launch("chat", EngineKind::Llamacpp)]);
+        let host = Arc::new(ModelHost::new(none.clone(), auth).with_load_on_demand(true));
+        let pool = Pool::new(Arc::new(serve("plain", host, Admission::new(2))), vec!["plain".to_string()]);
+        let e = pool.transcribe(TranscribeRequest::new(clip, "wav"), &cancel).await.unwrap_err();
+        assert!(e.to_string().contains("transcription"), "{e:?}");
+        sup.shutdown().await;
+    })
+}
+
 fn main() {
     common::main(&[
+        ("measured_limits_reach_status_and_catalog", measured_limits_reach_status_and_catalog as fn()),
+        ("transcription_through_the_model_host", transcription_through_the_model_host as fn()),
         ("lora_adapters_on_a_base", lora_adapters_on_a_base as fn()),
         ("live_adapter_changes", live_adapter_changes),
         ("mlx_behind_its_proxy", mlx_behind_its_proxy as fn()),
