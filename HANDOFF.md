@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-26: per-model media and request limits (for 0.4.8)
+
+What changed: [`4f4188a`](https://github.com/WeirdBrains/weirdnet-backends/commit/4f4188a227bf3ee9af6be8f3e1ab2a152db2b4e5) adds `Capabilities::limits` (a [weirdnet-agent](https://crates.io/crates/weirdnet-agent) 0.5.7 `MediaLimits`) with `Capabilities::with_limits` and `Capabilities::apply_to(CatalogModel)`; `ModelLaunch::limits` and `ModelLaunch::with_limits` for limits the operator sets (carried into `ModelLaunch::capabilities`); `ModelStatus::limits()` and `ModelStatus::apply_to(CatalogModel)` (inputs, limits and the configured context window). `Capabilities::intersect` keeps the stricter limits, and a limit only one side knows. Unknown limits are left out of records, so capability records and launches look as before and older nodes read new ones. `weirdnet-agent` floor raised to 0.5.7.
+
+Checks run: `cargo fmt --check`; `cargo clippy --all-targets -D warnings` (default and all features); `cargo test --all-features` (50 unit plus integration) and `--no-default-features` (30 unit plus integration); `cargo doc -D warnings`; `cargo semver-checks` against 0.4.7 (default and all features): no semver update required. New tests: limits through launches, capabilities and catalog entries; JSON and CBOR records with and without limits; 0.4.7-shaped `ModelStatus` rows.
+
+Not tested: measuring limits at model load (projector token counts); no live nodes; macOS.
+
+What's left and next: release 0.4.8; measured limits at load and video forwarding later.
+
 ## 2026-11-26: released 0.4.7 (upload switch, StoredEntry constructors)
 
 What changed: released with `scripts/weirdnet_release.py --patch` from [`0c64ca5`](https://github.com/WeirdBrains/weirdnet-backends/commit/0c64ca5f6b40a7a40b73faee4724920dc7eb011b) (CI green, Linux and Windows). Release commit [`6c4eacd`](https://github.com/WeirdBrains/weirdnet-backends/commit/6c4eacdecfbc359b6ab826a03beb8845cb54eedd) (CI green), tag [`v0.4.7`](https://github.com/WeirdBrains/weirdnet-backends/tree/v0.4.7), on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.7) and [docs.rs](https://docs.rs/weirdnet-backends/0.4.7).
