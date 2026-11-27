@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use weirdnet_agent::remote::catalog::{CatalogModel, Purpose};
+use weirdnet_agent::speech::SpeechProfile;
 use weirdnet_agent::{MediaLimits, Modalities};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -19,6 +20,12 @@ pub enum EngineKind {
     /// MLX-LM's `mlx_lm.server` (macOS on Apple silicon). Text only, no embeddings; the
     /// supervisor puts a key-checking proxy in front of it (see [`crate::mlx`]).
     Mlx,
+    /// vLLM-Omni (`vllm serve MODEL --omni`, Linux, NVIDIA): speech out through
+    /// `/v1/audio/speech` (Qwen3-TTS, VoxCPM2, Fish Audio Drama 3), and text chat. `vllm-omni`
+    /// on the wire. vLLM and the `vllm-omni` package go in one venv, pinned to one release (see
+    /// [`EngineKind::install_hint`]). Since 0.4.10.
+    #[serde(rename = "vllm-omni")]
+    VllmOmni,
 }
 
 impl EngineKind {
@@ -27,16 +34,75 @@ impl EngineKind {
             EngineKind::Llamacpp => "llamacpp",
             EngineKind::Vllm => "vllm",
             EngineKind::Mlx => "mlx",
+            EngineKind::VllmOmni => "vllm-omni",
+        }
+    }
+
+    /// The engine named `name` ([`EngineKind::name`]; `vllm_omni` and `omni` are taken for
+    /// `vllm-omni`), case-insensitive. Since 0.4.10.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "llamacpp" | "llama.cpp" | "llama-server" => Some(EngineKind::Llamacpp),
+            "vllm" => Some(EngineKind::Vllm),
+            "mlx" | "mlx-lm" => Some(EngineKind::Mlx),
+            "vllm-omni" | "vllm_omni" | "omni" => Some(EngineKind::VllmOmni),
+            _ => None,
         }
     }
 
     /// The most this engine can serve. A model may serve less (see [`ModelLaunch::capabilities`]).
+    /// Native video (`video_url` parts) is vLLM's; speech out is llama.cpp's (a speech model with
+    /// its projector) and vLLM-Omni's.
     pub fn capabilities(self) -> Capabilities {
         match self {
-            EngineKind::Llamacpp | EngineKind::Vllm => {
-                Capabilities { chat: true, embeddings: true, vision: true, audio: true, transcribe: true, ..Capabilities::default() }
+            EngineKind::Llamacpp => {
+                Capabilities { chat: true, embeddings: true, vision: true, audio: true, transcribe: true, speak: true, ..Capabilities::default() }
+            }
+            EngineKind::Vllm => {
+                Capabilities { chat: true, embeddings: true, vision: true, audio: true, transcribe: true, video: true, ..Capabilities::default() }
             }
             EngineKind::Mlx => Capabilities::text(),
+            EngineKind::VllmOmni => Capabilities { chat: true, speak: true, ..Capabilities::default() },
+        }
+    }
+
+    /// Whether the engine runs on `os` and `arch` (as in [`std::env::consts`]): llama.cpp
+    /// everywhere, vLLM and vLLM-Omni on Linux only, MLX-LM on macOS on Apple silicon only.
+    /// Since 0.4.10.
+    pub fn supported(self, os: &str, arch: &str) -> bool {
+        match self {
+            EngineKind::Llamacpp => true,
+            EngineKind::Vllm | EngineKind::VllmOmni => os == "linux",
+            EngineKind::Mlx => crate::mlx::supported(os, arch),
+        }
+    }
+
+    /// Whether the engine runs on this machine's OS and architecture ([`EngineKind::supported`]).
+    /// Since 0.4.10.
+    pub fn supported_here(self) -> bool {
+        self.supported(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// The program the engine is started as, looked for on `PATH` when no path is configured:
+    /// `llama-server`, `vllm` (vLLM-Omni too: `vllm serve MODEL --omni`) or `mlx_lm.server`.
+    /// Since 0.4.10.
+    pub fn program(self) -> &'static str {
+        match self {
+            EngineKind::Llamacpp => "llama-server",
+            EngineKind::Vllm | EngineKind::VllmOmni => "vllm",
+            EngineKind::Mlx => "mlx_lm.server",
+        }
+    }
+
+    /// How to install the engine, for an error or a setup screen. Since 0.4.10.
+    pub fn install_hint(self) -> &'static str {
+        match self {
+            EngineKind::Llamacpp => "install llama.cpp (https://github.com/ggml-org/llama.cpp) and put `llama-server` on PATH",
+            EngineKind::Vllm => "install vLLM in a venv (`pip install vllm`; Linux, NVIDIA sm_80+ or supported ROCm) and put its `vllm` on PATH",
+            EngineKind::VllmOmni => {
+                "install vLLM and vLLM-Omni in one venv, pinned to one release (`pip install vllm vllm-omni`; Linux, NVIDIA), and put its `vllm` on PATH; it runs as `vllm serve MODEL --omni`"
+            }
+            EngineKind::Mlx => "install MLX-LM into a venv (weirdnet_backends::mlx::install; macOS on Apple silicon)",
         }
     }
 }
@@ -69,6 +135,19 @@ pub struct Capabilities {
     /// records when false; absent (false) in records from nodes before 0.4.9.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transcribe: bool,
+    /// Video content parts sent whole (`video_url` with a `data:video/` URL, `weirdnet-agent`
+    /// `ContentPart::VideoUrl`): a model the operator marked as reading video
+    /// ([`ModelLaunch::video`]) on vLLM. catalog/1 `inputs.video`. Left out of records when
+    /// false; absent (false) in records from nodes before 0.4.10. Since 0.4.10.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub video: bool,
+    /// Text to speech (infer/2 `Speak`): the model has the speech role ([`ModelLaunch::speak`])
+    /// and its engine can serve it (llama.cpp with the model's projector, vLLM-Omni). Its
+    /// catalog/1 purpose is [`Purpose::Speak`]; what it does is its speech profile
+    /// ([`ModelStatus::speech`](crate::ModelStatus::speech)). Left out of records when false;
+    /// absent (false) in records from nodes before 0.4.10. Since 0.4.10.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub speak: bool,
 }
 
 impl Capabilities {
@@ -104,6 +183,18 @@ impl Capabilities {
         self
     }
 
+    /// See [`Capabilities::video`]. Since 0.4.10.
+    pub fn with_video(mut self, on: bool) -> Self {
+        self.video = on;
+        self
+    }
+
+    /// See [`Capabilities::speak`]. Since 0.4.10.
+    pub fn with_speak(mut self, on: bool) -> Self {
+        self.speak = on;
+        self
+    }
+
     /// A catalog/1 entry with these inputs and limits: `entry` with [`CatalogModel::inputs`]
     /// and [`CatalogModel::limits`] set from these (the rest of `entry` is kept).
     pub fn apply_to(&self, entry: CatalogModel) -> CatalogModel {
@@ -112,11 +203,14 @@ impl Capabilities {
 
     /// The catalog/1 purpose of a model with these capabilities: [`Purpose::Embedding`] for an
     /// embedding model (`embedding`, as [`ModelLaunch::embedding`] or [`ModelStatus::embedding`](crate::ModelStatus::embedding)),
-    /// else [`Purpose::Transcribe`] when it [transcribes](Capabilities::transcribe), else
+    /// else [`Purpose::Speak`] when it [speaks](Capabilities::speak) (since 0.4.10), else
+    /// [`Purpose::Transcribe`] when it [transcribes](Capabilities::transcribe), else
     /// [`Purpose::Chat`].
     pub fn purpose(&self, embedding: bool) -> Purpose {
         if embedding {
             Purpose::Embedding
+        } else if self.speak {
+            Purpose::Speak
         } else if self.transcribe {
             Purpose::Transcribe
         } else {
@@ -124,9 +218,10 @@ impl Capabilities {
         }
     }
 
-    /// The inputs beyond text, as `weirdnet-agent` [`Modalities`] (what catalog entries carry).
+    /// The inputs beyond text, as `weirdnet-agent` [`Modalities`] (what catalog entries carry),
+    /// video included (since 0.4.10).
     pub fn inputs(&self) -> Modalities {
-        Modalities::new(self.vision, self.audio)
+        Modalities::new(self.vision, self.audio).with_video(self.video)
     }
 
     /// What a request needing `needed` would lack here (`"images"`, `"audio"`, ...), if anything.
@@ -144,6 +239,8 @@ impl Capabilities {
             audio: self.audio && other.audio,
             limits: self.limits.tightest(other.limits),
             transcribe: self.transcribe && other.transcribe,
+            video: self.video && other.video,
+            speak: self.speak && other.speak,
         }
     }
 }
@@ -165,6 +262,23 @@ impl EngineConfig {
 
     pub fn vllm(program: impl Into<PathBuf>) -> Self {
         Self { kind: EngineKind::Vllm, program: program.into(), extra_args: Vec::new(), ready_timeout: Duration::from_secs(1200) }
+    }
+
+    /// vLLM-Omni: `program` is the `vllm` of the venv vLLM-Omni is installed in; each model
+    /// starts as `vllm serve MODEL --omni`. Since 0.4.10.
+    pub fn vllm_omni(program: impl Into<PathBuf>) -> Self {
+        Self { kind: EngineKind::VllmOmni, program: program.into(), extra_args: Vec::new(), ready_timeout: Duration::from_secs(1200) }
+    }
+
+    /// The engine's version as `program --version` prints it (its first line, stdout or
+    /// stderr), within 30 s; `None` when it doesn't run or says nothing. For a setup screen and
+    /// logs. Since 0.4.10.
+    pub async fn version(&self) -> Option<String> {
+        let mut cmd = Command::new(&self.program);
+        cmd.arg("--version").stdin(std::process::Stdio::null()).kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(30), cmd.output()).await.ok()?.ok()?;
+        let text = [out.stdout, out.stderr].iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect::<Vec<_>>().join("\n");
+        text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
     }
 
     /// `program` is `mlx_lm.server`, such as [`crate::mlx::server_in`] of a venv made by
@@ -231,6 +345,18 @@ impl EngineConfig {
                     // Lets the supervisor add and remove adapters on the running engine
                     // (`/v1/load_lora_adapter`); the endpoints sit behind the API key on loopback.
                     cmd.env("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "True");
+                }
+                cmd.env("VLLM_API_KEY", api_key);
+            }
+            EngineKind::VllmOmni => {
+                // Reference clips travel inline as `data:` URLs only, so it never gets
+                // `--allowed-local-media-path` (see `ModelLaunch::check_speech`).
+                cmd.args(["serve", &model.source, "--omni", "--host", "127.0.0.1", "--port", &port.to_string(), "--served-model-name", &model.id]);
+                if let Some(ctx) = model.context {
+                    cmd.args(["--max-model-len", &ctx.to_string()]);
+                }
+                if let Some(slots) = model.slots {
+                    cmd.args(["--max-num-seqs", &slots.to_string()]);
                 }
                 cmd.env("VLLM_API_KEY", api_key);
             }
@@ -329,6 +455,27 @@ pub struct ModelLaunch {
     /// [`ModelLaunch::capabilities`] for when the engine can serve it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transcribe: bool,
+    /// The model reads video parts whole (`video_url`, such as Qwen2.5-VL or Qwen3-VL on vLLM).
+    /// The operator says so: the engine doesn't report it. Served on vLLM (a wrapped
+    /// mistral.rs server is declared as vLLM: it takes the same `video_url` part); llama.cpp and
+    /// MLX-LM take no video, and a request with a video part is refused there with
+    /// `weirdnet-agent`'s `VIDEO_FALLBACK` (send frames instead). Since 0.4.10.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub video: bool,
+    /// The speech role: a text-to-speech model (Kokoro, VoxCPM2, Fish Audio Drama 3 or Qwen3-TTS
+    /// through llama.cpp with its projector; Qwen3-TTS through vLLM-Omni), served over infer/2
+    /// `Speak` and published with [`Purpose::Speak`]. A speaking model serves nothing else.
+    /// See [`ModelLaunch::capabilities`]. Since 0.4.10.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub speak: bool,
+    /// The operator's speech settings for a speaking model, field by field, narrowing only: fewer
+    /// voices or languages, smaller limits, or a limit the engine doesn't report
+    /// (`weirdnet-agent`'s [`SpeechProfile::narrowed_by`]). Never defaults; unknown by default.
+    /// Widening what the model's catalog entry says is refused by [`ModelLaunch::check_speech`],
+    /// and widening what the engine reports at load leaves the model without a profile.
+    /// Since 0.4.10.
+    #[serde(default, skip_serializing_if = "SpeechProfile::is_unknown")]
+    pub speech: SpeechProfile,
 }
 
 /// A stock OpenAI-compatible server the node forwards to but doesn't own.
@@ -399,7 +546,82 @@ impl ModelLaunch {
             mmproj: None,
             limits: MediaLimits::UNKNOWN,
             transcribe: false,
+            video: false,
+            speak: false,
+            speech: SpeechProfile::default(),
         }
+    }
+
+    /// See [`ModelLaunch::video`]. Since 0.4.10.
+    pub fn with_video(mut self, on: bool) -> Self {
+        self.video = on;
+        self
+    }
+
+    /// See [`ModelLaunch::speak`]. Since 0.4.10.
+    pub fn with_speak(mut self, on: bool) -> Self {
+        self.speak = on;
+        self
+    }
+
+    /// See [`ModelLaunch::speech`]. Since 0.4.10.
+    pub fn with_speech(mut self, speech: SpeechProfile) -> Self {
+        self.speech = speech;
+        self
+    }
+
+    /// What `weirdnet-model`'s catalog says this speaking model does ([`CatalogEntry::speech`](weirdnet_model::hw::CatalogEntry::speech)),
+    /// for the entry with this id or this source (a vLLM-Omni Hub repo, a llama.cpp GGUF file
+    /// name) whose files suit the engine: GGUF for llama.cpp, Hub checkpoints for vLLM-Omni.
+    /// `None` when no entry matches. Since 0.4.10.
+    pub fn cataloged_speech(&self) -> Option<weirdnet_model::SpeechProfile> {
+        if !matches!(self.engine, EngineKind::Llamacpp | EngineKind::VllmOmni) {
+            return None;
+        }
+        let gguf = self.engine == EngineKind::Llamacpp;
+        let name = |p: &str| Path::new(p).file_name().map(|n| n.to_string_lossy().to_ascii_lowercase());
+        let file = name(&self.source);
+        weirdnet_model::hw::by_purpose(weirdnet_model::hw::Purpose::Speak)
+            .into_iter()
+            .filter(|e| e.is_gguf() == gguf)
+            .find(|e| {
+                e.id() == self.id
+                    || (!gguf && e.spec.repo.eq_ignore_ascii_case(self.source.trim()))
+                    || (gguf && file.is_some() && name(&e.spec.file) == file)
+            })
+            .and_then(|e| e.speech())
+    }
+
+    /// Whether the speech role can be served as set: only on llama.cpp (with the model's
+    /// projector) or vLLM-Omni, not as an embedding or transcription model, never with
+    /// vLLM-Omni's `--allowed-local-media-path` (reference clips travel inline only), and
+    /// operator settings ([`ModelLaunch::speech`]) that only narrow what the model's catalog
+    /// entry says, when there is one ([`ModelLaunch::cataloged_speech`]). Settings on a model
+    /// without the role are refused too. Since 0.4.10.
+    pub fn check_speech(&self) -> Result<(), String> {
+        let id = &self.id;
+        if !self.speak {
+            return if self.speech.is_unknown() { Ok(()) } else { Err(format!("{id}: speech settings need the speak role")) };
+        }
+        if self.embedding || self.transcribe {
+            return Err(format!("{id}: a speaking model can't also be an embedding or transcription model"));
+        }
+        match self.engine {
+            EngineKind::Llamacpp if !self.has_projector() => {
+                return Err(format!("{id}: llama.cpp speaks only with the model's projector (mmproj)"));
+            }
+            EngineKind::Llamacpp | EngineKind::VllmOmni => {}
+            other => return Err(format!("{id}: {} has no speech engine; use llama.cpp or vLLM-Omni", other.name())),
+        }
+        if self.engine == EngineKind::VllmOmni && self.extra_args.iter().any(|a| a.split('=').next() == Some("--allowed-local-media-path")) {
+            return Err(format!("{id}: vLLM-Omni must not read local media (--allowed-local-media-path); reference clips travel inline"));
+        }
+        if !self.speech.is_unknown()
+            && let Some(cataloged) = self.cataloged_speech()
+        {
+            cataloged.to_agent().narrowed_by(&self.speech).map_err(|e| format!("{id}: speech settings widen the model's: {e}"))?;
+        }
+        Ok(())
     }
 
     /// See [`ModelLaunch::transcribe`].
@@ -536,13 +758,25 @@ impl ModelLaunch {
     /// [`transcribe`](ModelLaunch::transcribe) role transcribes on llama.cpp with a projector
     /// (an audio one: llama-server refuses audio otherwise) and on vLLM; never as an embedding
     /// model or on MLX-LM.
+    ///
+    /// Since 0.4.10: a model marked [`video`](ModelLaunch::video) reads video on vLLM (nowhere
+    /// else); a model with the [`speak`](ModelLaunch::speak) role speaks and does nothing else,
+    /// on llama.cpp with its projector or on vLLM-Omni (elsewhere it serves nothing).
     pub fn capabilities(&self) -> Capabilities {
         let own = if self.embedding {
             Capabilities::embeddings()
+        } else if self.speak {
+            let speaks = match self.engine {
+                EngineKind::Llamacpp => self.has_projector(),
+                EngineKind::VllmOmni => true,
+                _ => false,
+            };
+            Capabilities::default().with_speak(speaks)
         } else {
             let media = self.engine == EngineKind::Llamacpp && self.has_projector();
             let transcribe = self.transcribe && (media || self.engine == EngineKind::Vllm);
-            Capabilities::text().with_vision(media).with_audio(media).with_transcribe(transcribe)
+            let video = self.video && self.engine == EngineKind::Vllm;
+            Capabilities::text().with_vision(media).with_audio(media).with_transcribe(transcribe).with_video(video)
         };
         own.with_limits(self.limits).intersect(self.engine.capabilities())
     }
@@ -860,6 +1094,107 @@ pub(crate) mod tests {
         assert!(!old.transcribe);
         let l: ModelLaunch = serde_json::from_value(serde_json::to_value(&whisper).unwrap()).unwrap();
         assert!(l.transcribe);
+    }
+
+    #[test]
+    fn vllm_omni_is_its_own_engine() {
+        assert_eq!(serde_json::to_string(&EngineKind::VllmOmni).unwrap(), r#""vllm-omni""#);
+        assert_eq!(serde_json::from_str::<EngineKind>(r#""vllm-omni""#).unwrap(), EngineKind::VllmOmni);
+        for k in [EngineKind::Llamacpp, EngineKind::Vllm, EngineKind::Mlx, EngineKind::VllmOmni] {
+            assert_eq!(EngineKind::parse(k.name()), Some(k));
+            assert!(!k.install_hint().is_empty());
+        }
+        assert_eq!(
+            (EngineKind::parse("omni"), EngineKind::parse("llama.cpp"), EngineKind::parse("x")),
+            (Some(EngineKind::VllmOmni), Some(EngineKind::Llamacpp), None)
+        );
+        assert!(EngineKind::VllmOmni.supported("linux", "x86_64") && !EngineKind::VllmOmni.supported("macos", "aarch64"));
+        assert!(EngineKind::Llamacpp.supported("windows", "x86_64") && !EngineKind::Mlx.supported("linux", "x86_64"));
+        assert_eq!((EngineKind::VllmOmni.program(), EngineKind::Llamacpp.program()), ("vllm", "llama-server"));
+        let caps = EngineKind::VllmOmni.capabilities();
+        assert!(caps.speak && caps.chat && !caps.video && !caps.embeddings);
+        assert!(EngineKind::Llamacpp.capabilities().speak && !EngineKind::Llamacpp.capabilities().video);
+        assert!(EngineKind::Vllm.capabilities().video && !EngineKind::Vllm.capabilities().speak);
+
+        let mut m = ModelLaunch::new("qwen3-tts-1.7b-customvoice", EngineKind::VllmOmni, "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice").with_speak(true);
+        m.slots = Some(4);
+        let a = args(&EngineConfig::vllm_omni("/venv/bin/vllm").command(&m, 4321, "k"));
+        assert_eq!(&a[..3], ["serve", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "--omni"]);
+        assert!(a.windows(2).any(|w| w == ["--served-model-name", "qwen3-tts-1.7b-customvoice"]));
+        assert!(a.windows(2).any(|w| w == ["--max-num-seqs", "4"]));
+        assert!(!a.iter().any(|x| x == "k" || x.starts_with("--allowed-local-media-path")), "no key in argv, no local media");
+        assert_eq!(EngineConfig::vllm_omni("/v").ready_timeout, Duration::from_secs(1200));
+    }
+
+    #[test]
+    fn speakers_speak_and_nothing_else() {
+        let kokoro = ModelLaunch::new("kokoro-82m", EngineKind::Llamacpp, "/m/kokoro.gguf").with_speak(true);
+        assert_eq!(kokoro.capabilities(), Capabilities::default(), "no projector: llama.cpp can't speak");
+        assert!(kokoro.check_speech().unwrap_err().contains("projector"));
+        let kokoro = kokoro.with_mmproj("/m/mmproj-kokoro.gguf");
+        assert_eq!(kokoro.capabilities(), Capabilities::default().with_speak(true));
+        assert_eq!(kokoro.purpose(), Purpose::Speak);
+        assert!(kokoro.check_speech().is_ok());
+        let omni = ModelLaunch::new("q", EngineKind::VllmOmni, "Qwen/X").with_speak(true);
+        assert_eq!((omni.capabilities().speak, omni.purpose()), (true, Purpose::Speak));
+        for engine in [EngineKind::Vllm, EngineKind::Mlx] {
+            let m = ModelLaunch::new("s", engine, "/m/s").with_speak(true);
+            assert!(!m.capabilities().speak && m.check_speech().unwrap_err().contains("no speech engine"), "{engine:?}");
+        }
+        let mut both = omni.clone().with_transcribe(true);
+        assert!(both.check_speech().is_err());
+        both.transcribe = false;
+        both.extra_args = vec!["--allowed-local-media-path=/".into()];
+        assert!(both.check_speech().unwrap_err().contains("local media"));
+        // Settings without the role, and settings that widen the catalog's.
+        let p = SpeechProfile::new().with_max_input_chars(100);
+        assert!(ModelLaunch::new("c", EngineKind::Llamacpp, "/m/c.gguf").with_speech(p.clone()).check_speech().is_err());
+        assert!(kokoro.clone().with_speech(p.clone().with_presets(vec!["af_heart".into()])).check_speech().is_ok());
+        let e = kokoro.clone().with_speech(SpeechProfile::new().with_presets(vec!["alloy".into()])).check_speech().unwrap_err();
+        assert!(e.contains("widen") && e.contains("alloy"), "{e}");
+        assert!(kokoro.clone().with_speech(SpeechProfile::new().with_design(true)).check_speech().is_err());
+
+        // The catalog entry by id, Hub repo or GGUF file name, for the right engine only.
+        assert!(kokoro.cataloged_speech().unwrap().raw);
+        let by_repo = ModelLaunch::new("tts", EngineKind::VllmOmni, "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign");
+        let entry = weirdnet_model::hw::find(weirdnet_model::hw::QWEN3_TTS_1_7B_VOICEDESIGN).unwrap();
+        assert_eq!(by_repo.cataloged_speech().is_some(), entry.spec.repo.eq_ignore_ascii_case("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"));
+        let by_repo = ModelLaunch::new("tts", EngineKind::VllmOmni, entry.spec.repo.clone());
+        assert!(by_repo.cataloged_speech().unwrap().design);
+        let gguf = weirdnet_model::hw::find(weirdnet_model::hw::VOXCPM2).unwrap();
+        let by_file = ModelLaunch::new("vox", EngineKind::Llamacpp, format!("/models/{}", gguf.spec.file));
+        assert!(by_file.cataloged_speech().unwrap().design);
+        assert!(ModelLaunch::new("kokoro-82m", EngineKind::VllmOmni, "x/y").cataloged_speech().is_none(), "a GGUF entry is not vLLM-Omni's");
+        assert!(ModelLaunch::new("kokoro-82m", EngineKind::Vllm, "x/y").cataloged_speech().is_none());
+
+        let json = serde_json::to_value(kokoro.clone().with_speech(p.clone())).unwrap();
+        assert_eq!((json["speak"].as_bool(), json["speech"]["max_input_chars"].as_u64()), (Some(true), Some(100)));
+        let back: ModelLaunch = serde_json::from_value(json).unwrap();
+        assert_eq!(back.speech, p);
+    }
+
+    #[test]
+    fn video_is_vllms_on_the_operators_word() {
+        let vl = ModelLaunch::new("vl", EngineKind::Vllm, "Qwen/Qwen2.5-VL-7B-Instruct");
+        assert!(!vl.capabilities().video);
+        let vl = vl.with_video(true);
+        let caps = vl.capabilities();
+        assert!(caps.video && caps.chat && !caps.vision);
+        assert_eq!(caps.inputs(), Modalities::TEXT.with_video(true));
+        assert_eq!(caps.lacking(Modalities::VIDEO), None);
+        assert_eq!(Capabilities::text().lacking(Modalities::VIDEO), Some("video"));
+        assert!(!ModelLaunch::new("g", EngineKind::Llamacpp, "/m/g.gguf").with_mmproj("/m/p.gguf").with_video(true).capabilities().video);
+        assert!(!ModelLaunch::new("m", EngineKind::Mlx, "/m/m").with_video(true).capabilities().video);
+        assert!(!caps.intersect(Capabilities::text()).video);
+        let limits = MediaLimits::new().with_video_max_seconds(120).with_video_frames_per_minute(120);
+        let entry = caps.with_limits(limits).apply_to(CatalogModel::new("vl", Purpose::Chat, weirdnet_agent::remote::catalog::ModelState::Warm));
+        assert!(entry.inputs.video);
+        assert_eq!((entry.limits.video_max_seconds, entry.limits.video_frame_rate()), (Some(120), Some(2.0)));
+        let json = serde_json::to_string(&caps).unwrap();
+        assert!(json.contains(r#""video":true"#) && !json.contains("speak"));
+        assert_eq!(serde_json::from_str::<Capabilities>(&json).unwrap(), caps);
+        let cbor = weirdnet_agent::remote::to_cbor(&caps).unwrap();
+        assert_eq!(weirdnet_agent::remote::from_cbor::<Capabilities>(&cbor).unwrap(), caps);
     }
 
     #[test]

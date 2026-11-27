@@ -1,7 +1,8 @@
 //! The adapters against a fake engine (`examples/mock_engine.rs`): launch, readiness, streamed
 //! chat with reasoning, tool calls and prefixes, completions, embeddings, swap groups, idle
 //! unload, wrapping a stock server, crash restarts and MLX-LM behind its proxy; and raw infer/2
-//! through `ModelHost`.
+//! through `ModelHost`; native video forwarding and speech out (llama-server and vLLM-Omni
+//! `/v1/audio/speech`) through `ModelHost`.
 
 mod common;
 
@@ -9,12 +10,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use weirdnet_agent::remote::catalog::VIDEO_FALLBACK;
 use weirdnet_agent::remote::catalog::{ModelState as CatalogState, Purpose};
 use weirdnet_agent::remote::infer::Admission;
-use weirdnet_agent::remote::infer::v2::{EmbedRequest, Prefix, Request, Sampling, TranscribeRequest};
+use weirdnet_agent::remote::infer::v2::{EmbedRequest, Prefix, Request, Sampling, ScriptTurn, SpeakRequest, TranscribeRequest, Voice};
 use weirdnet_agent::remote::pool::{NoEvents, Pool};
 use weirdnet_agent::remote::{Authorize, Caller, RemoteError};
-use weirdnet_agent::{CancelToken, ContentPart, MediaLimits, Message, ToolSpec};
+use weirdnet_agent::speech::{AudioFormat, SpeechProfile};
+use weirdnet_agent::{CancelToken, ContentPart, MediaLimits, Message, Modalities, ToolSpec};
 use weirdnet_backends::{
     AdapterChange, Capabilities, Chunk, EngineKind, LoraAdapter, ModelHost, ModelLaunch, ModelState, RAW_INFER_PROTOCOL, RawInferDialer, Supervisor,
     SupervisorEvent, Wrap,
@@ -852,10 +855,243 @@ fn transcription_through_the_model_host() {
     })
 }
 
+/// What the mock engine was sent, read back from the audio it answered with (its samples are
+/// the request body's JSON, after a 44-byte header for WAV).
+fn sent(audio: &[u8], wav: bool) -> serde_json::Value {
+    let body = if wav { &audio[44..] } else { audio };
+    serde_json::from_slice(String::from_utf8_lossy(body).trim_end().as_bytes()).unwrap()
+}
+
+fn video_part(bytes: usize) -> ContentPart {
+    ContentPart::video_bytes(&vec![7u8; bytes], "video/mp4")
+}
+
+fn ask_video(bytes: usize) -> Vec<Message> {
+    vec![Message::user(vec![video_part(bytes), ContentPart::text("what happens")])]
+}
+
+fn native_video_reaches_vllm_and_is_refused_elsewhere() {
+    common::block_on(async {
+        let limits = MediaLimits::new().with_video_max_bytes(4096).with_video_max_seconds(60).with_video_frames_per_minute(120);
+        let vl = launch("vl", EngineKind::Vllm).with_video(true).with_limits(limits);
+        let gemma = launch("gemma", EngineKind::Llamacpp).with_mmproj("/models/mmproj-gemma.gguf").with_video(true);
+        let mlx = launch("mlx", EngineKind::Mlx).with_video(true);
+        let sup = supervisor(vec![vl, launch("vl-text", EngineKind::Vllm), gemma, mlx]);
+
+        // Only vLLM with the operator's word reads video; the catalog says so with the limits.
+        let status = sup.status();
+        let row = |id: &str| status.iter().find(|r| r.id == id).unwrap().clone();
+        assert!(row("vl").capabilities.unwrap().video);
+        for id in ["vl-text", "gemma", "mlx"] {
+            assert!(!row(id).capabilities.unwrap().video, "{id}");
+        }
+        let entry = row("vl").catalog_model(CatalogState::Loadable);
+        assert_eq!((entry.purpose, entry.inputs), (Purpose::Chat, Modalities::TEXT.with_video(true)));
+        assert_eq!(
+            (entry.limits.video_max_bytes, entry.limits.video_max_seconds, entry.limits.video_frames_per_minute),
+            (Some(4096), Some(60), Some(120))
+        );
+        assert_eq!(entry.limits.video_frame_rate(), Some(2.0));
+        assert!(!row("gemma").catalog_model(CatalogState::Loadable).inputs.video);
+        let back: weirdnet_backends::ModelStatus = serde_json::from_str(&serde_json::to_string(&row("vl")).unwrap()).unwrap();
+        assert_eq!(back, row("vl"));
+
+        for id in ["vl", "vl-text", "gemma"] {
+            sup.load(id).await.unwrap();
+        }
+        // vLLM gets the part as it came: `video_url` with the data: URL.
+        let chunks = collect(&sup, "vl", &Request::messages(ask_video(100))).await;
+        assert_eq!(text(&chunks), "Hello from vl! You said: what happens [1 video(s)]");
+        // Over the known size: refused before the engine, naming the limit.
+        let e = sup.chat("vl", &Request::messages(ask_video(5000))).await.err().unwrap();
+        assert!(matches!(&e, RemoteError::BadRequest { message } if message.contains("video_max_bytes")), "{e:?}");
+        // Elsewhere: Unsupported with the fallback, never sent.
+        for id in ["vl-text", "gemma"] {
+            let e = sup.chat(id, &Request::messages(ask_video(100))).await.err().unwrap();
+            assert!(matches!(&e, RemoteError::Unsupported { message } if message.ends_with(VIDEO_FALLBACK)), "{id}: {e:?}");
+        }
+
+        // Through the model host and a pool.
+        let auth: Arc<dyn Authorize> = Arc::new(|_: &Caller| Ok(()));
+        let host = Arc::new(ModelHost::new(sup.clone(), auth).with_default("gemma"));
+        let pool = Pool::new(Arc::new(serve("model-node", host, Admission::new(2))), vec!["model-node".to_string()]);
+        let cancel = CancelToken::new();
+        let a = pool.infer(Request::messages(ask_video(10)).with_model("vl"), &NoEvents, &cancel).await.unwrap();
+        assert_eq!(a.text, "Hello from vl! You said: what happens [1 video(s)]");
+        for req in [Request::messages(ask_video(10)).with_model("gemma"), Request::messages(ask_video(10))] {
+            let e = pool.infer(req, &NoEvents, &cancel).await.unwrap_err();
+            assert!(
+                matches!(&e.error, RemoteError::Unsupported { message } | RemoteError::BadRequest { message } if message.contains("video") && message.contains(VIDEO_FALLBACK)),
+                "{:?}",
+                e.error
+            );
+        }
+        sup.shutdown().await;
+    })
+}
+
+fn speech_through_the_model_host() {
+    common::block_on(async {
+        let kokoro =
+            ModelLaunch::new("kokoro-82m", EngineKind::Llamacpp, "/models/kokoro.gguf").with_mmproj("/models/mmproj-kokoro.gguf").with_speak(true);
+        let custom = ModelLaunch::new("qwen3-tts-1.7b-customvoice", EngineKind::VllmOmni, "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice").with_speak(true);
+        let base = ModelLaunch::new("qwen3-tts-0.6b-base", EngineKind::VllmOmni, "Qwen/Qwen3-TTS-12Hz-0.6B-Base").with_speak(true);
+        let mute = launch("mute", EngineKind::Llamacpp).with_speak(true);
+        let sup = supervisor(vec![kokoro, custom, base, mute, launch("chat", EngineKind::Llamacpp)]);
+
+        // Before any load: purpose and the catalog entry's profile; a speaker serves nothing else.
+        let status = sup.status();
+        let row = |id: &str| status.iter().find(|r| r.id == id).unwrap().clone();
+        assert_eq!(row("kokoro-82m").purpose(), Purpose::Speak);
+        assert_eq!(row("kokoro-82m").capabilities.unwrap(), Capabilities::default().with_speak(true));
+        assert_eq!((row("mute").purpose(), row("mute").speech.clone()), (Purpose::Chat, None), "llama.cpp needs the projector to speak");
+        let cataloged = row("kokoro-82m").speech.unwrap();
+        assert!(cataloged.presets.as_ref().unwrap().len() > 2 && cataloged.raw && cataloged.speed);
+        let entry = row("qwen3-tts-1.7b-customvoice").catalog_model(CatalogState::Loadable);
+        assert_eq!(entry.purpose, Purpose::Speak);
+        assert!(entry.speech.as_ref().unwrap().instructions);
+        assert!(row("chat").speech.is_none());
+        let e = sup.load("mute").await.unwrap_err();
+        assert!(e.to_string().contains("projector"), "{e:?}");
+
+        // Loaded: what the engine reports wins over the catalog, the rest is kept.
+        sup.load("kokoro-82m").await.unwrap();
+        let p = sup.speech("kokoro-82m").unwrap();
+        assert_eq!(p.presets, Some(vec!["af_heart".to_string(), "am_adam".to_string()]));
+        assert_eq!((p.languages.clone(), p.sample_rate, p.raw), (Some(vec!["en-us".to_string(), "en-gb".to_string()]), Some(24_000), true));
+        assert_eq!(p.formats, vec![AudioFormat::Wav, AudioFormat::Pcm16]);
+        let kept = sup.measured_limits("kokoro-82m").unwrap().speech.unwrap();
+        assert_eq!(kept.presets, Some(vec!["af_heart".to_string(), "am_adam".to_string()]), "the limits record carries the merged profile");
+        assert_eq!(sup.status().iter().find(|r| r.id == "kokoro-82m").unwrap().catalog_model(CatalogState::Loadable).speech, Some(p.clone()));
+
+        let auth: Arc<dyn Authorize> = Arc::new(|_: &Caller| Ok(()));
+        let host = Arc::new(ModelHost::new(sup.clone(), auth.clone()));
+        let pool = Pool::new(Arc::new(serve("model-node", host, Admission::new(2))), vec!["model-node".to_string()]);
+        let cancel = CancelToken::new();
+
+        // llama-server, whole file: WAV with its header's rate and channels.
+        let r = SpeakRequest::text("Hello").with_model("kokoro-82m").with_voice(Voice::preset("am_adam")).with_speed(1100).with_language("en-us");
+        let s = pool.speak(r, &cancel).await.unwrap();
+        assert_eq!((s.format, s.sample_rate, s.channels, s.model.as_str()), (AudioFormat::Wav, Some(24_000), Some(1), "kokoro-82m"));
+        let body = sent(&s.audio, true);
+        assert_eq!(body["voice"], "am_adam");
+        assert_eq!((body["speed"].as_f64(), body["lang"].as_str(), body["response_format"].as_str()), (Some(1.1), Some("en-us"), Some("wav")));
+        let usage = s.usage.unwrap();
+        assert_eq!(usage.input_chars, 5);
+        assert!(usage.audio_ms > 0);
+        // Streamed PCM: the rate from the Content-Type.
+        let r = SpeakRequest::text("Streamed words").with_model("kokoro-82m").with_format(AudioFormat::Pcm16).with_stream(true);
+        let s = pool.speak(r, &cancel).await.unwrap();
+        assert_eq!((s.format, s.sample_rate, s.channels), (AudioFormat::Pcm16, Some(24_000), Some(1)), "llama-server's pcm is mono");
+        assert!(s.usage.unwrap().audio_ms > 0);
+        let body = sent(&s.audio, false);
+        assert_eq!((body["response_format"].as_str(), body["stream_format"].as_str()), (Some("pcm"), Some("audio")));
+        // Streamed WAV: the header is read across pieces.
+        let r = SpeakRequest::text("More").with_model("kokoro-82m").with_stream(true);
+        let s = pool.speak(r, &cancel).await.unwrap();
+        assert_eq!((s.sample_rate, s.channels), (Some(24_000), Some(1)));
+        assert_eq!(sent(&s.audio, true)["input"], "More");
+
+        // What the model lacks is a BadRequest naming it; a format another engine makes fails over.
+        let e = pool.speak(SpeakRequest::text("hi").with_model("kokoro-82m").with_voice(Voice::preset("alloy")), &cancel).await.unwrap_err();
+        assert!(
+            matches!(&e, RemoteError::BadRequest { message } if message.contains("no preset voice `alloy`") && message.contains("am_adam")),
+            "{e:?}"
+        );
+        let clone = Voice::clone_from(wav(1000), "wav", Some("the words".into()), true);
+        let e = pool.speak(SpeakRequest::text("hi").with_model("kokoro-82m").with_voice(clone.clone()), &cancel).await.unwrap_err();
+        assert!(matches!(&e, RemoteError::BadRequest { message } if message.contains("does not clone")), "{e:?}");
+        let e = pool.speak(SpeakRequest::text("hi").with_model("kokoro-82m").with_format(AudioFormat::Mp3), &cancel).await.unwrap_err();
+        assert!(e.to_string().contains("mp3"), "{e:?}");
+        let e = sup.speak("kokoro-82m", &SpeakRequest::text("hi").with_format(AudioFormat::Mp3)).await.unwrap_err();
+        assert!(matches!(&e, RemoteError::Unsupported { .. }), "{e:?}");
+        let e = sup.speak("chat", &SpeakRequest::text("hi")).await.unwrap_err();
+        assert!(matches!(&e, RemoteError::Unsupported { message } if message.contains("does not speak")), "{e:?}");
+        // Engine failures.
+        let e = sup.speak("kokoro-82m", &SpeakRequest::text("FAIL500")).await.unwrap_err();
+        assert!(e.to_string().contains("synthesis crashed"), "{e:?}");
+        let e = sup.speak("kokoro-82m", &SpeakRequest::text("BUSY")).await.unwrap_err();
+        assert!(matches!(e, RemoteError::Busy), "{e:?}");
+
+        // vLLM-Omni CustomVoice: voices from /v1/audio/voices, rate from the probe's header.
+        sup.load("qwen3-tts-1.7b-customvoice").await.unwrap();
+        let p = sup.speech("qwen3-tts-1.7b-customvoice").unwrap();
+        assert_eq!((p.presets.clone(), p.sample_rate, p.instructions), (Some(vec!["vivian".to_string(), "ryan".to_string()]), Some(24_000), true));
+        // With no model named, the loaded speaker that covers the request.
+        let r = SpeakRequest::text("Hi there").with_voice(Voice::preset("vivian")).with_instructions("cheerful").with_stream(true);
+        let s = pool.speak(r, &cancel).await.unwrap();
+        assert_eq!((s.model.as_str(), s.sample_rate), ("qwen3-tts-1.7b-customvoice", Some(24_000)));
+        let body = sent(&s.audio, true);
+        assert_eq!(
+            (body["task_type"].as_str(), body["voice"].as_str(), body["instructions"].as_str()),
+            (Some("CustomVoice"), Some("vivian"), Some("cheerful"))
+        );
+        assert_eq!((body["stream"].as_bool(), body["stream_format"].as_str()), (Some(true), Some("audio")));
+        let s =
+            pool.speak(SpeakRequest::text("pcm please").with_voice(Voice::preset("ryan")).with_format(AudioFormat::Pcm16), &cancel).await.unwrap();
+        assert_eq!((s.format, s.sample_rate, s.channels), (AudioFormat::Pcm16, Some(24_000), None), "x-audio-sample-rate; channels unknown");
+        // The mock encodes WAV and PCM only: the engine's 400 comes back as a BadRequest.
+        let e =
+            pool.speak(SpeakRequest::text("hi").with_model("qwen3-tts-1.7b-customvoice").with_format(AudioFormat::Flac), &cancel).await.unwrap_err();
+        assert!(matches!(&e, RemoteError::BadRequest { message } if message.contains("wav and pcm only")), "{e:?}");
+
+        // vLLM-Omni Base: a clone goes as a data: URL with its transcript and a salt.
+        sup.load("qwen3-tts-0.6b-base").await.unwrap();
+        let s = pool.speak(SpeakRequest::text("In my voice").with_model("qwen3-tts-0.6b-base").with_voice(clone.clone()), &cancel).await.unwrap();
+        let body = sent(&s.audio, true);
+        assert!(body["ref_audio"].as_str().unwrap().starts_with("data:audio/wav;base64,UklGR"), "{body}");
+        assert_eq!((body["ref_text"].as_str(), body["task_type"].as_str()), (Some("the words"), Some("Base")));
+        assert_eq!(body["cache_salt"].as_str().unwrap().len(), 16);
+        // A clone without consent never reaches a backend.
+        let e = pool.speak(SpeakRequest::text("x").with_voice(Voice::clone_from(wav(10), "wav", None, false)), &cancel).await.unwrap_err();
+        assert!(e.to_string().contains("consent"), "{e:?}");
+        // No speaker covers a script.
+        let e = pool.speak(SpeakRequest::script(vec![ScriptTurn::new(0, "a"), ScriptTurn::new(1, "b")]), &cancel).await.unwrap_err();
+        assert!(e.to_string().contains("multi-speaker"), "{e:?}");
+
+        // Load on demand: a cold speaker is started.
+        sup.unload("kokoro-82m").await.unwrap();
+        let lazy = Arc::new(ModelHost::new(sup.clone(), auth.clone()).with_load_on_demand(true));
+        let lazy_pool = Pool::new(Arc::new(serve("lazy-node", lazy, Admission::new(2))), vec!["lazy-node".to_string()]);
+        let s = lazy_pool.speak(SpeakRequest::text("wake").with_model("kokoro-82m"), &cancel).await.unwrap();
+        assert_eq!(s.model, "kokoro-82m");
+        assert_eq!(sup.state("kokoro-82m"), Some(ModelState::Ready));
+        sup.shutdown().await;
+
+        // The operator narrows what the engine reports, and can't widen it.
+        let narrowed = ModelLaunch::new("kokoro-82m", EngineKind::Llamacpp, "/models/kokoro.gguf")
+            .with_mmproj("/models/mmproj-kokoro.gguf")
+            .with_speak(true)
+            .with_speech(SpeechProfile::new().with_presets(vec!["am_adam".into()]).with_max_input_chars(10));
+        let sup = supervisor(vec![narrowed.clone()]);
+        sup.load("kokoro-82m").await.unwrap();
+        let p = sup.speech("kokoro-82m").unwrap();
+        assert_eq!((p.presets, p.max_input_chars), (Some(vec!["am_adam".to_string()]), Some(10)));
+        let e = sup.speak("kokoro-82m", &SpeakRequest::text("far more than ten characters")).await.unwrap_err();
+        assert!(matches!(&e, RemoteError::BadRequest { message } if message.contains("at most 10 characters")), "{e:?}");
+        let e = sup.speak("kokoro-82m", &SpeakRequest::text("hi").with_voice(Voice::preset("af_heart"))).await.unwrap_err();
+        assert!(e.to_string().contains("af_heart"), "{e:?}");
+        // Checked against the catalog entry (found by id) before anything else.
+        let wide = narrowed.clone().with_speech(SpeechProfile::new().with_presets(vec!["alloy".into()]));
+        let e = sup.add_model(wide).unwrap_err();
+        assert!(e.to_string().contains("widen"), "{e:?}");
+        sup.shutdown().await;
+
+        // A node without a speaker.
+        let none = supervisor(vec![launch("chat", EngineKind::Llamacpp)]);
+        let host = Arc::new(ModelHost::new(none.clone(), auth).with_load_on_demand(true));
+        let pool = Pool::new(Arc::new(serve("plain", host, Admission::new(2))), vec!["plain".to_string()]);
+        let e = pool.speak(SpeakRequest::text("hi"), &cancel).await.unwrap_err();
+        assert!(e.to_string().contains("speech"), "{e:?}");
+    })
+}
+
 fn main() {
     common::main(&[
         ("measured_limits_reach_status_and_catalog", measured_limits_reach_status_and_catalog as fn()),
         ("transcription_through_the_model_host", transcription_through_the_model_host as fn()),
+        ("native_video_reaches_vllm_and_is_refused_elsewhere", native_video_reaches_vllm_and_is_refused_elsewhere as fn()),
+        ("speech_through_the_model_host", speech_through_the_model_host as fn()),
         ("lora_adapters_on_a_base", lora_adapters_on_a_base as fn()),
         ("live_adapter_changes", live_adapter_changes),
         ("mlx_behind_its_proxy", mlx_behind_its_proxy as fn()),

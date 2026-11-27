@@ -32,6 +32,19 @@
 //! instruction names one). As vLLM, `/v1/audio/transcriptions` (multipart) answers "heard N bytes"
 //! for the `file` part, with the language and, for `verbose_json`, a duration and two segments.
 //!
+//! Video: as vLLM, `video_url` parts (a `data:video/` URL) are counted into the answer
+//! ("... [1 video(s)]"); llama-server and MLX-LM refuse them like an engine without video.
+//!
+//! Speech: `/v1/audio/speech` as llama-server (with `--mmproj`) and as vLLM-Omni (`--omni`).
+//! The audio's samples are the request body's JSON, so a test can read what the engine was sent:
+//! WAV (24 kHz mono 16-bit; streamed with placeholder sizes) or raw PCM (`pcm`; llama-server says
+//! `audio/pcm;rate=24000`, vLLM-Omni `x-audio-sample-rate: 24000`). Streamed (llama-server
+//! `stream_format: "audio"`, vLLM-Omni `stream: true`) in three pieces, the first shorter than a
+//! WAV header. Other formats are refused in each flavor's words, a reference that isn't a
+//! `data:` URL is refused, input containing `BUSY` is a 503 and `FAIL500` a 500. llama-server's
+//! `/props` lists `voices` for a Kokoro projector (`af_heart`, `am_adam`); vLLM-Omni's
+//! `/v1/audio/voices` lists `vivian` and `ryan` for a CustomVoice checkpoint.
+//!
 //! Port races: with `--mock-port-race MODE FILE`, the first launch (while FILE doesn't exist)
 //! creates FILE and misbehaves: `impostor` serves as a stranger would (another key, healthy at
 //! once), `in-use` logs llama-server's "couldn't bind" line and exits, `held` has another process
@@ -63,6 +76,10 @@ struct Mock {
     runtime_lora: bool,
     /// Started as vLLM (`--served-model-name`).
     vllm: bool,
+    /// Started as vLLM-Omni (`--omni`).
+    omni: bool,
+    /// Preset voices it reports.
+    voices: Vec<String>,
     /// `--ctx-size`, `--parallel`, `--max-model-len`.
     ctx: Option<u64>,
     parallel: u64,
@@ -136,6 +153,15 @@ async fn serve() {
     assert!(modules.is_empty() || enable_lora, "--lora-modules needs --enable-lora");
     assert!(!enable_lora || flag("--max-loras").is_some_and(|n| n.parse::<u32>().unwrap() >= modules.len().max(1) as u32), "--max-loras");
     let runtime_lora = enable_lora && std::env::var("VLLM_ALLOW_RUNTIME_LORA_UPDATING").as_deref() == Ok("True");
+    let omni = args.iter().any(|a| a == "--omni");
+    assert!(!args.iter().any(|a| a.starts_with("--allowed-local-media-path")), "vLLM-Omni never reads local media");
+    let voices: Vec<String> = if omni && alias.contains("customvoice") {
+        vec!["vivian".into(), "ryan".into()]
+    } else if flag("--mmproj").is_some_and(|m| m.contains("kokoro")) {
+        vec!["af_heart".into(), "am_adam".into()]
+    } else {
+        Vec::new()
+    };
     let st = Arc::new(Mock {
         projector,
         alias,
@@ -146,6 +172,8 @@ async fn serve() {
         modules: std::sync::Mutex::new(modules),
         runtime_lora,
         vllm: flag("--served-model-name").is_some(),
+        omni,
+        voices,
         ctx: flag("--ctx-size").and_then(|v| v.parse().ok()),
         parallel: flag("--parallel").and_then(|v| v.parse().ok()).unwrap_or(1),
         max_model_len: flag("--max-model-len").and_then(|v| v.parse().ok()),
@@ -155,10 +183,15 @@ async fn serve() {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions));
-    if st.vllm {
+    if st.omni {
+        app = app.route("/v1/audio/speech", post(speech)).route("/v1/audio/voices", get(voices_list));
+    } else if st.vllm {
         app = app.route("/v1/audio/transcriptions", post(transcriptions));
     } else if !mlx {
         app = app.route("/props", get(props));
+        if st.projector {
+            app = app.route("/v1/audio/speech", post(speech));
+        }
     }
     if runtime_lora {
         app = app.route("/v1/load_lora_adapter", post(load_lora)).route("/v1/unload_lora_adapter", post(unload_lora));
@@ -199,7 +232,97 @@ async fn props(State(st): State<Arc<Mock>>, headers: HeaderMap) -> Response {
         Some(c) => json!({"n_ctx": c / st.parallel.max(1)}),
         None => json!({}),
     };
-    axum::Json(json!({"default_generation_settings": settings, "total_slots": st.parallel})).into_response()
+    let mut v = json!({"default_generation_settings": settings, "total_slots": st.parallel});
+    if !st.voices.is_empty() {
+        v["voices"] = json!(st.voices);
+    }
+    axum::Json(v).into_response()
+}
+
+async fn voices_list(State(st): State<Arc<Mock>>, headers: HeaderMap) -> Response {
+    if !authorized(&st, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    axum::Json(json!({"voices": st.voices})).into_response()
+}
+
+/// A WAV header for `data` bytes of 24 kHz mono 16-bit (sizes as placeholders when streamed).
+fn wav_header(data: usize, streamed: bool) -> Vec<u8> {
+    let rate = 24_000u32;
+    let size = |n: usize| if streamed { u32::MAX } else { n as u32 };
+    let mut out = b"RIFF".to_vec();
+    out.extend(size(36 + data).to_le_bytes());
+    out.extend(b"WAVEfmt ");
+    out.extend(16u32.to_le_bytes());
+    out.extend(1u16.to_le_bytes());
+    out.extend(1u16.to_le_bytes());
+    out.extend(rate.to_le_bytes());
+    out.extend((rate * 2).to_le_bytes());
+    out.extend(2u16.to_le_bytes());
+    out.extend(16u16.to_le_bytes());
+    out.extend(b"data");
+    out.extend(size(data).to_le_bytes());
+    out
+}
+
+async fn speech(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>) -> Response {
+    let error = |code: StatusCode, msg: &str| (code, axum::Json(json!({"error": {"message": msg}}))).into_response();
+    if !authorized(&st, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "Invalid API Key");
+    }
+    if body["model"].as_str() != Some(st.alias.as_str()) {
+        return error(StatusCode::BAD_REQUEST, "unknown model");
+    }
+    let text = body.to_string();
+    if text.contains("http://") || text.contains("https://") || text.contains("file://") {
+        return error(StatusCode::BAD_REQUEST, "remote references are refused");
+    }
+    if body["ref_audio"].as_str().is_some_and(|u| !u.starts_with("data:audio/")) {
+        return error(StatusCode::BAD_REQUEST, "ref_audio must be a data: URL");
+    }
+    let input = body["input"].as_str().unwrap_or("");
+    if input.contains("BUSY") {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "busy");
+    }
+    if input.contains("FAIL500") {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "synthesis crashed");
+    }
+    let format = body["response_format"].as_str().unwrap_or("wav");
+    if !matches!(format, "wav" | "pcm") {
+        let msg = if st.omni { "the mock encodes wav and pcm only" } else { "response_format must be wav or pcm" };
+        return error(StatusCode::BAD_REQUEST, msg);
+    }
+    let streamed = if st.omni { body["stream"] == true } else { body["stream_format"] == "audio" };
+    let mut payload = text.into_bytes();
+    if payload.len() % 2 == 1 {
+        payload.push(b' ');
+    }
+    let wav = format == "wav";
+    let audio = if wav { [wav_header(payload.len(), streamed), payload].concat() } else { payload };
+    let ct = if wav {
+        "audio/wav"
+    } else if st.omni {
+        "audio/pcm"
+    } else {
+        "audio/pcm;rate=24000"
+    };
+    let mut resp = if streamed {
+        let cut1 = 20.min(audio.len());
+        let cut2 = cut1 + (audio.len() - cut1) / 2;
+        let pieces = vec![audio[..cut1].to_vec(), audio[cut1..cut2].to_vec(), audio[cut2..].to_vec()];
+        let stream = futures::stream::unfold(pieces.into_iter(), |mut it| async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            it.next().map(|p| (Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(p)), it))
+        });
+        axum::body::Body::from_stream(stream).into_response()
+    } else {
+        axum::body::Body::from(audio).into_response()
+    };
+    resp.headers_mut().insert("content-type", ct.parse().unwrap());
+    if st.omni {
+        resp.headers_mut().insert("x-audio-sample-rate", "24000".parse().unwrap());
+    }
+    resp
 }
 
 /// The named parts of a multipart body: name, file name, bytes.
@@ -353,7 +476,13 @@ async fn chat(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body):
     let last_user = messages.iter().rev().find(|m| m["role"] == "user");
     let parts = last_user.and_then(|m| m["content"].as_array()).cloned().unwrap_or_default();
     let count = |t: &str| parts.iter().filter(|p| p["type"] == t).count();
-    let (images, audio) = (count("image_url"), count("input_audio"));
+    let (images, audio, video) = (count("image_url"), count("input_audio"), count("video_url"));
+    if video > 0 && !st.vllm {
+        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": {"message": "video input is not supported"}}))).into_response();
+    }
+    if parts.iter().any(|p| p["type"] == "video_url" && !p["video_url"]["url"].as_str().is_some_and(|u| u.starts_with("data:video/"))) {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": {"message": "bad video"}}))).into_response();
+    }
     if (images > 0 || audio > 0) && !st.projector {
         let msg = if images > 0 {
             "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj"
@@ -382,6 +511,9 @@ async fn chat(State(st): State<Arc<Mock>>, headers: HeaderMap, axum::Json(body):
     }
     if audio > 0 && !said.starts_with("heard ") {
         said.push_str(&format!(" [{audio} audio]"));
+    }
+    if video > 0 {
+        said.push_str(&format!(" [{video} video(s)]"));
     }
     let chunk = |delta: Value, finish: Option<&str>| json!({"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
     let mut events = vec![chunk(json!({"role": "assistant", "content": null}), None)];

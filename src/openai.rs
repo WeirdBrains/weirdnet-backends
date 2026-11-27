@@ -9,7 +9,7 @@ use weirdnet_agent::{Message, Role, ToolSpec};
 use crate::engine::EngineKind;
 use crate::error::bad_request;
 
-/// An OpenAI chat message. Image and audio parts go through unchanged, in the OpenAI shape.
+/// An OpenAI chat message. Image, audio and video parts go through unchanged, in the OpenAI shape.
 pub fn message(m: &Message) -> Value {
     let role = match m.role {
         Role::System => "system",
@@ -114,11 +114,22 @@ pub fn chat_body(request: &Request, alias: &str, engine: EngineKind) -> Result<V
     chat_body_for(request, &Target::base(alias), engine)
 }
 
-/// [`chat_body`] for a [`Target`]: a base model or an adapter on one.
+/// `Unsupported` for a video part on an engine that takes none (llama.cpp, MLX-LM), with
+/// `weirdnet-agent`'s fallback (send frames instead), so a pool can try a model that reads video.
+pub(crate) fn no_video(engine: EngineKind) -> RemoteError {
+    RemoteError::Unsupported { message: format!("{} takes no video parts; {}", engine.name(), weirdnet_agent::remote::catalog::VIDEO_FALLBACK) }
+}
+
+/// [`chat_body`] for a [`Target`]: a base model or an adapter on one. Video parts
+/// (`video_url`) go through unchanged to vLLM; on an engine without native video the request is
+/// `Unsupported` (since 0.4.10).
 pub fn chat_body_for(request: &Request, target: &Target, engine: EngineKind) -> Result<Value, RemoteError> {
     let Input::Messages(messages) = &request.input else {
         return Err(bad_request("chat takes assembled messages, not a context_ref or a raw prompt"));
     };
+    if crate::model_needs(messages).video && !engine.capabilities().video {
+        return Err(no_video(engine));
+    }
     let mut msgs: Vec<Value> = messages.iter().map(message).collect();
     let prefix = request.assistant_prefix.as_ref().filter(|p| !p.text.is_empty());
     if let Some(p) = prefix {
@@ -173,6 +184,22 @@ pub fn completion_body_for(prompt: &str, s: &Sampling, seed: Option<u64>, target
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_parts_go_through_to_vllm_only() {
+        let video = weirdnet_agent::ContentPart::video_bytes(&[1, 2, 3], "video/mp4");
+        let r = Request::messages(vec![Message::user(vec![video, weirdnet_agent::ContentPart::text("what happens")])]);
+        let b = chat_body(&r, "vl", EngineKind::Vllm).unwrap();
+        assert_eq!(b["messages"][0]["content"][0], json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AQID"}}));
+        for engine in [EngineKind::Llamacpp, EngineKind::Mlx, EngineKind::VllmOmni] {
+            let e = chat_body(&r, "m", engine).unwrap_err();
+            assert!(
+                matches!(&e, RemoteError::Unsupported { message } if message.contains("takes no video") && message.ends_with(weirdnet_agent::remote::catalog::VIDEO_FALLBACK)),
+                "{engine:?}: {e:?}"
+            );
+        }
+        assert!(crate::mlx::has_media(&b));
+    }
 
     #[test]
     fn adapter_targets() {

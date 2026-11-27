@@ -4,7 +4,7 @@ The Weirdnet model-node wrapper. A model node runs models and takes requests, li
 vLLM or MLX-LM server (it can even be one: a stock server it only wraps). This crate starts and stops
 the engines and serves them to inference nodes; what to load is always the caller's decision.
 
-- `EngineConfig` / `ModelLaunch`: how `llama-server`, `vllm serve` and MLX-LM's
+- `EngineConfig` / `ModelLaunch`: how `llama-server`, `vllm serve`, vLLM-Omni and MLX-LM's
   `mlx_lm.server` are launched (loopback only, random port, per-process API key in the
   environment, or checked by a proxy for MLX-LM) and probed. Ready means the server on the
   port takes the launch's key and lists its model; a port taken by another process before the
@@ -39,6 +39,40 @@ the engines and serves them to inference nodes; what to load is always the calle
   (`InferHost::open_transcribe`): `Supervisor::transcribe` sends llama.cpp a greedy chat request
   with the clip as a base64 `input_audio` part, and vLLM a `/v1/audio/transcriptions` request
   (segments with timestamps when asked).
+- **Native video** (since 0.4.10): `ModelLaunch::with_video(true)` marks a vLLM model that reads
+  whole clips (Qwen2.5-VL, Qwen3-VL; a wrapped mistral.rs server is declared as vLLM), which
+  the engine can't report. `Capabilities::video` and `inputs().video` put it in catalog/1
+  `inputs.video`, with the `MediaLimits` video fields (`video_max_seconds`, `video_max_bytes`,
+  `video_frames_per_minute`, `video_frame_rate()`) from the operator's limits or a measured
+  record. `video_url` parts (weirdnet-agent `ContentPart::VideoUrl`, a `data:video/` URL) go to
+  vLLM unchanged; on llama.cpp, MLX-LM or a model not marked, the request is `Unsupported` with
+  weirdnet-agent's `VIDEO_FALLBACK` ("send the video as frames ... instead"), so a pool tries a
+  node that reads video, and a clip over `video_max_bytes` is a `BadRequest` naming the limit.
+- **Speech out** (text to speech, since 0.4.10): `ModelLaunch::with_speak(true)` gives a model
+  the speech role, served on llama.cpp (a speech GGUF with its projector: Kokoro, VoxCPM2,
+  Fish Audio Drama 3, Qwen3-TTS Base) or on vLLM-Omni (`EngineKind::VllmOmni`,
+  `EngineConfig::vllm_omni`, started as `vllm serve MODEL --omni`; Qwen3-TTS CustomVoice,
+  VoiceDesign and Base). A speaker speaks and does nothing else: `Capabilities::speak`, catalog/1
+  `Purpose::Speak`. Its **speech profile** (weirdnet-agent `SpeechProfile`: presets, design,
+  instructions, clone mode, script speakers, raw, speed, streaming, languages, formats, sample
+  rate, limits, license) is `ModelStatus::speech` and `CatalogModel::speech`: what the engine
+  reports at load (llama-server `/props` `voices`; vLLM-Omni `GET /v1/audio/voices` and the
+  sample rate of a one-word probe) over what the GGUF headers or the weirdnet-model catalog entry
+  say (`SpeechProfile::or`), narrowed by the operator's `ModelLaunch::with_speech`
+  (`check_speech` refuses settings that widen it). The merged profile is kept in the limits
+  record (`LimitsRecord::speech`, `Supervisor::set_limits_store`). `ModelHost` serves infer/2
+  `Speak` (`InferHost::open_speak`, `EngineModel` as the `SpeakBackend`) through
+  `Supervisor::speak`, which checks the request against the profile (what the model lacks is a
+  `BadRequest` naming it; a format only another engine makes is `Unsupported`) and calls the
+  engine's `/v1/audio/speech`: a preset `voice`, a designed voice (VoxCPM2's parenthesized prefix
+  on llama-server, `instructions` on vLLM-Omni), style `instructions`, a cloned voice
+  (llama-server `speaker_ref_b64`/`speaker_ref_text`, vLLM-Omni `ref_audio` as a `data:` URL
+  only with `ref_text` and a per-request `cache_salt`), Drama 3 scripts as `<|speaker:N|>` tags,
+  raw phonemes (`raw_prompt`), speed, language, seed, format, and streaming (`stream_format:
+  "audio"`). Audio comes back whole or as it streams, with the format, sample rate and channels
+  when known, and usage (characters, milliseconds). A reference transcript the model doesn't use
+  is named in `Meta::ignored`. Nothing spoken is logged; reference clips stay in memory and
+  are never sent as URLs or paths.
 - `Supervisor`: load and unload with draining, **swap groups** (loading one model of a group
   unloads the others), **idle unload**, crash restarts with exponential backoff and crash-loop
   detection, `SupervisorEvent`s, per-model logs; chat, completion and embedding forwarding.
@@ -261,6 +295,7 @@ How inference nodes drive model nodes over [`weirdnet-net`](https://crates.io/cr
 |---|---|---|---|
 | llama.cpp | yes | yes | yes |
 | vLLM | yes | no (vLLM is Linux-only) | no |
+| vLLM-Omni | yes (NVIDIA) | no | no |
 | MLX-LM | no | Apple silicon only | no |
 | Graceful stop (SIGTERM, then SIGKILL after a grace period) | yes | yes | no: killed outright |
 | Engine in its own process group (children stopped too) | yes | yes | no |
@@ -272,6 +307,7 @@ The Unix-only pieces are behind `cfg(unix)`; the library builds everywhere.
 ## Tests
 
 The adapter tests run against a mock engine (the test binary re-executes itself as a fake
-`llama-server`/`vllm serve`/`mlx_lm.server`), never a real one. The MLX proxy has unit tests
+`llama-server`/`vllm serve`/`vllm serve --omni`/`mlx_lm.server`, with `/v1/audio/speech` in
+both speech flavors), never a real one. The MLX proxy has unit tests
 against a fake MLX-LM server in `src/mlx.rs`; no test runs a real `mlx_lm.server`. `tests/node.rs` runs node/1 and raw infer/2
 between in-process `weirdnet-net` nodes on the memory transport.

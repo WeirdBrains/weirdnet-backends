@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Native video, for Bragi and Ymir: `ModelLaunch::video` and `with_video` (the operator marks a vLLM model that reads whole clips), `Capabilities::video` and `with_video`, with `Capabilities::inputs` carrying `Modalities::video` into catalog/1 `inputs.video` and the video `MediaLimits` (`video_max_seconds`, `video_max_bytes`, `video_frames_per_minute`) in capability records and catalog entries. `video_url` parts go to vLLM unchanged; `Supervisor::chat`, `openai::chat_body` and `ModelHost` refuse video on llama.cpp, MLX-LM or an unmarked model as `Unsupported` ending with weirdnet-agent's `VIDEO_FALLBACK`, and a clip over `video_max_bytes` as a `BadRequest` naming the limit. The MLX proxy counts `video_url` as media.
+- Speech out (text to speech), following Ymir's audio design: `EngineKind::VllmOmni` (`vllm-omni` on the wire; `vllm serve MODEL --omni`, never with `--allowed-local-media-path`) with `EngineConfig::vllm_omni`; `EngineKind::parse`, `supported`, `supported_here`, `program` and `install_hint`; `EngineConfig::version`. `ModelLaunch::speak` and `with_speak`, `ModelLaunch::speech` and `with_speech` (operator settings, narrowing only), `ModelLaunch::cataloged_speech` and `check_speech`; `Capabilities::speak` and `with_speak` (purpose `Purpose::Speak`); `ModelStatus::speech` (filled into catalog/1 `CatalogModel::speech` by `apply_to`) and `Supervisor::speech`: what the engine reports at load (llama-server `/props` voices; vLLM-Omni `/v1/audio/voices` and a probe's sample rate) over the GGUF headers or the weirdnet-model catalog entry (`SpeechProfile::or`), kept in `LimitsRecord::speech`. `Supervisor::speak` with llama-server and vLLM-Omni `/v1/audio/speech` adapters (presets, design, instructions, cloning from inline clips only, scripts, raw input, speed, language, seed, format, streaming); `ModelHost` serves infer/2 `Speak` (`InferHost::open_speak`, `EngineModel` as `SpeakBackend`). `SpeechProfile` is re-exported at the crate root.
+
+### Changed
+
+- Needs weirdnet-agent 0.5.11 and weirdnet-model 0.5.5.
+
 ## [0.4.9] - 2026-11-26
 
 ### Added

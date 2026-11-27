@@ -1,5 +1,6 @@
 //! The model node's inference side: a `weirdnet-agent` [`InferHost`] over the [`Supervisor`],
-//! serving raw infer/2 (assembled messages in, tokens out; cancel aborts the engine request).
+//! serving raw infer/2 (assembled messages in, tokens out; cancel aborts the engine request),
+//! transcription (infer/2 `Transcribe`) and speech out (infer/2 `Speak`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use weirdnet_agent::remote::infer::InferHost;
 use weirdnet_agent::remote::infer::v2::{
-    self, EmbedBackend, Finish, InferBackend, Input, Output, Request, TranscribeBackend, TranscribeRequest, Transcript, Usage,
+    self, AudioStream, EmbedBackend, Finish, InferBackend, Input, Output, Request, SpeakBackend, SpeakRequest, TranscribeBackend, TranscribeRequest,
+    Transcript, Usage,
 };
 use weirdnet_agent::remote::{Authorize, Caller, Channel, Dialer, RemoteError};
 use weirdnet_agent::{CancelToken, Modalities, ModelBackend};
@@ -110,7 +112,8 @@ impl ModelHost {
         }
         let id = model.map(str::to_string).or_else(|| self.default_model.clone()).ok_or_else(|| bad_request("no model named and no default"))?;
         if let Some(what) = self.supervisor.capabilities(&id).and_then(|c| c.lacking(needed)) {
-            return Err(RemoteError::Unsupported { message: format!("model `{id}` does not take {what} on this node") });
+            let fallback = if needed.video { format!("; {}", weirdnet_agent::remote::catalog::VIDEO_FALLBACK) } else { String::new() };
+            return Err(RemoteError::Unsupported { message: format!("model `{id}` does not take {what} on this node{fallback}") });
         }
         match self.supervisor.state(&id) {
             None => Err(crate::error::unknown_model(&id)),
@@ -142,6 +145,75 @@ impl ModelHost {
                     Some(id) => id.clone(),
                     None if ids.is_empty() => return Err(unavailable("no transcription model on this node")),
                     None => return Err(unavailable(format!("no transcription model is loaded on this node ({})", ids.join(", ")))),
+                }
+            }
+        };
+        self.pick(Some(&id), false, Modalities::TEXT)
+    }
+
+    /// The model for a speech request: a named one must speak here
+    /// ([`Capabilities::speak`](crate::Capabilities::speak)) and its profile cover the request
+    /// (what it lacks is a `BadRequest`; an output format this engine doesn't make is
+    /// `Unsupported`, as are models that don't speak here, so a pool tries elsewhere). With none
+    /// named, the speakers whose profile covers the request, the ready one first by id, else
+    /// (loading on demand) the first by id.
+    fn pick_speaker(&self, request: &SpeakRequest) -> Result<(String, bool), RemoteError> {
+        let speaks = |id: &str| self.supervisor.capabilities(id).is_some_and(|c| c.speak);
+        let needs = request.needs();
+        let covers = |id: &str| -> Result<(), String> {
+            match self.supervisor.speech(id) {
+                Some(p) => p.covers(&needs),
+                None => Err("has speech settings that widen what its engine reports".into()),
+            }
+        };
+        let id = match request.model.as_deref() {
+            Some(id) => {
+                if self.supervisor.state(id).is_none() {
+                    return Err(crate::error::unknown_model(id));
+                }
+                if !speaks(id) {
+                    return Err(RemoteError::Unsupported { message: format!("model `{id}` does not speak on this node") });
+                }
+                if let Err(why) = covers(id) {
+                    let mut other_format = needs.clone();
+                    other_format.format = None;
+                    let format_only = needs.format.is_some() && self.supervisor.speech(id).is_some_and(|p| p.covers(&other_format).is_ok());
+                    return Err(if format_only {
+                        RemoteError::Unsupported { message: format!("model `{id}` {why} on this node") }
+                    } else {
+                        bad_request(format!("model `{id}` {why}"))
+                    });
+                }
+                id.to_string()
+            }
+            None => {
+                let all: Vec<String> = self.supervisor.launches().into_iter().map(|l| l.id).filter(|id| speaks(id)).collect();
+                if all.is_empty() {
+                    return Err(unavailable("no speech model on this node"));
+                }
+                let mut why = None;
+                let ids: Vec<&String> = all
+                    .iter()
+                    .filter(|id| match covers(id) {
+                        Ok(()) => true,
+                        Err(w) => {
+                            why.get_or_insert_with(|| format!("`{id}` {w}"));
+                            false
+                        }
+                    })
+                    .collect();
+                let ready = ids.iter().find(|id| self.supervisor.state(id) == Some(ModelState::Ready));
+                match ready.or(ids.first().filter(|_| self.load_on_demand)) {
+                    Some(id) => (*id).clone(),
+                    None if ids.is_empty() => {
+                        return Err(RemoteError::Unsupported {
+                            message: format!("no speech model on this node covers the request ({})", why.unwrap_or_default()),
+                        });
+                    }
+                    None => {
+                        let names: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+                        return Err(unavailable(format!("no speech model is loaded on this node ({})", names.join(", "))));
+                    }
                 }
             }
         };
@@ -184,6 +256,17 @@ impl InferHost for ModelHost {
     /// [`Supervisor::transcribe`](crate::Supervisor::transcribe).
     fn open_transcribe(&self, _caller: &Caller, model: Option<&str>) -> Result<Arc<dyn TranscribeBackend>, RemoteError> {
         let (id, load) = self.pick_transcriber(model)?;
+        Ok(Arc::new(self.backend(id, load)))
+    }
+
+    /// A speaking model on this node ([`Capabilities::speak`](crate::Capabilities::speak))
+    /// whose speech profile covers the request: the named one, or with none named the loaded one
+    /// (first by id; with load on demand, the first by id even when not loaded). A named model
+    /// that lacks what the request needs is a `BadRequest` that says what; one that doesn't speak
+    /// here is `Unsupported` (a pool tries elsewhere); none at all is unavailable. Served by
+    /// [`Supervisor::speak`](crate::Supervisor::speak). Since 0.4.10.
+    fn open_speak(&self, _caller: &Caller, request: &SpeakRequest) -> Result<Arc<dyn SpeakBackend>, RemoteError> {
+        let (id, load) = self.pick_speaker(request)?;
         Ok(Arc::new(self.backend(id, load)))
     }
 }
@@ -309,6 +392,26 @@ impl TranscribeBackend for EngineModel {
         tokio::select! {
             _ = cancel.cancelled() => Err(RemoteError::Cancelled),
             r = self.supervisor.transcribe(&self.id, request) => r,
+        }
+    }
+}
+
+#[async_trait]
+impl SpeakBackend for EngineModel {
+    fn name(&self) -> String {
+        self.id.clone()
+    }
+
+    /// The speech from [`Supervisor::speak`](crate::Supervisor::speak), loading the model first
+    /// when it was picked cold. Cancelling stops the engine request.
+    async fn speak(&self, request: &SpeakRequest, cancel: &CancelToken) -> Result<AudioStream, RemoteError> {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(RemoteError::Cancelled),
+            r = self.ready() => r?,
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => Err(RemoteError::Cancelled),
+            r = self.supervisor.speak(&self.id, request) => r,
         }
     }
 }

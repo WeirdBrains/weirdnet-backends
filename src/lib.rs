@@ -4,8 +4,9 @@
 //! a stock server it only wraps). This crate starts and stops the engines and serves them; it
 //! decides nothing beyond the node: what to load is the caller's decision.
 //!
-//! - [`engine`]: how llama.cpp `llama-server`, `vllm serve` and MLX-LM's `mlx_lm.server` are
-//!   launched and probed, each model's [`Capabilities`] (chat, embeddings, images, audio), and
+//! - [`engine`]: how llama.cpp `llama-server`, `vllm serve`, vLLM-Omni (`vllm serve --omni`) and
+//!   MLX-LM's `mlx_lm.server` are launched and probed, each model's [`Capabilities`] (chat,
+//!   embeddings, images, audio, video, transcription, speech), and
 //!   [`Wrap`] for a stock OpenAI-compatible server on loopback, and [`LoraAdapter`]s served
 //!   next to a llama.cpp or vLLM base model.
 //! - [`mlx`]: installing a pinned `mlx-lm` into a venv, and the proxy the supervisor puts in front
@@ -20,7 +21,8 @@
 //!   streamed tool calls.
 //! - [`openai`]: engine request bodies from `weirdnet-agent` infer/2 requests.
 //! - [`host`]: [`ModelHost`], a `weirdnet-agent` `InferHost` serving raw infer/2 from the
-//!   supervisor's models, transcription (infer/2 `Transcribe`) included.
+//!   supervisor's models, transcription (infer/2 `Transcribe`) and speech out (infer/2 `Speak`,
+//!   llama-server's and vLLM-Omni's `/v1/audio/speech`) included.
 //! - `node` (feature): `/weirdnet-backends/node/1` over `weirdnet-net`: signed capability
 //!   records, `Load`, `Unload`, `Drain`, `Reserve`/`Release`, `GroupUp`/`GroupDown` and health.
 //! - `models` (feature `node`): `/weirdnet-backends/models/1`, for the owner only: search the
@@ -32,7 +34,7 @@
 //! Platforms: the supervisor runs on Unix and Windows. On Unix an engine gets its own process
 //! group, stops with SIGTERM then SIGKILL after a grace period, and on Linux dies with its
 //! parent; on Windows the engine process is killed outright and processes it started are not.
-//! vLLM runs on Linux only; MLX-LM on macOS on Apple silicon only.
+//! vLLM and vLLM-Omni run on Linux only; MLX-LM on macOS on Apple silicon only.
 
 pub mod engine;
 pub mod error;
@@ -46,6 +48,7 @@ pub mod models;
 #[cfg(feature = "node")]
 pub mod node;
 pub mod openai;
+mod speak;
 pub mod sse;
 pub mod supervisor;
 mod transcribe;
@@ -57,3 +60,9 @@ pub use sse::{Chunk, ChunkDecoder, SseParser, ToolCalls};
 pub use supervisor::{
     AdapterChange, ChunkStream, MAX_ADAPTER_SCALE, ModelState, ModelStatus, Reservation, Supervisor, SupervisorEvent, SupervisorOptions,
 };
+pub use weirdnet_agent::speech::SpeechProfile;
+
+/// What `messages` need beyond text (images, audio, video).
+pub(crate) fn model_needs(messages: &[weirdnet_agent::Message]) -> weirdnet_agent::Modalities {
+    weirdnet_agent::model::needs(messages)
+}

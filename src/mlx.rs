@@ -116,7 +116,9 @@ pub fn has_media(body: &Value) -> bool {
     body["messages"].as_array().is_some_and(|ms| {
         ms.iter().any(|m| {
             m["content"].as_array().is_some_and(|parts| {
-                parts.iter().any(|p| matches!(p["type"].as_str(), Some("image_url" | "input_image" | "image" | "input_audio" | "audio")))
+                parts.iter().any(|p| {
+                    matches!(p["type"].as_str(), Some("image_url" | "input_image" | "image" | "input_audio" | "audio" | "video_url" | "video"))
+                })
             })
         })
     })

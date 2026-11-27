@@ -14,7 +14,10 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use weirdnet_agent::remote::RemoteError;
-use weirdnet_agent::remote::infer::v2::{Request, Sampling, TranscribeRequest, Transcript, Usage};
+use weirdnet_agent::remote::infer::v2::{
+    AudioHeader, AudioStream, Request, Sampling, SpeakRequest, SpeechPiece, TranscribeRequest, Transcript, Usage,
+};
+use weirdnet_agent::speech::{AudioFormat, SpeechProfile};
 use weirdnet_model::ModelStore;
 use weirdnet_model::limits::LimitsRecord;
 
@@ -171,6 +174,15 @@ pub struct ModelStatus {
     /// when the engine doesn't say, and in records from nodes before 0.4.9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+    /// What a speaking model does ([`Capabilities::speak`]): what the engine reported at load
+    /// (llama-server `/props` voices; vLLM-Omni `/v1/audio/voices` and its sample rate) over
+    /// what the GGUF headers or `weirdnet-model`'s catalog entry say
+    /// (`weirdnet_model::SpeechProfile::or`), narrowed by the operator's
+    /// [`ModelLaunch::speech`]. Before the first load, the kept record's or the catalog entry's.
+    /// `None` for models that don't speak, when settings widen what the engine reports, and in
+    /// records from nodes before 0.4.10. Since 0.4.10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech: Option<SpeechProfile>,
 }
 
 impl ModelStatus {
@@ -183,9 +195,16 @@ impl ModelStatus {
     /// `entry` with this row's inputs, limits and context window filled in from the record:
     /// the measured context per sequence ([`context_tokens`](Self::context_tokens)), else the
     /// configured `--ctx-size` when set; `entry`'s own values stay where the record has none.
+    ///
+    /// Since 0.4.10 also the speech profile ([`speech`](Self::speech), catalog/1
+    /// `CatalogModel::speech`) and video input (`inputs.video` with the video limits).
     pub fn apply_to(&self, entry: weirdnet_agent::remote::catalog::CatalogModel) -> weirdnet_agent::remote::catalog::CatalogModel {
         let entry = match self.capabilities {
             Some(c) => c.apply_to(entry),
+            None => entry,
+        };
+        let entry = match &self.speech {
+            Some(p) => entry.with_speech(p.clone()),
             None => entry,
         };
         match self.context_tokens.or(self.context) {
@@ -194,8 +213,8 @@ impl ModelStatus {
         }
     }
 
-    /// Its catalog/1 purpose ([`Capabilities::purpose`]): embedding, transcription
-    /// ([`Capabilities::transcribe`]) or chat.
+    /// Its catalog/1 purpose ([`Capabilities::purpose`]): embedding, speech
+    /// ([`Capabilities::speak`]), transcription ([`Capabilities::transcribe`]) or chat.
     pub fn purpose(&self) -> weirdnet_agent::remote::catalog::Purpose {
         self.capabilities.unwrap_or_default().purpose(self.embedding)
     }
@@ -306,6 +325,21 @@ impl Slot {
             c.limits = c.limits.or(r.limits.to_media());
         }
         c
+    }
+
+    /// What the model speaks, when it speaks here: the measured record's profile (the engine's
+    /// report over the headers' or catalog's), else the catalog entry's, narrowed by the
+    /// operator's settings. `Err` when the settings widen it.
+    fn speech(&self) -> Option<Result<SpeechProfile, String>> {
+        if !self.capabilities().speak {
+            return None;
+        }
+        let found = self.measured.as_ref().and_then(|r| r.speech.clone()).or_else(|| self.launch.cataloged_speech());
+        let own = found.map(|p| p.to_agent()).unwrap_or_default();
+        if self.launch.speech.is_unknown() {
+            return Some(Ok(own));
+        }
+        Some(own.narrowed_by(&self.launch.speech).map_err(|e| format!("speech settings widen what the engine reports: {e}")))
     }
 }
 
@@ -533,6 +567,7 @@ impl Supervisor {
             w.check().map_err(bad_request)?;
         }
         launch.check_adapters().map_err(bad_request)?;
+        launch.check_speech().map_err(bad_request)?;
         let id = launch.id.clone();
         let ids = launch.served_ids();
         {
@@ -630,6 +665,7 @@ impl Supervisor {
             capabilities: Some(s.capabilities()),
             base: None,
             context_tokens: s.measured.as_ref().and_then(|r| r.limits.context_tokens),
+            speech: s.speech().and_then(Result::ok),
         }
     }
 
@@ -655,6 +691,13 @@ impl Supervisor {
     pub fn capabilities(&self, id: &str) -> Option<Capabilities> {
         let route = self.route(id).ok()?;
         self.slots().get(&route.base).map(Slot::capabilities)
+    }
+
+    /// What `id` speaks ([`ModelStatus::speech`]); `None` when it doesn't speak here (or its
+    /// settings widen what the engine reports). Since 0.4.10.
+    pub fn speech(&self, id: &str) -> Option<SpeechProfile> {
+        let route = self.route(id).ok()?;
+        self.slots().get(&route.base).and_then(Slot::speech).and_then(Result::ok)
     }
 
     /// What `id` (or an adapter's base) measured when it last loaded, as `weirdnet-model`'s
@@ -723,7 +766,7 @@ impl Supervisor {
                 let v: Value = get("/props").send().await.ok().filter(|r| r.status().is_success())?.json().await.ok()?;
                 read(v["default_generation_settings"]["n_ctx"].as_u64())
             }
-            EngineKind::Vllm => {
+            EngineKind::Vllm | EngineKind::VllmOmni => {
                 let v: Value = get("/v1/models").send().await.ok().filter(|r| r.status().is_success())?.json().await.ok()?;
                 let row = v["data"].as_array()?.iter().find(|m| m["id"].as_str() == Some(launch.id.as_str()))?;
                 read(row["max_model_len"].as_u64())
@@ -732,12 +775,71 @@ impl Supervisor {
         }
     }
 
-    /// Measures `launch`, just loaded at `base`, and keeps the record in the store when set.
+    /// What the engine at `base` reports about speaking model `launch`: llama-server's `/props`
+    /// `voices`; vLLM-Omni's `GET /v1/audio/voices` and the sample rate of its answer to a
+    /// one-word probe (`x-audio-sample-rate`, else the WAV header). Over what each API always
+    /// does (formats, streaming, vLLM-Omni's speed). `None` for models that don't speak.
+    async fn reported_speech(&self, launch: &ModelLaunch, base: &str, key: Option<&str>) -> Option<weirdnet_model::SpeechProfile> {
+        if !launch.capabilities().speak {
+            return None;
+        }
+        let auth = |mut req: reqwest::RequestBuilder| {
+            if let Some(k) = key {
+                req = req.bearer_auth(k);
+            }
+            req.timeout(Duration::from_secs(10))
+        };
+        let get = |path: &str| auth(self.inner.http.get(format!("{base}{path}")));
+        async fn json_of(req: reqwest::RequestBuilder) -> Option<Value> {
+            req.send().await.ok().filter(|r| r.status().is_success())?.json().await.ok()
+        }
+        match launch.engine {
+            EngineKind::Llamacpp => Some(crate::speak::llama_reported(json_of(get("/props")).await.as_ref())),
+            EngineKind::VllmOmni => {
+                let voices = json_of(get("/v1/audio/voices")).await;
+                let mut probe = json!({"model": launch.id, "input": "Hello.", "response_format": "wav"});
+                if let Some(t) = crate::speak::task_type(launch) {
+                    probe["task_type"] = t.into();
+                }
+                let mut rate = None;
+                if let Ok(resp) = auth(self.inner.http.post(format!("{base}/v1/audio/speech")).json(&probe)).send().await
+                    && resp.status().is_success()
+                {
+                    rate = crate::speak::header_rate(resp.headers());
+                    if rate.is_none()
+                        && let Ok(bytes) = resp.bytes().await
+                    {
+                        rate = crate::speak::wav_format(&bytes).map(|(r, _)| r);
+                    }
+                }
+                Some(crate::speak::omni_reported(voices.as_ref(), rate))
+            }
+            _ => None,
+        }
+    }
+
+    /// Measures `launch`, just loaded at `base`, and keeps the record in the store when set. A
+    /// speaking model's record carries its speech profile: what the engine reported over what
+    /// the headers ([`weirdnet_model::limits::measure`]) or the catalog entry say.
     async fn measure_loaded(&self, launch: &ModelLaunch, base: &str, key: Option<&str>) -> Option<LimitsRecord> {
         let context = self.served_context(launch, base, key).await;
+        let reported = self.reported_speech(launch, base, key).await;
         let (launch, args, store) = (launch.clone(), self.engine_args(launch.engine), self.limits_store());
         tokio::task::spawn_blocking(move || {
-            let record = crate::measure::measure(&launch, &args, context)?;
+            let mut record = crate::measure::measure(&launch, &args, context);
+            if let Some(reported) = reported {
+                let mut r = record.unwrap_or_else(|| {
+                    LimitsRecord::new(weirdnet_model::ModelLimits::new(), weirdnet_model::LimitSource::Measured)
+                        .with_engine(launch.engine.name())
+                        .stamped()
+                });
+                let cataloged = launch.cataloged_speech().unwrap_or_default();
+                let fallback = r.speech.as_ref().map_or_else(|| cataloged.clone(), |headers| headers.or(&cataloged));
+                let merged = reported.or(&fallback);
+                r.speech = (!merged.is_unknown()).then_some(merged);
+                record = Some(r);
+            }
+            let record = record?;
             if let Some(store) = store {
                 crate::measure::keep(&store, &launch, &record);
             }
@@ -814,6 +916,13 @@ impl Supervisor {
         }
         // A failed engine may still have a process record; clear it.
         self.stop(id, false).await;
+        if let Err(why) = launch.check_speech() {
+            if let Some(s) = self.slots().get_mut(id) {
+                s.state = ModelState::Failed(why.clone());
+            }
+            self.emit(SupervisorEvent::LoadFailed { model: id.into(), why: why.clone() });
+            return Err(bad_request(why));
+        }
         let started = Instant::now();
         self.emit(SupervisorEvent::Starting { model: id.into() });
         let result = match &launch.wrap {
@@ -1494,7 +1603,17 @@ impl Supervisor {
 
     /// Streams a chat answer from `id`, which must be ready. Dropping the stream aborts the engine
     /// request. For an adapter on llama.cpp, [`Request::adapter_scale`] overrides its scale.
+    ///
+    /// Video parts (since 0.4.10) go only to a model that reads video here
+    /// ([`Capabilities::video`]); otherwise the request is `Unsupported` with `weirdnet-agent`'s
+    /// `VIDEO_FALLBACK` (send frames instead). A clip over the model's known `video_max_bytes`
+    /// is a `BadRequest` naming the limit.
     pub async fn chat(&self, id: &str, request: &Request) -> Result<ChunkStream, RemoteError> {
+        if let Some(messages) = request.inline_messages()
+            && crate::model_needs(messages).video
+        {
+            self.check_video(id, messages)?;
+        }
         let (engine, target, base, key, guard) = self.routed(id, request.adapter_scale)?;
         let body = openai::chat_body_for(request, &target, engine)?;
         let resp = self.post(format!("{base}/v1/chat/completions"), key.as_deref(), &body).await?;
@@ -1521,6 +1640,75 @@ impl Supervisor {
         let body = openai::completion_body_for(prompt, sampling, seed, &target, engine);
         let resp = self.post(format!("{base}/v1/completions"), key.as_deref(), &body).await?;
         Ok(stream_chunks(resp, guard))
+    }
+
+    /// Whether `id` takes the video parts in `messages` ([`Supervisor::chat`]).
+    fn check_video(&self, id: &str, messages: &[weirdnet_agent::Message]) -> Result<(), RemoteError> {
+        let caps = self.capabilities(id).ok_or_else(|| unknown_model(id))?;
+        if !caps.video {
+            return Err(RemoteError::Unsupported {
+                message: format!("model `{id}` does not take video on this node; {}", weirdnet_agent::remote::catalog::VIDEO_FALLBACK),
+            });
+        }
+        if let Some(max) = caps.limits.video_max_bytes {
+            for m in messages {
+                if let weirdnet_agent::Content::Parts(parts) = &m.content {
+                    for p in parts {
+                        if let weirdnet_agent::ContentPart::VideoUrl { video_url } = p
+                            && let Some(n) = video_url.data_len()
+                            && n > max
+                        {
+                            return Err(bad_request(format!("model `{id}` takes video of at most {max} bytes (video_max_bytes); this clip is {n}")));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Speaks `request` with `id`, which must be ready and speak here ([`Capabilities::speak`];
+    /// otherwise `Unsupported`, so a pool tries elsewhere), through the engine's
+    /// `/v1/audio/speech` (llama-server or vLLM-Omni; see the crate's `speak` adapters for the
+    /// fields each takes). The request is checked against the model's speech profile
+    /// ([`Supervisor::speech`], `SpeechProfile::covers`): what the model lacks is a
+    /// `BadRequest` naming it, except an output format this engine doesn't make, which is
+    /// `Unsupported` (another engine may). Returns the audio as it comes: streamed when asked and
+    /// the engine streams, else the finished file; the header carries the format and, when
+    /// known, the sample rate (vLLM-Omni's `x-audio-sample-rate`, a `Content-Type` `rate`, the
+    /// WAV header, else the profile's) and channels (WAV). Usage counts the characters spoken
+    /// and, for WAV, the milliseconds of audio. Neither text nor audio is logged. Since 0.4.10.
+    pub async fn speak(&self, id: &str, request: &SpeakRequest) -> Result<AudioStream, RemoteError> {
+        let engine = self.engine_of(id)?;
+        let (speaks, profile, launch) = {
+            let slots = self.slots();
+            let s = slots.get(id).ok_or_else(|| unknown_model(id))?;
+            (s.capabilities().speak, s.speech(), s.launch.clone())
+        };
+        if !speaks {
+            return Err(RemoteError::Unsupported { message: format!("model `{id}` does not speak on this node") });
+        }
+        request.check()?;
+        let profile = match profile {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => return Err(bad_request(format!("model `{id}`: {e}"))),
+            None => return Err(RemoteError::Unsupported { message: format!("model `{id}` does not speak on this node") }),
+        };
+        let needs = request.needs();
+        if let Err(why) = profile.covers(&needs) {
+            let mut other_format = needs.clone();
+            other_format.format = None;
+            return Err(if needs.format.is_some() && profile.covers(&other_format).is_ok() {
+                RemoteError::Unsupported { message: format!("model `{id}` {why} on this node") }
+            } else {
+                bad_request(format!("model `{id}` {why}"))
+            });
+        }
+        let b = crate::speak::body(engine, id, request, &profile, crate::speak::task_type(&launch))?;
+        let (base, key, guard) = self.target(id)?;
+        tracing::debug!(model = %id, chars = needs.input_chars, "speaking");
+        let resp = self.post(format!("{base}/v1/audio/speech"), key.as_deref(), &b.body).await?;
+        speech_stream(resp, b, request.input.chars(), profile.sample_rate, guard).await
     }
 
     fn engine_of(&self, id: &str) -> Result<EngineKind, RemoteError> {
@@ -1591,6 +1779,114 @@ pub const MAX_ADAPTER_SCALE: f32 = 16.0;
 fn backoff(base: Duration, max: Duration, n: usize) -> Duration {
     let factor = 1u32.checked_shl(n.saturating_sub(1).min(16) as u32).unwrap_or(u32::MAX);
     base.saturating_mul(factor).min(max)
+}
+
+/// The audio of a `/v1/audio/speech` answer as an [`AudioStream`]: the finished file, or with
+/// `body.stream` the bytes as they come (the engine request is dropped when the asker goes away).
+async fn speech_stream(
+    resp: reqwest::Response,
+    body: crate::speak::SpeechBody,
+    chars: u64,
+    profile_rate: Option<u32>,
+    guard: InFlight,
+) -> Result<AudioStream, RemoteError> {
+    let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+    if ct.starts_with("application/json") || ct.starts_with("text/") {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(engine_error(format!("the engine answered with {ct}, not audio: {}", trim(&text))));
+    }
+    let rate = crate::speak::header_rate(resp.headers());
+    let format = body.format;
+    let pcm = format == AudioFormat::Pcm16;
+    let pcm_channels = if pcm { crate::speak::header_channels(resp.headers()).or(body.pcm_channels) } else { None };
+    let pcm_rate = if pcm { rate.or(profile_rate) } else { None };
+    let header = move |head: &[u8]| {
+        let wav = if format == AudioFormat::Wav { crate::speak::wav_format(head) } else { None };
+        let mut h = AudioHeader::new(format);
+        if let Some(hz) = rate.or(wav.map(|w| w.0)).or(profile_rate) {
+            h = h.with_sample_rate(hz);
+        }
+        if let Some(ch) = wav.map(|w| w.1).or(pcm_channels) {
+            h = h.with_channels(ch);
+        }
+        h
+    };
+    // Milliseconds of audio: from the WAV header, or for 16-bit PCM from its known rate and
+    // channels; otherwise not counted.
+    let usage = move |head: &[u8], total: u64| {
+        let ms = match (format, pcm_rate, pcm_channels) {
+            (AudioFormat::Wav, _, _) => crate::speak::wav_ms(head, total),
+            (AudioFormat::Pcm16, Some(hz), Some(ch)) => Some(total * 1000 / (u64::from(hz) * 2 * u64::from(ch))),
+            _ => None,
+        };
+        Usage::speech(chars, ms.unwrap_or(0))
+    };
+    let meta = (!body.meta.ignored.is_empty()).then_some(body.meta);
+    if !body.stream {
+        let bytes = resp.bytes().await.map_err(|e| engine_error(format!("audio broke off: {e}")))?.to_vec();
+        drop(guard);
+        if bytes.is_empty() {
+            return Err(engine_error("the engine sent no audio"));
+        }
+        let mut pieces = vec![Ok(SpeechPiece::Start(header(&bytes))), Ok(SpeechPiece::Usage(usage(&bytes, bytes.len() as u64)))];
+        pieces.insert(1, Ok(SpeechPiece::Audio(bytes)));
+        pieces.extend(meta.map(|m| Ok(SpeechPiece::Meta(m))));
+        return Ok(AudioStream::from_pieces(pieces));
+    }
+    let (sink, out) = AudioStream::channel(16);
+    tokio::spawn(async move {
+        let _guard = guard;
+        let mut stream = resp.bytes_stream();
+        let mut head: Vec<u8> = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut started = false;
+        let mut total = 0u64;
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    total += chunk.len() as u64;
+                    if head.len() < 4096 {
+                        head.extend_from_slice(&chunk[..chunk.len().min(4096 - head.len())]);
+                    }
+                    if !started {
+                        pending.extend_from_slice(&chunk);
+                        // A WAV header first, so the rate and channels can be told.
+                        if format == AudioFormat::Wav && pending.len() < 44 {
+                            continue;
+                        }
+                        if sink.start(header(&head)).await.is_err() || sink.audio(std::mem::take(&mut pending)).await.is_err() {
+                            return;
+                        }
+                        started = true;
+                    } else if sink.audio(chunk.to_vec()).await.is_err() {
+                        return;
+                    }
+                }
+                Some(Err(e)) => {
+                    let _ = sink.fail(engine_error(format!("audio stream broke: {e}"))).await;
+                    return;
+                }
+                None => break,
+            }
+        }
+        if !started {
+            if pending.is_empty() {
+                let _ = sink.fail(engine_error("the engine sent no audio")).await;
+                return;
+            }
+            if sink.start(header(&head)).await.is_err() || sink.audio(pending).await.is_err() {
+                return;
+            }
+        }
+        let _ = sink.usage(usage(&head, total)).await;
+        if let Some(m) = meta {
+            let _ = sink.meta(m).await;
+        }
+    });
+    Ok(out)
 }
 
 fn stream_chunks(resp: reqwest::Response, guard: InFlight) -> ChunkStream {
@@ -1776,6 +2072,19 @@ mod tests {
         assert_eq!(t.purpose(), Purpose::Transcribe);
         let e = t.catalog_model(CatalogState::Loadable);
         assert_eq!((e.id.as_str(), e.purpose, e.state, e.inputs), ("g", Purpose::Transcribe, CatalogState::Loadable, Modalities::new(false, true)));
+
+        // Speech (0.4.10): old rows have no profile and don't speak; a speaker's row carries it.
+        assert_eq!(row.speech, None);
+        assert!(!serde_json::to_string(&row).unwrap().contains("speech"));
+        let profile = SpeechProfile::new().with_presets(vec!["vivian".into()]).with_formats(vec![AudioFormat::Wav]).with_sample_rate(24_000);
+        let speaker = ModelStatus { capabilities: Some(Capabilities::default().with_speak(true)), speech: Some(profile.clone()), ..t };
+        let back: ModelStatus = serde_json::from_str(&serde_json::to_string(&speaker).unwrap()).unwrap();
+        assert_eq!(back, speaker);
+        let cbor = weirdnet_agent::remote::to_cbor(&speaker).unwrap();
+        assert_eq!(weirdnet_agent::remote::from_cbor::<ModelStatus>(&cbor).unwrap(), speaker);
+        let e = speaker.catalog_model(CatalogState::Loadable);
+        assert!(e.speaks());
+        assert_eq!((e.purpose, e.speech), (Purpose::Speak, Some(profile)));
     }
 
     #[test]
