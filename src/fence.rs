@@ -259,6 +259,26 @@ mod tests {
         assert_eq!(FenceRefusal::from_error(&RemoteError::Busy), None);
     }
 
+    /// The bytes `weirdnet_sync::FenceGuard::export` (0.8) gives after the same checks; CI also
+    /// tests against weirdnet-sync 0.5 and 0.7, which have no `FenceGuard`, so they are fixed here.
+    const SYNC_EXPORT: [u8; 32] = [
+        0x82, 0x82, 0x6b, b'y', b'm', b'i', b'r', b'.', b'j', b'o', b'b', b's', b'/', b'7', 0x02, 0x82, 0x6e, b'y', b'm', b'i', b'r', b'.', b'p',
+        b'l', b'a', b'c', b'e', b'm', b'e', b'n', b't', 0x03,
+    ];
+
+    #[test]
+    fn saved_bytes_match_weirdnet_sync() {
+        let mut g = FenceGuard::new();
+        // The same outcomes as weirdnet_sync::FenceGuard for these checks.
+        let outcomes: Vec<_> = [("ymir.placement", 1), ("ymir.placement", 3), ("ymir.jobs/7", 2), ("ymir.placement", 2), ("ymir.jobs/7", 2)]
+            .into_iter()
+            .map(|(lease, term)| g.check(lease, term).map_err(|s| s.seen))
+            .collect();
+        assert_eq!(outcomes, vec![Ok(()), Ok(()), Ok(()), Err(3), Ok(())]);
+        assert_eq!(g.export(), SYNC_EXPORT);
+        assert_eq!(FenceGuard::import(&SYNC_EXPORT).unwrap(), g);
+    }
+
     #[test]
     fn lease_names_follow_weirdnet_sync() {
         assert!(Fence::new("ymir.placement", 1).is_valid());

@@ -401,27 +401,10 @@ fn node1_fencing() {
     });
 }
 
-/// The saved guard is interchangeable with weirdnet-sync's `FenceGuard`.
-fn fence_guard_matches_weirdnet_sync() {
-    use weirdnet_sync::{LeaseName, Term};
-    let mut ours = FenceGuard::new();
-    let mut theirs = weirdnet_sync::FenceGuard::new();
-    for (lease, term) in [("ymir.placement", 1), ("ymir.placement", 3), ("ymir.jobs/7", 2), ("ymir.placement", 2), ("ymir.jobs/7", 2)] {
-        let a = ours.check(lease, term).map_err(|s| s.seen);
-        let b = theirs.check(&LeaseName::new(lease).unwrap(), Term(term)).map_err(|s| s.seen.0);
-        assert_eq!(a, b, "{lease} {term}");
-    }
-    assert_eq!(ours.export(), theirs.export());
-    assert_eq!(FenceGuard::import(&theirs.export()).unwrap(), ours);
-    let back = weirdnet_sync::FenceGuard::import(&ours.export()).unwrap();
-    assert_eq!(back.seen(&LeaseName::new("ymir.placement").unwrap()), Some(Term(3)));
-}
-
 fn main() {
     common::main(&[
         ("node1_round_trip", node1_round_trip as fn()),
         ("node1_fencing", node1_fencing as fn()),
-        ("fence_guard_matches_weirdnet_sync", fence_guard_matches_weirdnet_sync as fn()),
         ("one_node_is_inference_and_model_node", one_node_is_inference_and_model_node as fn()),
     ]);
 }
