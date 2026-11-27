@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-11-27
+
 ### Added
 
 - Native video, for Bragi and Ymir: `ModelLaunch::video` and `with_video` (the operator marks a vLLM model that reads whole clips), `Capabilities::video` and `with_video`, with `Capabilities::inputs` carrying `Modalities::video` into catalog/1 `inputs.video` and the video `MediaLimits` (`video_max_seconds`, `video_max_bytes`, `video_frames_per_minute`) in capability records and catalog entries. `video_url` parts go to vLLM unchanged; `Supervisor::chat`, `openai::chat_body` and `ModelHost` refuse video on llama.cpp, MLX-LM or an unmarked model as `Unsupported` ending with weirdnet-agent's `VIDEO_FALLBACK`, and a clip over `video_max_bytes` as a `BadRequest` naming the limit. The MLX proxy counts `video_url` as media.
