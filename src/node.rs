@@ -4,7 +4,14 @@
 //! chained to the user by its [`NodeCert`], with a sequence number and a 90 second expiry,
 //! refreshed every 15 seconds and on every change. It takes [`Command`]s: `Load`, `Unload`,
 //! `Drain`, `Reserve`/`Release` (hold the node's GPU for one job: nothing is placed there until
-//! released; nodes before 0.4.3 fail these calls), `GroupUp`/`GroupDown` and `Health`. Inference itself is raw infer/2 framing through
+//! released; nodes before 0.4.3 fail these calls), `GroupUp`/`GroupDown` and `Health`.
+//!
+//! Fencing (since 0.4.11): a placement lease holder sends `LoadFenced`/`UnloadFenced` with its
+//! lease name and term ([`Fence`]). The node checks them against its [`FenceGuard`] before it
+//! loads or unloads anything and refuses an older term than it has seen for that lease
+//! ([`FenceRefusal::Stale`], a `Refused` error). Unfenced `Load`/`Unload` work as before unless
+//! the node requires a fence ([`NodeService::with_fence_required`]). Nodes before 0.4.11 fail
+//! fenced commands (they close the stream) and leave `fencing` out of their records. Inference itself is raw infer/2 framing through
 //! [`ModelHost`], served next to node/1 by [`NodeServer`] on [`RAW_INFER_PROTOCOL`]
 //! (`/weirdnet-backends/infer/1`) and, unless [`NodeServerOptions::legacy_infer2`] is off, on
 //! `/weirdnet-agent/infer/2` as in 0.1.0. Inference nodes dial model nodes through
@@ -20,6 +27,7 @@
 //! with `Unsupported` and says `group_jobs: false` in its record.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,6 +45,7 @@ use weirdnet_net::user::NodeCert;
 use weirdnet_net::{AppBody, AppResponse, Keypair, PeerId, PublicKey};
 
 use crate::engine::EngineKind;
+pub use crate::fence::{Fence, FenceGuard, FenceRefusal, Stale};
 use crate::host::{ModelHost, RAW_INFER_PROTOCOL, Speed};
 pub use crate::link::{AddrClass, LinkInfo, LinkMeasure};
 use crate::supervisor::{ModelState, ModelStatus, Reservation, SupervisorEvent};
@@ -98,6 +107,19 @@ pub struct Capability {
     /// in records from 0.1.1 nodes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<LinkInfo>,
+    /// Takes fenced `Load`/`Unload` ([`Command::LoadFenced`], [`Command::UnloadFenced`]) and
+    /// checks them against its [`FenceGuard`]. False (absent) in records from nodes before
+    /// 0.4.11, which fail fenced commands.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fencing: bool,
+    /// Refuses `Load` and `Unload` without a fence ([`NodeService::with_fence_required`]).
+    /// Absent when false. Since 0.4.11.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fence_required: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One model in a [`Capability`] record.
@@ -336,6 +358,43 @@ pub enum Command {
         group: String,
     },
     Health,
+    /// `Load` from a lease holder ([`Command::load_fenced`]): refused with
+    /// [`FenceRefusal::Stale`], nothing loaded, when the node has seen a newer term for the
+    /// lease. Since 0.4.11; older nodes fail the call.
+    #[non_exhaustive]
+    LoadFenced {
+        model: String,
+        force: bool,
+        fence: Fence,
+    },
+    /// `Unload` from a lease holder ([`Command::unload_fenced`]): refused with
+    /// [`FenceRefusal::Stale`], the model left as it is, when the node has seen a newer term for
+    /// the lease. Since 0.4.11; older nodes fail the call.
+    #[non_exhaustive]
+    UnloadFenced {
+        model: String,
+        fence: Fence,
+    },
+}
+
+impl Command {
+    /// [`Command::LoadFenced`].
+    pub fn load_fenced(model: impl Into<String>, force: bool, fence: Fence) -> Self {
+        Command::LoadFenced { model: model.into(), force, fence }
+    }
+
+    /// [`Command::UnloadFenced`].
+    pub fn unload_fenced(model: impl Into<String>, fence: Fence) -> Self {
+        Command::UnloadFenced { model: model.into(), fence }
+    }
+
+    /// The fence a command carries.
+    pub fn fence(&self) -> Option<&Fence> {
+        match self {
+            Command::LoadFenced { fence, .. } | Command::UnloadFenced { fence, .. } => Some(fence),
+            _ => None,
+        }
+    }
 }
 
 /// What a client sends: its certificate and one command.
@@ -424,6 +483,9 @@ pub struct NodeService {
     withdrawn: AtomicBool,
     changed: watch::Sender<u64>,
     started: Instant,
+    fence: Mutex<FenceGuard>,
+    fence_file: Option<PathBuf>,
+    fence_required: bool,
 }
 
 impl NodeService {
@@ -459,7 +521,69 @@ impl NodeService {
             withdrawn: AtomicBool::new(false),
             changed: watch::Sender::new(0),
             started: Instant::now(),
+            fence: Mutex::default(),
+            fence_file: None,
+            fence_required: false,
         }
+    }
+
+    /// Starts fencing from `guard` (for example one the application saved). Without this or
+    /// [`with_fence_file`](Self::with_fence_file) the node still checks fenced commands, from an
+    /// empty guard kept in memory only, so a restart forgets the terms it has seen.
+    pub fn with_fence_guard(mut self, guard: FenceGuard) -> Self {
+        self.fence = Mutex::new(guard);
+        self
+    }
+
+    /// Keeps the [`FenceGuard`] in `path`: read now (an empty guard when there is no file yet)
+    /// and saved before a command with a newer term runs, so a restart keeps refusing old terms.
+    /// When the save fails, the command is refused (`Failed`) and the guard stays as it was.
+    pub fn with_fence_file(mut self, path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        self.fence = Mutex::new(FenceGuard::load(&path)?);
+        self.fence_file = Some(path);
+        Ok(self)
+    }
+
+    /// Refuse `Load` and `Unload` without a fence ([`FenceRefusal::Required`]). Default off:
+    /// unfenced commands run as before 0.4.11, and only fenced ones are checked.
+    pub fn with_fence_required(mut self, on: bool) -> Self {
+        self.fence_required = on;
+        self
+    }
+
+    /// The terms the node has seen, per lease name.
+    pub fn fence_guard(&self) -> FenceGuard {
+        self.fence.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Checks a `Load`/`Unload`'s fence (or its absence) and records a newer term.
+    fn admit(&self, fence: Option<&Fence>) -> Result<(), RemoteError> {
+        let Some(fence) = fence else {
+            return if self.fence_required { Err(FenceRefusal::Required.to_error()) } else { Ok(()) };
+        };
+        if !fence.is_valid() {
+            return Err(RemoteError::BadRequest { message: format!("bad lease name {:?}", fence.lease) });
+        }
+        let mut guard = self.fence.lock().unwrap_or_else(|e| e.into_inner());
+        let before = guard.seen(&fence.lease);
+        let mut next = guard.clone();
+        next.check(&fence.lease, fence.term)
+            .map_err(|s| FenceRefusal::Stale { lease: fence.lease.clone(), term: fence.term, seen: s.seen }.to_error())?;
+        if before != Some(fence.term)
+            && let Some(path) = &self.fence_file
+        {
+            next.save(path).map_err(|e| RemoteError::Failed { message: format!("could not save the fence guard: {e}") })?;
+        }
+        *guard = next;
+        Ok(())
+    }
+
+    async fn load(&self, model: &str, force: bool) -> Result<(), RemoteError> {
+        if self.host.draining() {
+            return Err(RemoteError::unavailable("this node is draining"));
+        }
+        self.host.supervisor().load_with(model, force).await
     }
 
     /// Infer/2 admission: `slots` concurrent requests, `queue` waiting (default 4 and 0).
@@ -581,6 +705,8 @@ impl NodeService {
             group_jobs: self.workers.is_some(),
             reserved: self.host.supervisor().reservation(),
             links: self.links.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            fencing: true,
+            fence_required: self.fence_required,
         }
     }
 
@@ -644,12 +770,21 @@ impl NodeService {
             Command::Record => return Ok(ServerMsg::Record(self.record()?)),
             Command::Health => return Ok(ServerMsg::Health(self.health())),
             Command::Load { model, force } => {
-                if self.host.draining() {
-                    return Err(RemoteError::unavailable("this node is draining"));
-                }
-                sup.load_with(&model, force).await
+                self.admit(None)?;
+                self.load(&model, force).await
             }
-            Command::Unload { model } => sup.unload(&model).await,
+            Command::LoadFenced { model, force, fence } => {
+                self.admit(Some(&fence))?;
+                self.load(&model, force).await
+            }
+            Command::Unload { model } => {
+                self.admit(None)?;
+                sup.unload(&model).await
+            }
+            Command::UnloadFenced { model, fence } => {
+                self.admit(Some(&fence))?;
+                sup.unload(&model).await
+            }
             Command::Drain { on } => {
                 self.host.set_draining(on);
                 self.touch();
@@ -957,6 +1092,19 @@ impl NodeClient {
         self.done(node, Command::Unload { model: model.into() }).await
     }
 
+    /// [`load`](Self::load) under a lease: the node refuses it, loading nothing, when it has
+    /// seen a newer term for `fence`'s lease ([`FenceRefusal::from_error`] reads the refusal;
+    /// don't retry it). Needs a node at 0.4.11 or later (`Capability::fencing`).
+    pub async fn load_fenced(&self, node: &str, model: &str, force: bool, fence: &Fence) -> Result<(), RemoteError> {
+        self.done(node, Command::load_fenced(model, force, fence.clone())).await
+    }
+
+    /// [`unload`](Self::unload) under a lease: refused, the model left as it is, when the node
+    /// has seen a newer term for `fence`'s lease. Needs a node at 0.4.11 or later.
+    pub async fn unload_fenced(&self, node: &str, model: &str, fence: &Fence) -> Result<(), RemoteError> {
+        self.done(node, Command::unload_fenced(model, fence.clone())).await
+    }
+
     /// Drains (waiting for requests under way) or resumes.
     pub async fn drain(&self, node: &str, on: bool) -> Result<(), RemoteError> {
         self.done(node, Command::Drain { on }).await
@@ -993,6 +1141,7 @@ impl NodeClient {
 mod tests {
     use super::*;
     use crate::supervisor::{Supervisor, SupervisorOptions};
+    use weirdnet_agent::remote::{from_cbor, to_cbor};
     use weirdnet_net::WEIRDNET;
 
     fn service() -> (NodeService, Keypair) {
@@ -1020,5 +1169,139 @@ mod tests {
         let user = Keypair::generate_ed25519();
         assert!(Verifier::new(&WEIRDNET, user.public()).verify(&rec, svc.peer(), now_ms()).is_err(), "no certificate");
         assert!(svc.record().unwrap().verify(svc.peer(), now_ms()).unwrap().seq > cap.seq);
+    }
+
+    /// node/1 commands as a 0.4.10 node reads them.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    enum OldCommand {
+        Load { model: String, force: bool },
+        Unload { model: String },
+        Health,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct OldClientMsg {
+        #[serde(default, with = "serde_bytes")]
+        cert: Option<Vec<u8>>,
+        command: OldCommand,
+    }
+
+    fn msg(command: Command) -> Vec<u8> {
+        to_cbor(&ClientMsg { cert: None, command }).unwrap()
+    }
+
+    #[test]
+    fn fenced_commands_on_the_wire() {
+        let fence = Fence::new("ymir.placement", 7);
+        // Unfenced commands are the same bytes as before, both ways.
+        for (new, old) in [
+            (Command::Load { model: "chat".into(), force: true }, OldCommand::Load { model: "chat".into(), force: true }),
+            (Command::Unload { model: "chat".into() }, OldCommand::Unload { model: "chat".into() }),
+        ] {
+            let bytes = msg(new.clone());
+            assert_eq!(bytes, to_cbor(&OldClientMsg { cert: None, command: old.clone() }).unwrap(), "same bytes as 0.4.10");
+            assert_eq!(from_cbor::<OldClientMsg>(&bytes).unwrap().command, old, "an old node reads it");
+            assert_eq!(from_cbor::<Command>(&to_cbor(&old).unwrap()).unwrap(), new, "a new node reads an old client's");
+            assert_eq!(new.fence(), None);
+        }
+        // Fenced commands round-trip (CBOR and JSON).
+        for cmd in [Command::load_fenced("chat", false, fence.clone()), Command::unload_fenced("chat", fence.clone())] {
+            assert_eq!(cmd.fence(), Some(&fence));
+            let back: ClientMsg = from_cbor(&msg(cmd.clone())).unwrap();
+            assert_eq!(back.command, cmd);
+            let json = serde_json::to_value(&cmd).unwrap();
+            assert_eq!(serde_json::from_value::<Command>(json.clone()).unwrap(), cmd);
+            assert_eq!(json.as_object().unwrap().values().next().unwrap()["fence"], serde_json::json!({ "lease": "ymir.placement", "term": 7 }));
+            // An old node can't read it: the call fails rather than running unfenced.
+            assert!(from_cbor::<OldClientMsg>(&msg(cmd)).is_err());
+        }
+    }
+
+    #[test]
+    fn records_say_fencing() {
+        let (svc, _) = service();
+        let cap = svc.capability();
+        assert!(cap.fencing && !cap.fence_required);
+        let bytes = to_cbor(&cap).unwrap();
+        assert!(!bytes.windows(14).any(|w| w == b"fence_required"), "false is left out");
+        // A record from an older node has neither field.
+        let mut old = serde_json::to_value(&cap).unwrap();
+        old.as_object_mut().unwrap().remove("fencing");
+        let back: Capability = serde_json::from_value(old).unwrap();
+        assert!(!back.fencing && !back.fence_required);
+        let (svc, _) = service();
+        assert!(svc.with_fence_required(true).capability().fence_required);
+    }
+
+    fn refusal(r: Result<ServerMsg, RemoteError>) -> Option<FenceRefusal> {
+        FenceRefusal::from_error(&r.unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn the_guard_refuses_old_terms() {
+        let (svc, _) = service();
+        let f = |lease: &str, term| Fence::new(lease, term);
+        // No model "m" on this node: a command that passes the fence fails as unknown model,
+        // one that doesn't is a fencing refusal.
+        let passed = |r: Result<ServerMsg, RemoteError>| matches!(r, Err(RemoteError::Unavailable { .. }));
+        assert!(passed(svc.run(Command::load_fenced("m", false, f("ymir.placement", 1))).await));
+        assert!(passed(svc.run(Command::load_fenced("m", false, f("ymir.placement", 2))).await));
+        assert!(passed(svc.run(Command::unload_fenced("m", f("ymir.placement", 2))).await), "the same term again");
+        assert_eq!(
+            refusal(svc.run(Command::load_fenced("m", false, f("ymir.placement", 1))).await),
+            Some(FenceRefusal::Stale { lease: "ymir.placement".into(), term: 1, seen: 2 })
+        );
+        assert_eq!(
+            refusal(svc.run(Command::unload_fenced("m", f("ymir.placement", 1))).await),
+            Some(FenceRefusal::Stale { lease: "ymir.placement".into(), term: 1, seen: 2 })
+        );
+        // Another lease keeps its own term.
+        assert!(passed(svc.run(Command::unload_fenced("m", f("other.lease", 1))).await));
+        assert_eq!((svc.fence_guard().seen("ymir.placement"), svc.fence_guard().seen("other.lease")), (Some(2), Some(1)));
+        // Unfenced commands run as before while a fence isn't required.
+        assert!(passed(svc.run(Command::Load { model: "m".into(), force: false }).await));
+        assert!(passed(svc.run(Command::Unload { model: "m".into() }).await));
+        // Bad lease names are bad requests and record nothing.
+        assert!(matches!(svc.run(Command::load_fenced("m", false, f("bad name", 9))).await, Err(RemoteError::BadRequest { .. })));
+        assert_eq!(svc.fence_guard().leases().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_required_fence_refuses_unfenced_commands() {
+        let (svc, _) = service();
+        let svc = svc.with_fence_required(true);
+        assert_eq!(refusal(svc.run(Command::Load { model: "m".into(), force: false }).await), Some(FenceRefusal::Required));
+        assert_eq!(refusal(svc.run(Command::Unload { model: "m".into() }).await), Some(FenceRefusal::Required));
+        assert!(matches!(svc.run(Command::load_fenced("m", false, Fence::new("ymir.placement", 1))).await, Err(RemoteError::Unavailable { .. })));
+        // Other commands don't need one.
+        assert!(matches!(svc.run(Command::Health).await, Ok(ServerMsg::Health(_))));
+    }
+
+    #[tokio::test]
+    async fn a_fence_file_keeps_terms_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fence.cbor");
+        let (svc, _) = service();
+        let svc = svc.with_fence_file(&path).unwrap();
+        let _ = svc.run(Command::load_fenced("m", false, Fence::new("ymir.placement", 3))).await;
+        assert_eq!(FenceGuard::load(&path).unwrap().seen("ymir.placement"), Some(3));
+        // A restarted node reads it back and still refuses term 2.
+        let (svc, _) = service();
+        let svc = svc.with_fence_file(&path).unwrap();
+        assert_eq!(
+            refusal(svc.run(Command::unload_fenced("m", Fence::new("ymir.placement", 2))).await),
+            Some(FenceRefusal::Stale { lease: "ymir.placement".into(), term: 2, seen: 3 })
+        );
+        // A guard handed over by the application works the same.
+        let (svc, _) = service();
+        let svc = svc.with_fence_guard(FenceGuard::load(&path).unwrap());
+        assert!(refusal(svc.run(Command::load_fenced("m", false, Fence::new("ymir.placement", 1))).await).is_some());
+        // When the guard can't be saved, a newer term is refused and not recorded.
+        let blocker = dir.path().join("not-a-dir");
+        let (svc, _) = service();
+        let svc = svc.with_fence_file(blocker.join("fence.cbor")).unwrap();
+        std::fs::write(&blocker, b"").unwrap();
+        assert!(matches!(svc.run(Command::load_fenced("m", false, Fence::new("ymir.placement", 4))).await, Err(RemoteError::Failed { .. })));
+        assert_eq!(svc.fence_guard().seen("ymir.placement"), None);
     }
 }

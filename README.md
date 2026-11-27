@@ -279,6 +279,16 @@ How inference nodes drive model nodes over [`weirdnet-net`](https://crates.io/cr
   nothing loads, runs or joins a group there until released; since 0.4.3), `GroupUp`/`GroupDown`, `Health`. Cross-machine swap
   groups (a Ray worker, an `rpc-server` on a private link) are started by the application's
   `GroupWorkers`; without one a node answers `Unsupported` and advertises `group_jobs: false`.
+- **Fencing** (since 0.4.11): a placement lease holder sends `LoadFenced`/`UnloadFenced`
+  (`NodeClient::load_fenced`/`unload_fenced`) with a `Fence`: its lease name and term, as a
+  `weirdnet-sync` lease handle gives them. The node keeps a `FenceGuard` (per lease name, the
+  highest term seen; the same rule and saved bytes as `weirdnet_sync::FenceGuard`) and refuses an
+  older term before it loads or unloads anything: a `Refused` error that
+  `FenceRefusal::from_error` reads back as `Stale { lease, term, seen }`, so callers stop rather than
+  retry. `NodeService::with_fence_file` keeps the guard on disk across restarts (without it the
+  guard lives in memory); `with_fence_required(true)` also refuses unfenced `Load`/`Unload`
+  (`FenceRefusal::Required`). Records say `fencing` (and `fence_required`); nodes before 0.4.11
+  fail fenced commands rather than run them unfenced.
 - `NodeServer::start` serves node/1 and raw inference on `/weirdnet-backends/infer/1`
   (`RAW_INFER_PROTOCOL`, the infer/2 framing) and, for 0.1.0 inference nodes, on
   `/weirdnet-agent/infer/2`; `NodeServer::start_with(.., NodeServerOptions::default().with_legacy_infer2(false))`

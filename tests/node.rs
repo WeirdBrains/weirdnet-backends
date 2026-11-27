@@ -17,7 +17,8 @@ use weirdnet_agent::serve::RosterAuth;
 use weirdnet_agent::serve::{Server, Serving};
 use weirdnet_agent::{CancelToken, Message, ModelBackend};
 use weirdnet_backends::node::{
-    AddrClass, Capability, GroupPlan, GroupWorkers, LinkInfo, NodeClient, NodeServer, NodeServerOptions, NodeService, Subscription, Update, Verifier,
+    AddrClass, Capability, Fence, FenceGuard, FenceRefusal, GroupPlan, GroupWorkers, LinkInfo, NodeClient, NodeServer, NodeServerOptions,
+    NodeService, Subscription, Update, Verifier,
 };
 use weirdnet_backends::{EngineKind, ModelHost, ModelState, RawInferDialer};
 use weirdnet_net::node::{Handler, Node, NodeConfig};
@@ -327,9 +328,100 @@ fn one_node_is_inference_and_model_node() {
     });
 }
 
+/// Placement-lease fencing on a model node with a real (mock) engine: a holder whose lease was
+/// taken over is refused on Load and Unload, and the model stays as the newer holder left it,
+/// across a restart of the node's service too.
+fn node1_fencing() {
+    let user = Keypair::generate_ed25519();
+    let model_key = Keypair::generate_ed25519();
+    let (inference, model) = (start(Keypair::generate_ed25519()), start(model_key.clone()));
+    let inference_cert = certify(&user, &inference, "studio");
+    let model_cert = certify(&user, &model, "gpu-box");
+    let mut roster = Roster::new();
+    roster.upsert(inference_cert.clone());
+    roster.upsert(model_cert.clone());
+    let roster = Arc::new(roster);
+    let view: Arc<dyn Fn() -> Roster + Send + Sync> = Arc::new(move || (*roster).clone());
+    let dir = tempfile::tempdir().unwrap();
+    let fence_file = dir.path().join("fence.cbor");
+
+    common::block_on(async {
+        let auth: Arc<dyn Authorize> = Arc::new(RosterAuth::new(&WEIRDNET, user.public(), view.clone()));
+        let sup = common::supervisor(vec![common::launch("chat", EngineKind::Llamacpp)]);
+        let host = Arc::new(ModelHost::new(sup.clone(), auth.clone()));
+        let service =
+            Arc::new(NodeService::new(host.clone(), model_key.clone(), Some(model_cert.clone()), auth.clone()).with_fence_file(&fence_file).unwrap());
+        let server = NodeServer::start(&model, service.clone()).unwrap();
+        let peer = model.peer_id().to_string();
+        let dialer = Arc::new(NetDialer::new(inference.clone()));
+        dialer.hint(model.peer_id(), vec![addr(&model)]);
+        let client = NodeClient::new(dialer.clone(), Verifier::new(&WEIRDNET, user.public())).with_cert(Some(encode_cert(&inference_cert)));
+
+        let cap = client.record(&peer).await.unwrap();
+        assert!(cap.fencing && !cap.fence_required);
+        let (old, new) = (Fence::new("ymir.placement", 1), Fence::new("ymir.placement", 2));
+        let stale = Some(FenceRefusal::Stale { lease: "ymir.placement".into(), term: 1, seen: 2 });
+
+        // The first holder places the model; a newer holder takes over and unloads it.
+        client.load_fenced(&peer, "chat", false, &old).await.unwrap();
+        assert_eq!(state(&client.record(&peer).await.unwrap(), "chat"), ModelState::Ready);
+        client.unload_fenced(&peer, "chat", &new).await.unwrap();
+        assert_eq!(state(&client.record(&peer).await.unwrap(), "chat"), ModelState::Unloaded);
+        // The old holder is refused, and the model stays unloaded.
+        let e = client.load_fenced(&peer, "chat", false, &old).await.unwrap_err();
+        assert_eq!(FenceRefusal::from_error(&e), stale);
+        assert_eq!(state(&client.record(&peer).await.unwrap(), "chat"), ModelState::Unloaded);
+        // The newer holder loads it again; the old one can't unload it.
+        client.load_fenced(&peer, "chat", false, &new).await.unwrap();
+        let e = client.unload_fenced(&peer, "chat", &old).await.unwrap_err();
+        assert_eq!(FenceRefusal::from_error(&e), stale);
+        assert_eq!(state(&client.record(&peer).await.unwrap(), "chat"), ModelState::Ready);
+        // Another lease name has its own term; unfenced commands still run (fence not required).
+        client.unload_fenced(&peer, "chat", &Fence::new("other.lease", 1)).await.unwrap();
+        client.load(&peer, "chat", false).await.unwrap();
+        assert_eq!(FenceGuard::load(&fence_file).unwrap().leases(), vec![("other.lease".into(), 1), ("ymir.placement".into(), 2)]);
+
+        // The node's service restarts from the saved guard, now requiring a fence.
+        drop(server);
+        let service =
+            Arc::new(NodeService::new(host, model_key, Some(model_cert), auth).with_fence_file(&fence_file).unwrap().with_fence_required(true));
+        let _server = NodeServer::start(&model, service).unwrap();
+        let cap = client.record(&peer).await.unwrap();
+        assert!(cap.fencing && cap.fence_required);
+        let e = client.unload_fenced(&peer, "chat", &old).await.unwrap_err();
+        assert_eq!(FenceRefusal::from_error(&e), stale, "term 2 survived the restart");
+        let e = client.unload(&peer, "chat").await.unwrap_err();
+        assert_eq!(FenceRefusal::from_error(&e), Some(FenceRefusal::Required));
+        assert_eq!(state(&client.record(&peer).await.unwrap(), "chat"), ModelState::Ready, "refusals left the model alone");
+        // A refusal is not a transient error: other failures don't read as one.
+        assert_eq!(FenceRefusal::from_error(&client.load_fenced(&peer, "nope", false, &new).await.unwrap_err()), None);
+        client.unload_fenced(&peer, "chat", &Fence::new("ymir.placement", 3)).await.unwrap();
+        assert_eq!(state(&client.record(&peer).await.unwrap(), "chat"), ModelState::Unloaded);
+        sup.shutdown().await;
+    });
+}
+
+/// The saved guard is interchangeable with weirdnet-sync's `FenceGuard`.
+fn fence_guard_matches_weirdnet_sync() {
+    use weirdnet_sync::{LeaseName, Term};
+    let mut ours = FenceGuard::new();
+    let mut theirs = weirdnet_sync::FenceGuard::new();
+    for (lease, term) in [("ymir.placement", 1), ("ymir.placement", 3), ("ymir.jobs/7", 2), ("ymir.placement", 2), ("ymir.jobs/7", 2)] {
+        let a = ours.check(lease, term).map_err(|s| s.seen);
+        let b = theirs.check(&LeaseName::new(lease).unwrap(), Term(term)).map_err(|s| s.seen.0);
+        assert_eq!(a, b, "{lease} {term}");
+    }
+    assert_eq!(ours.export(), theirs.export());
+    assert_eq!(FenceGuard::import(&theirs.export()).unwrap(), ours);
+    let back = weirdnet_sync::FenceGuard::import(&ours.export()).unwrap();
+    assert_eq!(back.seen(&LeaseName::new("ymir.placement").unwrap()), Some(Term(3)));
+}
+
 fn main() {
     common::main(&[
         ("node1_round_trip", node1_round_trip as fn()),
+        ("node1_fencing", node1_fencing as fn()),
+        ("fence_guard_matches_weirdnet_sync", fence_guard_matches_weirdnet_sync as fn()),
         ("one_node_is_inference_and_model_node", one_node_is_inference_and_model_node as fn()),
     ]);
 }

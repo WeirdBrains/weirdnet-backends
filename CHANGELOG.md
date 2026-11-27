@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Placement-lease fencing on the model node, for Ymir's placement lease: `fence::Fence` (lease name and term), `fence::FenceGuard` (per lease name, the highest term seen; `check`, `seen`, `leases`, `export`/`import`, `load`/`save` with an atomic write) and `fence::FenceRefusal` (`Stale { lease, term, seen }`, `Required`; `to_error`/`from_error` over a `RemoteError::Refused` with a fixed message). The guard follows `weirdnet_sync::FenceGuard` (equal terms pass, one counter per lease name) and its saved bytes are interchangeable with it, without requiring weirdnet-sync 0.8.
+- node/1 `Command::LoadFenced` and `Command::UnloadFenced` (`Command::load_fenced`, `unload_fenced`, `fence`), `NodeClient::load_fenced` and `unload_fenced`. The node checks the fence before it loads or unloads anything and refuses an older term, leaving the model as it is. `NodeService::with_fence_guard`, `with_fence_file` (saved before a newer term runs; a failed save refuses the command), `with_fence_required` (refuse unfenced `Load`/`Unload`; default off, so unfenced commands work as before) and `fence_guard`. `Capability::fencing` and `fence_required` (left out when false). Unfenced `Load`/`Unload` are the same bytes on the wire as before; nodes before 0.4.11 fail fenced commands instead of running them unfenced.
+
 ## [0.4.10] - 2026-11-27
 
 ### Added

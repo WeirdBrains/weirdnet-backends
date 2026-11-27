@@ -23,6 +23,8 @@
 //! - [`host`]: [`ModelHost`], a `weirdnet-agent` `InferHost` serving raw infer/2 from the
 //!   supervisor's models, transcription (infer/2 `Transcribe`) and speech out (infer/2 `Speak`,
 //!   llama-server's and vLLM-Omni's `/v1/audio/speech`) included.
+//! - [`fence`]: placement-lease fencing ([`Fence`], [`FenceGuard`], [`FenceRefusal`]): a model node
+//!   refuses node/1 `Load` and `Unload` from a lease holder with an older term than it has seen.
 //! - `node` (feature): `/weirdnet-backends/node/1` over `weirdnet-net`: signed capability
 //!   records, `Load`, `Unload`, `Drain`, `Reserve`/`Release`, `GroupUp`/`GroupDown` and health.
 //! - `models` (feature `node`): `/weirdnet-backends/models/1`, for the owner only: search the
@@ -38,6 +40,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod fence;
 pub mod host;
 #[cfg(feature = "node")]
 pub mod link;
@@ -54,6 +57,7 @@ pub mod supervisor;
 mod transcribe;
 
 pub use engine::{Capabilities, EngineConfig, EngineKind, LoraAdapter, ModelLaunch, Wrap, find_in_path};
+pub use fence::{Fence, FenceGuard, FenceRefusal};
 pub use host::{EngineModel, ModelHost, RAW_INFER_PROTOCOL, RawInferDialer, Speed};
 pub use openai::Target;
 pub use sse::{Chunk, ChunkDecoder, SseParser, ToolCalls};
