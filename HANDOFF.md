@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-27: released 0.4.10 (native video and speech out)
+
+What changed: `scripts/weirdnet_release.py cut --patch` from [`316d9f4`](https://github.com/WeirdBrains/weirdnet-backends/commit/316d9f486f76b31c3003de58c6db1be7ba3f4dca) (CI green, Linux and Windows). Release commit [`73499f5`](https://github.com/WeirdBrains/weirdnet-backends/commit/73499f5f16cdc4c2c2699ec5667b341a43ebc6cb) (CI green), tag [`v0.4.10`](https://github.com/WeirdBrains/weirdnet-backends/tree/v0.4.10), published by the same run: on [crates.io](https://crates.io/crates/weirdnet-backends/0.4.10), docs on [docs.rs](https://docs.rs/weirdnet-backends/0.4.10). The site is updated on [net.weirdbrains.com](https://net.weirdbrains.com/crates/backends).
+
+Release basis: the requested additive 0.4.x patch release for Bragi and Ymir. `cargo semver-checks` against 0.4.9 (default and all features): no semver update required.
+
+Checks run: the release script's checks (fmt, clippy all features, test all features, doc with `-D warnings`), CI on the release commit and `cargo publish` verification; the rest is in the entry below.
+
+Not tested: as below.
+
+What's left and next: Bragi native-video routing; Ymir's TTS route and video wiring on 0.4.10.
+
 ## 2026-11-27: native video and speech out (for 0.4.10)
 
 What changed: [Bragi](https://github.com/WeirdBrains/bragi) and [Ymir](https://github.com/WeirdBrains/ymir) support for native video and Ymir's speech output (Ymir `docs/design/audio.md`, "weirdnet-backends (0.4.10)"; `docs/design/video.md`), on [weirdnet-agent](https://crates.io/crates/weirdnet-agent/0.5.11) 0.5.11 and [weirdnet-model](https://crates.io/crates/weirdnet-model/0.5.5) 0.5.5. Additive only (`cargo semver-checks` against 0.4.9: no semver update required).
