@@ -385,7 +385,18 @@ fn node1_fencing() {
         drop(server);
         let service =
             Arc::new(NodeService::new(host, model_key, Some(model_cert), auth).with_fence_file(&fence_file).unwrap().with_fence_required(true));
-        let _server = NodeServer::start(&model, service).unwrap();
+        // The old server lets go of its protocols in the background.
+        let mut tries = 0;
+        let _server = loop {
+            match NodeServer::start(&model, service.clone()) {
+                Ok(server) => break server,
+                Err(_) if tries < 100 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("restart: {e}"),
+            }
+        };
         let cap = client.record(&peer).await.unwrap();
         assert!(cap.fencing && cap.fence_required);
         let e = client.unload_fenced(&peer, "chat", &old).await.unwrap_err();
